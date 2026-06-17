@@ -1,0 +1,45 @@
+{
+  "name": "yolo-onnx-web",
+  "publishConfig": {
+    "access": "public"
+  },
+  "version": "0.1.0",
+  "description": "YOLO browser inference client powered by onnxruntime-web",
+  "author": "ShiFang Tech",
+  "license": "MIT",
+  "keywords": [
+    "yolo",
+    "yolov5",
+    "onnx",
+    "onnxruntime-web",
+    "browser-inference"
+  ],
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "vite",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.23.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "tsup": "latest",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3"
+  }
+}
