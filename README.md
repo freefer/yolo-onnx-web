@@ -4,7 +4,9 @@ Browser-side YOLO inference powered by `onnxruntime-web`.
 
 This package loads Ultralytics-style ONNX models in the browser, parses model metadata, dispatches to the correct YOLO output handler, and provides drawing helpers for detection, classification, segmentation, pose estimation, and oriented bounding boxes.
 
-Chinese documentation: [README.zh-CN.md](./README.zh-CN.md)
+Repository: [https://github.com/freefer/yolo-onnx-web](https://github.com/freefer/yolo-onnx-web)
+
+Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-web/blob/main/README.zh-CN.md)
 
 ## Features
 

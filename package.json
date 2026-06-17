@@ -7,6 +7,14 @@
   "description": "YOLO browser inference client powered by onnxruntime-web",
   "author": "ShiFang Tech",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freefer/yolo-onnx-web.git"
+  },
+  "homepage": "https://github.com/freefer/yolo-onnx-web#readme",
+  "bugs": {
+    "url": "https://github.com/freefer/yolo-onnx-web/issues"
+  },
   "keywords": [
     "yolo",
     "yolov5",

@@ -4,7 +4,9 @@
 
 本库可以在浏览器中加载 Ultralytics 风格的 ONNX 模型，解析模型元数据，根据模型版本和任务类型自动选择输出解析器，并提供分类、检测、分割、姿态估计、旋转框等任务的 Canvas 绘制方法。
 
-English documentation: [README.md](./README.md)
+GitHub 仓库：[https://github.com/freefer/yolo-onnx-web](https://github.com/freefer/yolo-onnx-web)
+
+English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob/main/README.md)
 
 ## 功能特性
 
