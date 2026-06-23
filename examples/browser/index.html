@@ -74,6 +74,22 @@
         border-radius: 10px;
       }
 
+      input[type="range"] {
+        padding: 0;
+      }
+
+      .range-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .range-value {
+        color: #2563eb;
+        font-variant-numeric: tabular-nums;
+      }
+
       button {
         padding: 9px 14px;
         color: #fff;
@@ -132,7 +148,7 @@
       .viewer {
         position: relative;
         align-self: flex-start;
-        width: 100%;
+        min-width: 60%;
         overflow: hidden;
         background: #0f172a;
         border: 1px solid #e5e7eb;
@@ -277,6 +293,21 @@
           <label>
             本地 ONNX
             <input id="modelFile" type="file" accept=".onnx" />
+          </label>
+
+          <label>
+            类别文件 class_names.txt
+            <input id="classNamesFile" type="file" accept=".txt,.json" />
+          </label>
+
+          <label>
+            <span class="range-label">置信度 <span id="confidenceValue" class="range-value">0.20</span></span>
+            <input id="confidenceInput" type="range" min="0" max="1" step="0.01" value="0.2" />
+          </label>
+
+          <label>
+            <span class="range-label">IoU <span id="iouValue" class="range-value">0.70</span></span>
+            <input id="iouInput" type="range" min="0" max="1" step="0.01" value="0.7" />
           </label>
         </div>
       </section>

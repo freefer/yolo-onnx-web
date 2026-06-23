@@ -33,6 +33,7 @@ export type {
   YoloFeeds,
   YoloFetches,
   YoloImageSource,
+  YoloLabels,
   YoloModelSource,
   YoloOptions,
   YoloPreprocessResult,

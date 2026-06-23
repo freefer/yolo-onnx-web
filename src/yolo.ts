@@ -30,6 +30,7 @@ import { Yolo26Handler } from './handler/yolo26/yolo26-hanlder';
 import { Yolov10Handler } from './handler/yolov10/yolov10-handler';
 import { Yolov8Handler } from './handler/yolov8/yolov8-handler';
 import { RT_DETRHandler } from './handler/RT-DETR/RT-DETR-handler';
+import { RF_DETRHandler } from './handler/RF-DETR/RF-DETR-handler';
 
 const DEFAULT_EXECUTION_PROVIDERS = ['wasm'] as const;
 const DEFAULT_BOX_COLORS = [
@@ -78,6 +79,10 @@ export class Yolo {
     ensureOnnxRuntimeWebInitialized(options);
   }
 
+  get yoloOptions(): YoloOptions {
+    return this.options;
+  }
+
   static async create(options: YoloOptions): Promise<Yolo> {
     const yolo = new Yolo(options);
 
@@ -114,7 +119,7 @@ export class Yolo {
     this.session = await this.createSession(model);
 
     // 解析 ONNX 模型信息，结构对齐 YoloDotNet 的 OnnxModel。
-    this._onnxModel = await parseOnnxModel(this.session, model);
+    this._onnxModel = await parseOnnxModel(this.session, model, this.options);
 
     var modelVersion = this._onnxModel.modelVersion;
     var modelType = this._onnxModel.modelType;
@@ -142,6 +147,9 @@ export class Yolo {
         break;
       case 'RTDETR':
         this._handler = new RT_DETRHandler(this);
+        break;
+      case 'RFDETR':
+        this._handler = new RF_DETRHandler(this);
         break;
       default:
         throw new Error('Unsupported model version: ' + modelVersion);
@@ -208,12 +216,16 @@ export class Yolo {
     const [, channels, modelHeight, modelWidth] = inputShape;
 
     const sourceRect = this.getSourceRect(img, roi);
-    const { drawWidth, drawHeight, xPad, yPad, gain } = this.calculateProportionalResize(
-      sourceRect.width,
-      sourceRect.height,
-      modelWidth,
-      modelHeight,
-    );
+    const resizeMode = this.options.imageResize ?? 'proportional';
+    const { drawWidth, drawHeight, xPad, yPad, gain } =
+      resizeMode === 'stretch'
+        ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 }
+        : this.calculateProportionalResize(
+            sourceRect.width,
+            sourceRect.height,
+            modelWidth,
+            modelHeight,
+          );
     const context = this.getPreprocessContext(modelWidth, modelHeight);
 
     context.clearRect(0, 0, modelWidth, modelHeight);
@@ -232,11 +244,23 @@ export class Yolo {
     const imageData = context.getImageData(0, 0, modelWidth, modelHeight).data;
     const pixelCount = modelWidth * modelHeight;
     const tensorData = this.getPreprocessTensorData(channels * pixelCount);
+    const imageMean = this.options.imageMean;
+    const imageStd = this.options.imageStd;
 
     for (let i = 0, pixel = 0; i < imageData.length; i += 4, pixel += 1) {
-      tensorData[pixel] = imageData[i] / 255;
-      tensorData[pixelCount + pixel] = imageData[i + 1] / 255;
-      tensorData[pixelCount * 2 + pixel] = imageData[i + 2] / 255;
+      const r = imageData[i] / 255;
+      const g = imageData[i + 1] / 255;
+      const b = imageData[i + 2] / 255;
+
+      if (imageMean && imageStd) {
+        tensorData[pixel] = (r - imageMean[0]) / imageStd[0];
+        tensorData[pixelCount + pixel] = (g - imageMean[1]) / imageStd[1];
+        tensorData[pixelCount * 2 + pixel] = (b - imageMean[2]) / imageStd[2];
+      } else {
+        tensorData[pixel] = r;
+        tensorData[pixelCount + pixel] = g;
+        tensorData[pixelCount * 2 + pixel] = b;
+      }
     }
 
     return {
@@ -248,6 +272,7 @@ export class Yolo {
       xPad,
       yPad,
       gain,
+      resizeMode,
       roi,
     };
   }
@@ -966,6 +991,7 @@ export class Yolo {
       V12: allTasks,
       V26: allTasks,
       RTDETR: ['ObjectDetection'],
+      RFDETR: ['ObjectDetection'],
       WORLDV2: ['ObjectDetection'],
     };
 

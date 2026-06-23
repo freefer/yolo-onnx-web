@@ -21,6 +21,11 @@ const backendSelect = getElement<HTMLSelectElement>('#backend');
 const inputModeSelect = getElement<HTMLSelectElement>('#inputMode');
 const modelUrlInput = getElement<HTMLInputElement>('#modelUrl');
 const modelFileInput = getElement<HTMLInputElement>('#modelFile');
+const classNamesFileInput = getElement<HTMLInputElement>('#classNamesFile');
+const confidenceInput = getElement<HTMLInputElement>('#confidenceInput');
+const iouInput = getElement<HTMLInputElement>('#iouInput');
+const confidenceValue = getElement<HTMLElement>('#confidenceValue');
+const iouValue = getElement<HTMLElement>('#iouValue');
 const imageFileInput = getElement<HTMLInputElement>('#imageFile');
 const imageInputGroup = getElement<HTMLElement>('#imageInputGroup');
 const startCameraButton = getElement<HTMLButtonElement>('#startCameraButton');
@@ -41,6 +46,9 @@ let isCameraInferencing = false;
 let cameraInferenceFrame = 0;
 let fpsLastTimestamp = 0;
 let fpsAverage = 0;
+let thresholdPreviewTimer = 0;
+let isThresholdPreviewRunning = false;
+let pendingThresholdPreview = false;
 
 type InferenceResult =
   | { modelType: 'Classification'; result: Classification[] }
@@ -75,6 +83,16 @@ modelFileInput.addEventListener('change', () => {
   });
 });
 
+classNamesFileInput.addEventListener('change', () => {
+  if (!hasModelSource()) {
+    return;
+  }
+
+  loadSelectedModel().catch(error => {
+    writeModelInfo(error instanceof Error ? error.stack ?? error.message : String(error));
+  });
+});
+
 imageFileInput.addEventListener('change', () => {
   updateRunButton();
 });
@@ -97,6 +115,16 @@ modelUrlInput.addEventListener('keydown', event => {
   modelUrlInput.blur();
 });
 
+confidenceInput.addEventListener('input', () => {
+  updateThresholdLabels();
+  scheduleThresholdPreview();
+});
+
+iouInput.addEventListener('input', () => {
+  updateThresholdLabels();
+  scheduleThresholdPreview();
+});
+
 runButton.addEventListener('click', () => {
   handleRunButtonClick().catch(error => {
     writeOutput(error instanceof Error ? error.stack ?? error.message : String(error));
@@ -115,6 +143,7 @@ stopCameraButton.addEventListener('click', () => {
 
 updateInputMode();
 updateRunButton();
+updateThresholdLabels();
 loadSelectedModel().catch(error => {
   writeModelInfo(error instanceof Error ? error.stack ?? error.message : String(error));
 });
@@ -127,10 +156,13 @@ async function loadSelectedModel(): Promise<void> {
 
   try {
     const model = await getModelSource();
+    const labels = await getClassNames();
     const executionProvider = getSelectedExecutionProvider();
     const nextYolo = await Yolo.create({
       model,
+      labels,
       wasmPaths: ORT_WASM_PATHS,
+      //imageResize:'proportional',
       executionProviders: [executionProvider],
     });
 
@@ -183,6 +215,48 @@ async function runImageInference(): Promise<void> {
     const elapsedMs = performance.now() - startedAt;
 
     drawInferenceResult(yolo, source, result, preview);
+    writeOutput(formatInferenceResult(result, elapsedMs));
+  } finally {
+    setInferencing(false);
+  }
+}
+
+async function runCurrentPreviewInference(): Promise<void> {
+  if (!yolo) {
+    return;
+  }
+
+  if (getInputMode() === 'camera') {
+    if (!cameraStream || cameraVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || isCameraInferencing) {
+      return;
+    }
+
+    await runSingleSourceInference(cameraVideo, false);
+    return;
+  }
+
+  if (!imageFileInput.files?.[0]) {
+    return;
+  }
+
+  await runImageInference();
+}
+
+async function runSingleSourceInference(source: YoloImageSource, drawSource = true): Promise<void> {
+  if (!yolo) {
+    return;
+  }
+
+  setInferencing(true);
+
+  try {
+    writeOutput('正在按当前阈值重新推理...');
+
+    const startedAt = performance.now();
+    const result = await runInferenceByModelType(yolo, source);
+    const elapsedMs = performance.now() - startedAt;
+
+    drawInferenceResult(yolo, source, result, preview, drawSource);
     writeOutput(formatInferenceResult(result, elapsedMs));
   } finally {
     setInferencing(false);
@@ -259,6 +333,39 @@ async function getModelSource(): Promise<YoloModelSource> {
   return url || DEFAULT_MODEL_URL;
 }
 
+async function getClassNames(): Promise<string[] | undefined> {
+  const file = classNamesFileInput.files?.[0];
+
+  if (!file) {
+    return undefined;
+  }
+
+  return parseClassNames(await file.text());
+}
+
+function parseClassNames(content: string): string[] {
+  const trimmed = content.trim();
+
+  if (!trimmed) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+
+    if (Array.isArray(parsed)) {
+      return parsed.map(String).map(label => label.trim()).filter(Boolean);
+    }
+  } catch {
+    // class_names.txt normally contains one class per line.
+  }
+
+  return trimmed
+    .split(/\r?\n|,/)
+    .map(label => label.trim())
+    .filter(Boolean);
+}
+
 async function getImageElement(): Promise<HTMLImageElement> {
   const file = imageFileInput.files?.[0];
 
@@ -313,6 +420,8 @@ function stopCamera(): void {
 
 async function runInferenceByModelType(yoloInstance: Yolo, source: YoloImageSource): Promise<InferenceResult> {
   const modelType = yoloInstance.onnxModel.modelType;
+  const confidence = getThresholdValue(confidenceInput, 0.2);
+  const iou = getThresholdValue(iouInput, 0.7);
 
   switch (modelType) {
     case 'Classification':
@@ -323,25 +432,69 @@ async function runInferenceByModelType(yoloInstance: Yolo, source: YoloImageSour
     case 'ObjectDetection':
       return {
         modelType,
-        result: await yoloInstance.RunObjectDetection(source),
+        result: await yoloInstance.RunObjectDetection(source, confidence, iou),
       };
     case 'ObbDetection':
       return {
         modelType,
-        result: await yoloInstance.RunObbDetection(source),
+        result: await yoloInstance.RunObbDetection(source, confidence, iou),
       };
     case 'Segmentation':
       return {
         modelType,
-        result: await yoloInstance.RunSegmentation(source),
+        result: await yoloInstance.RunSegmentation(source, confidence, 0.65, iou),
       };
     case 'PoseEstimation':
       return {
         modelType,
-        result: await yoloInstance.RunPoseEstimation(source),
+        result: await yoloInstance.RunPoseEstimation(source, confidence, iou),
       };
     default:
       throw new Error(`Unsupported model type: ${modelType satisfies never}`);
+  }
+}
+
+function getThresholdValue(input: HTMLInputElement, fallback: number): number {
+  const value = Number(input.value);
+
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(value, 0), 1);
+}
+
+function updateThresholdLabels(): void {
+  confidenceValue.textContent = getThresholdValue(confidenceInput, 0.2).toFixed(2);
+  iouValue.textContent = getThresholdValue(iouInput, 0.7).toFixed(2);
+}
+
+function scheduleThresholdPreview(): void {
+  window.clearTimeout(thresholdPreviewTimer);
+  thresholdPreviewTimer = window.setTimeout(() => {
+    runThresholdPreview().catch(error => {
+      writeOutput(error instanceof Error ? error.stack ?? error.message : String(error));
+    });
+  }, 150);
+}
+
+async function runThresholdPreview(): Promise<void> {
+  if (isThresholdPreviewRunning) {
+    pendingThresholdPreview = true;
+    return;
+  }
+
+  isThresholdPreviewRunning = true;
+
+  try {
+    await runCurrentPreviewInference();
+  } finally {
+    isThresholdPreviewRunning = false;
+
+    if (pendingThresholdPreview) {
+      pendingThresholdPreview = false;
+      scheduleThresholdPreview();
+    }
   }
 }
 
@@ -485,6 +638,7 @@ function setLoadingModel(isLoading: boolean): void {
   backendSelect.disabled = isLoading;
   inputModeSelect.disabled = isLoading;
   modelFileInput.disabled = isLoading;
+  classNamesFileInput.disabled = isLoading;
   modelUrlInput.disabled = isLoading;
   updateRunButton(isLoading);
 }

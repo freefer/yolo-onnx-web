@@ -60,12 +60,13 @@ declare const YoloWebExecutionProviderOptions: readonly [{
     readonly label: "CPU";
 }];
 type ModelType = 'Classification' | 'ObjectDetection' | 'ObbDetection' | 'Segmentation' | 'PoseEstimation';
-type ModelVersion = 'V5U' | 'V8' | 'V8E' | 'V9' | 'V10' | 'V11' | 'V11E' | 'V12' | 'V26' | 'RTDETR' | 'WORLDV2';
+type ModelVersion = 'V5U' | 'V8' | 'V8E' | 'V9' | 'V10' | 'V11' | 'V11E' | 'V12' | 'V26' | 'RTDETR' | 'RFDETR' | 'WORLDV2';
 type ModelDataType = 'Float' | 'Float16';
 interface LabelModel {
     index: number;
     name: string;
 }
+type YoloLabels = readonly string[] | string;
 interface Point {
     x: number;
     y: number;
@@ -138,6 +139,7 @@ interface YoloPreprocessResult {
     xPad: number;
     yPad: number;
     gain: number;
+    resizeMode: 'proportional' | 'stretch';
     roi: Rect | null;
 }
 declare class TrackingInfo {
@@ -202,6 +204,18 @@ interface YoloOptions extends OnnxRuntimeWebOptions {
     executionProviders?: readonly YoloExecutionProvider[];
     /** Extra onnxruntime-web session options. */
     sessionOptions?: ort.InferenceSession.SessionOptions;
+    /** Optional model type override for ONNX models without custom metadata. */
+    modelType?: ModelType;
+    /** Optional model version override for ONNX models without custom metadata. */
+    modelVersion?: ModelVersion;
+    /** Optional labels override for ONNX models without embedded class names. Accepts string[] or class_names.txt text. */
+    labels?: YoloLabels;
+    /** Resize mode used before inference. Defaults to proportional letterbox. */
+    imageResize?: 'proportional' | 'stretch';
+    /** Optional channel-wise input mean after scaling pixels to 0..1. */
+    imageMean?: readonly [number, number, number];
+    /** Optional channel-wise input standard deviation after scaling pixels to 0..1. */
+    imageStd?: readonly [number, number, number];
 }
 type YoloFeeds = ort.InferenceSession.FeedsType;
 type YoloFetches = ort.InferenceSession.FetchesType;
@@ -233,6 +247,7 @@ declare class Yolo {
     private preprocessTensorData;
     private preprocessTensorSize;
     constructor(options?: YoloOptions);
+    get yoloOptions(): YoloOptions;
     static create(options: YoloOptions): Promise<Yolo>;
     get isLoaded(): boolean;
     get inputNames(): readonly string[];
@@ -284,4 +299,4 @@ declare class Yolo {
     private isSupportedModel;
 }
 
-export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };
+export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };

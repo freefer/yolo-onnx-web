@@ -123,20 +123,21 @@ var Classification = class {
 var MODEL_METADATA_PROPS_FIELD = 14;
 var STRING_ENTRY_KEY_FIELD = 1;
 var STRING_ENTRY_VALUE_FIELD = 2;
-async function parseOnnxModel(session, model) {
-  var _a;
+async function parseOnnxModel(session, model, options = {}) {
+  var _a, _b, _c;
   const customMetaData = await parseCustomMetadata(model);
   const inputShapes = getShapes(session.inputMetadata);
   const outputShapes = getShapes(session.outputMetadata);
   const firstInputShape = (_a = Object.values(inputShapes)[0]) != null ? _a : [];
+  const labels = options.labels ? mapLabels(parseLabelsInput(options.labels)) : customMetaData.names ? mapLabelsAndColors(customMetaData.names) : inferLabels(outputShapes);
   return {
     inputShapes,
     outputShapes,
     customMetaData,
     modelDataType: getModelDataType(session.inputMetadata),
-    modelType: getModelType(requireMetadata(customMetaData, "task")),
-    modelVersion: getModelVersion(requireMetadata(customMetaData, "description")),
-    labels: mapLabelsAndColors(requireMetadata(customMetaData, "names")),
+    modelType: (_b = options.modelType) != null ? _b : getModelType(customMetaData, outputShapes),
+    modelVersion: (_c = options.modelVersion) != null ? _c : getModelVersion(customMetaData, outputShapes),
+    labels,
     inputShapeSize: calculateTotalInputShapeSize(firstInputShape)
   };
 }
@@ -181,7 +182,16 @@ function getModelDataType(metadata) {
   const firstTensor = metadata.find((item) => item.isTensor);
   return (firstTensor == null ? void 0 : firstTensor.isTensor) && firstTensor.type === "float16" ? "Float16" : "Float";
 }
-function getModelType(modelType) {
+function getModelType(metadata, outputShapes) {
+  if (metadata.task) {
+    return getModelTypeFromMetadata(metadata.task);
+  }
+  if (isRfdetrOutput(outputShapes)) {
+    return "ObjectDetection";
+  }
+  throw new Error("Unsupported task");
+}
+function getModelTypeFromMetadata(modelType) {
   switch (modelType) {
     case "classify":
       return "Classification";
@@ -197,7 +207,16 @@ function getModelType(modelType) {
       throw new Error("Unsupported task");
   }
 }
-function getModelVersion(modelDescription) {
+function getModelVersion(metadata, outputShapes) {
+  if (metadata.description) {
+    return getModelVersionFromDescription(metadata.description);
+  }
+  if (isRfdetrOutput(outputShapes)) {
+    return "RFDETR";
+  }
+  throw new Error("Onnx model not supported!");
+}
+function getModelVersionFromDescription(modelDescription) {
   const version = modelDescription.toLowerCase();
   if (version.startsWith("ultralytics yolov5")) return "V5U";
   if (version.startsWith("ultralytics yolov8")) return "V8";
@@ -218,6 +237,36 @@ function mapLabelsAndColors(onnxLabelData) {
   return Object.entries(labels).map(([, name], index) => ({
     index,
     name
+  }));
+}
+function mapLabels(labels) {
+  return labels.map((name, index) => ({ index, name }));
+}
+function parseLabelsInput(labels) {
+  if (typeof labels !== "string") {
+    return labels.map((label) => label.trim()).filter(Boolean);
+  }
+  const content = labels.trim();
+  if (!content) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) {
+      return parsed.map(String).map((label) => label.trim()).filter(Boolean);
+    }
+  } catch (e) {
+  }
+  return content.split(/\r?\n|,/).map((label) => label.trim()).filter(Boolean);
+}
+function inferLabels(outputShapes) {
+  const classCount = tryGetRfdetrClassCount(outputShapes);
+  if (classCount === null) {
+    throw new Error('ONNX custom metadata "names" is missing. Pass labels in YoloOptions for metadata-free models.');
+  }
+  return Array.from({ length: classCount }, (_, index) => ({
+    index,
+    name: index === 0 ? "background_class" : `class_${index}`
   }));
 }
 function parseLabels(onnxLabelData) {
@@ -248,12 +297,13 @@ function calculateTotalInputShapeSize(shape) {
   }
   return shapeSize;
 }
-function requireMetadata(metadata, key) {
-  const value = metadata[key];
-  if (value === void 0) {
-    throw new Error(`ONNX custom metadata "${key}" is missing.`);
-  }
-  return value;
+function isRfdetrOutput(outputShapes) {
+  const dets = outputShapes.dets;
+  const labels = outputShapes.labels;
+  return Boolean(dets && labels && dets.length === 3 && labels.length === 3 && dets[2] === 4);
+}
+function tryGetRfdetrClassCount(outputShapes) {
+  return isRfdetrOutput(outputShapes) ? outputShapes.labels[2] : null;
 }
 function parseStringStringEntry(bytes) {
   let key = "";
@@ -1017,6 +1067,422 @@ var RT_DETRHandler = class {
   }
 };
 
+// src/handler/RF-DETR/RF-DETR-handler.ts
+var BACKGROUND_CLASS_PREFIX = "background_class";
+var DEFAULT_IMAGE_MEAN = [0.485, 0.456, 0.406];
+var DEFAULT_IMAGE_STD = [0.229, 0.224, 0.225];
+var RF_DETRHandler = class {
+  constructor(yolo) {
+    this.preprocessCanvas = null;
+    this.preprocessContext = null;
+    this.preprocessTensorData = null;
+    this.preprocessTensorSize = 0;
+    this.x0Lookup = null;
+    this.x1Lookup = null;
+    this.xWeightLookup = null;
+    this.y0Lookup = null;
+    this.y1Lookup = null;
+    this.yWeightLookup = null;
+    this.interpolationCacheKey = "";
+    this.topIndices = null;
+    this.topScores = null;
+    this._yolo = yolo;
+  }
+  preprocessImage(img, roi = null) {
+    var _a, _b, _c;
+    const inputShape = this.getInputShape();
+    const [, channels, modelHeight, modelWidth] = inputShape;
+    const sourceRect = this.getSourceRect(img, roi);
+    const resizeMode = (_a = this._yolo.yoloOptions.imageResize) != null ? _a : "stretch";
+    const { drawWidth, drawHeight, xPad, yPad, gain } = resizeMode === "stretch" ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 } : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
+    const context = this.getPreprocessContext(sourceRect.width, sourceRect.height);
+    context.clearRect(0, 0, sourceRect.width, sourceRect.height);
+    context.drawImage(
+      img,
+      sourceRect.x,
+      sourceRect.y,
+      sourceRect.width,
+      sourceRect.height,
+      0,
+      0,
+      sourceRect.width,
+      sourceRect.height
+    );
+    const imageData = context.getImageData(0, 0, sourceRect.width, sourceRect.height).data;
+    const pixelCount = modelWidth * modelHeight;
+    const tensorData = this.getPreprocessTensorData(channels * pixelCount);
+    const imageMean = (_b = this._yolo.yoloOptions.imageMean) != null ? _b : DEFAULT_IMAGE_MEAN;
+    const imageStd = (_c = this._yolo.yoloOptions.imageStd) != null ? _c : DEFAULT_IMAGE_STD;
+    this.writePreprocessedTensor(
+      imageData,
+      sourceRect.width,
+      sourceRect.height,
+      modelWidth,
+      modelHeight,
+      drawWidth,
+      drawHeight,
+      xPad,
+      yPad,
+      imageMean,
+      imageStd,
+      tensorData
+    );
+    return {
+      tensorData,
+      inputName: this._yolo.inputNames[0],
+      inputShape,
+      sourceWidth: sourceRect.width,
+      sourceHeight: sourceRect.height,
+      xPad,
+      yPad,
+      gain,
+      resizeMode,
+      roi
+    };
+  }
+  async RunObjectDetection(img, confidence, iou, roi = null) {
+    var _a, _b;
+    if (this._yolo.onnxModel.modelType !== "ObjectDetection") {
+      unsupportedTask("ObjectDetection");
+    }
+    const input = this.preprocessImage(img, roi);
+    const result = await this._yolo.run({
+      [input.inputName]: this._yolo.tensor("float32", input.tensorData, input.inputShape)
+    });
+    const dets = (_a = result.dets) == null ? void 0 : _a.data;
+    const labels = (_b = result.labels) == null ? void 0 : _b.data;
+    if (!dets || !labels) {
+      throw new Error(`Unsupported RF-DETR outputs: ${Object.keys(result).join(", ")}`);
+    }
+    return this.decodeObjectDetections(dets, labels, input, confidence);
+  }
+  RunObbDetection(img, confidence, iou, roi = null) {
+    unsupportedTask("ObbDetection");
+  }
+  RunSegmentation(img, confidence, pixelConfidence, iou, roi = null) {
+    unsupportedTask("Segmentation");
+  }
+  RunPoseEstimation(img, confidence, iou, roi = null) {
+    unsupportedTask("PoseEstimation");
+  }
+  RunClassification(img, classes) {
+    unsupportedTask("Classification");
+  }
+  decodeObjectDetections(dets, logits, input, confidence) {
+    const detsShape = this._yolo.onnxModel.outputShapes.dets;
+    const labelsShape = this._yolo.onnxModel.outputShapes.labels;
+    if (!detsShape || !labelsShape || detsShape.length !== 3 || labelsShape.length !== 3) {
+      throw new Error(`Unsupported RF-DETR output shapes: ${JSON.stringify(this._yolo.onnxModel.outputShapes)}`);
+    }
+    const predictions = detsShape[1];
+    const classCount = labelsShape[2];
+    const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
+      (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
+    );
+    const labels = backgroundClassIndex >= 0 ? this._yolo.onnxModel.labels.filter((label) => label.index !== backgroundClassIndex).map((label, index) => ({ ...label, index })) : this._yolo.onnxModel.labels;
+    const maxDetections = predictions;
+    const { topIndices, topScores } = this.getTopKBuffers(maxDetections);
+    const objects = [];
+    let topCount = 0;
+    let minScore = Number.POSITIVE_INFINITY;
+    let minPosition = -1;
+    for (let prediction = 0; prediction < predictions; prediction += 1) {
+      const labelOffset = prediction * classCount;
+      for (let labelIndex = 0; labelIndex < classCount; labelIndex += 1) {
+        const score = this.sigmoid(logits[labelOffset + labelIndex]);
+        const flatIndex = labelOffset + labelIndex;
+        if (topCount < maxDetections) {
+          topIndices[topCount] = flatIndex;
+          topScores[topCount] = score;
+          if (score < minScore) {
+            minScore = score;
+            minPosition = topCount;
+          }
+          topCount += 1;
+          continue;
+        }
+        if (score <= minScore) {
+          continue;
+        }
+        topIndices[minPosition] = flatIndex;
+        topScores[minPosition] = score;
+        minScore = topScores[0];
+        minPosition = 0;
+        for (let i = 1; i < topCount; i += 1) {
+          const candidateScore = topScores[i];
+          if (candidateScore < minScore) {
+            minScore = candidateScore;
+            minPosition = i;
+          }
+        }
+      }
+    }
+    this.sortTopKDescending(topIndices, topScores, topCount);
+    for (let i = 0; i < topCount; i += 1) {
+      const candidateConfidence = topScores[i];
+      if (candidateConfidence < confidence) {
+        continue;
+      }
+      const flatIndex = topIndices[i];
+      const prediction = Math.trunc(flatIndex / classCount);
+      const labelIndex = flatIndex - prediction * classCount;
+      if (labelIndex === backgroundClassIndex) {
+        continue;
+      }
+      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex ? labelIndex - 1 : labelIndex;
+      const label = labels[mappedLabelIndex];
+      if (!label) {
+        continue;
+      }
+      const boxOffset = prediction * 4;
+      const cx = dets[boxOffset];
+      const cy = dets[boxOffset + 1];
+      const w = dets[boxOffset + 2];
+      const h = dets[boxOffset + 3];
+      const x1 = cx - w / 2;
+      const y1 = cy - h / 2;
+      const x2 = cx + w / 2;
+      const y2 = cy + h / 2;
+      objects.push(new ObjectDetection({
+        label,
+        confidence: candidateConfidence,
+        boundingBox: this.scaleNormalizedBoundingBox(x1, y1, x2, y2, input)
+      }));
+    }
+    return objects;
+  }
+  getTopKBuffers(size) {
+    if (!this.topIndices || this.topIndices.length < size) {
+      this.topIndices = new Int32Array(size);
+      this.topScores = new Float32Array(size);
+    }
+    return {
+      topIndices: this.topIndices,
+      topScores: this.topScores
+    };
+  }
+  sortTopKDescending(indices, scores, length) {
+    for (let i = 1; i < length; i += 1) {
+      const score = scores[i];
+      const index = indices[i];
+      let j = i - 1;
+      while (j >= 0 && scores[j] < score) {
+        scores[j + 1] = scores[j];
+        indices[j + 1] = indices[j];
+        j -= 1;
+      }
+      scores[j + 1] = score;
+      indices[j + 1] = index;
+    }
+  }
+  sigmoid(value) {
+    return 1 / (1 + Math.exp(-value));
+  }
+  scaleNormalizedBoundingBox(x1, y1, x2, y2, input) {
+    var _a, _b, _c, _d;
+    const roiLeft = (_b = (_a = input.roi) == null ? void 0 : _a.left) != null ? _b : 0;
+    const roiTop = (_d = (_c = input.roi) == null ? void 0 : _c.top) != null ? _d : 0;
+    if (input.resizeMode === "stretch") {
+      return {
+        left: roiLeft + clamp(Math.trunc(x1 * input.sourceWidth), 0, input.sourceWidth - 1),
+        top: roiTop + clamp(Math.trunc(y1 * input.sourceHeight), 0, input.sourceHeight - 1),
+        right: roiLeft + clamp(Math.trunc(x2 * input.sourceWidth), 0, input.sourceWidth),
+        bottom: roiTop + clamp(Math.trunc(y2 * input.sourceHeight), 0, input.sourceHeight)
+      };
+    }
+    return this._yolo.scaleBoundingBox(
+      x1 * input.inputShape[3],
+      y1 * input.inputShape[2],
+      x2 * input.inputShape[3],
+      y2 * input.inputShape[2],
+      input
+    );
+  }
+  getInputShape() {
+    const shape = Object.values(this._yolo.onnxModel.inputShapes)[0];
+    if (!shape || shape.length !== 4) {
+      throw new Error(`Unsupported RF-DETR input shape: ${JSON.stringify(shape)}`);
+    }
+    return [shape[0], shape[1], shape[2], shape[3]];
+  }
+  writePreprocessedTensor(imageData, sourceWidth, sourceHeight, modelWidth, modelHeight, drawWidth, drawHeight, xPad, yPad, imageMean, imageStd, tensorData) {
+    const pixelCount = modelWidth * modelHeight;
+    tensorData.fill(0);
+    const outputLeft = Math.trunc(xPad);
+    const outputTop = Math.trunc(yPad);
+    const outputWidth = Math.max(1, Math.trunc(drawWidth));
+    const outputHeight = Math.max(1, Math.trunc(drawHeight));
+    this.ensureInterpolationCache(sourceWidth, sourceHeight, outputWidth, outputHeight);
+    const x0Lookup = this.x0Lookup;
+    const x1Lookup = this.x1Lookup;
+    const xWeightLookup = this.xWeightLookup;
+    const y0Lookup = this.y0Lookup;
+    const y1Lookup = this.y1Lookup;
+    const yWeightLookup = this.yWeightLookup;
+    for (let y = 0; y < outputHeight; y += 1) {
+      const targetY = outputTop + y;
+      if (targetY < 0 || targetY >= modelHeight) {
+        continue;
+      }
+      const y0 = y0Lookup[y];
+      const y1 = y1Lookup[y];
+      const yWeight = yWeightLookup[y];
+      const topRow = y0 * sourceWidth * 4;
+      const bottomRow = y1 * sourceWidth * 4;
+      for (let x = 0; x < outputWidth; x += 1) {
+        const targetX = outputLeft + x;
+        if (targetX < 0 || targetX >= modelWidth) {
+          continue;
+        }
+        const x0 = x0Lookup[x];
+        const x1 = x1Lookup[x];
+        const xWeight = xWeightLookup[x];
+        const targetPixel = targetY * modelWidth + targetX;
+        const topLeft = topRow + x0 * 4;
+        const topRight = topRow + x1 * 4;
+        const bottomLeft = bottomRow + x0 * 4;
+        const bottomRight = bottomRow + x1 * 4;
+        const r = this.interpolate(imageData[topLeft], imageData[topRight], imageData[bottomLeft], imageData[bottomRight], xWeight, yWeight);
+        const g = this.interpolate(imageData[topLeft + 1], imageData[topRight + 1], imageData[bottomLeft + 1], imageData[bottomRight + 1], xWeight, yWeight);
+        const b = this.interpolate(imageData[topLeft + 2], imageData[topRight + 2], imageData[bottomLeft + 2], imageData[bottomRight + 2], xWeight, yWeight);
+        tensorData[targetPixel] = (r / 255 - imageMean[0]) / imageStd[0];
+        tensorData[pixelCount + targetPixel] = (g / 255 - imageMean[1]) / imageStd[1];
+        tensorData[pixelCount * 2 + targetPixel] = (b / 255 - imageMean[2]) / imageStd[2];
+      }
+    }
+  }
+  ensureInterpolationCache(sourceWidth, sourceHeight, outputWidth, outputHeight) {
+    const cacheKey = `${sourceWidth}:${sourceHeight}:${outputWidth}:${outputHeight}`;
+    if (this.interpolationCacheKey === cacheKey) {
+      return;
+    }
+    this.interpolationCacheKey = cacheKey;
+    this.x0Lookup = new Int32Array(outputWidth);
+    this.x1Lookup = new Int32Array(outputWidth);
+    this.xWeightLookup = new Float32Array(outputWidth);
+    this.y0Lookup = new Int32Array(outputHeight);
+    this.y1Lookup = new Int32Array(outputHeight);
+    this.yWeightLookup = new Float32Array(outputHeight);
+    this.fillInterpolationAxis(this.x0Lookup, this.x1Lookup, this.xWeightLookup, outputWidth, sourceWidth);
+    this.fillInterpolationAxis(this.y0Lookup, this.y1Lookup, this.yWeightLookup, outputHeight, sourceHeight);
+  }
+  fillInterpolationAxis(lowerLookup, upperLookup, weightLookup, targetSize, sourceSize) {
+    for (let target = 0; target < targetSize; target += 1) {
+      const source = (target + 0.5) * (sourceSize / targetSize) - 0.5;
+      const index = Math.floor(source);
+      if (index < 0) {
+        lowerLookup[target] = 0;
+        upperLookup[target] = 0;
+        weightLookup[target] = 0;
+      } else if (index >= sourceSize - 1) {
+        lowerLookup[target] = sourceSize - 1;
+        upperLookup[target] = sourceSize - 1;
+        weightLookup[target] = 0;
+      } else {
+        lowerLookup[target] = index;
+        upperLookup[target] = index + 1;
+        weightLookup[target] = source - index;
+      }
+    }
+  }
+  interpolate(topLeft, topRight, bottomLeft, bottomRight, xWeight, yWeight) {
+    const top = topLeft + (topRight - topLeft) * xWeight;
+    const bottom = bottomLeft + (bottomRight - bottomLeft) * xWeight;
+    return top + (bottom - top) * yWeight;
+  }
+  getSourceRect(img, roi) {
+    const { width, height } = this.getImageSourceSize(img);
+    if (!roi) {
+      return { x: 0, y: 0, width, height };
+    }
+    const left = clamp(Math.trunc(roi.left), 0, width - 1);
+    const top = clamp(Math.trunc(roi.top), 0, height - 1);
+    const right = clamp(Math.trunc(roi.right), left + 1, width);
+    const bottom = clamp(Math.trunc(roi.bottom), top + 1, height);
+    return {
+      x: left,
+      y: top,
+      width: right - left,
+      height: bottom - top
+    };
+  }
+  calculateProportionalResize(sourceWidth, sourceHeight, modelWidth, modelHeight) {
+    if (sourceWidth < modelWidth && sourceHeight < modelHeight) {
+      return {
+        drawWidth: sourceWidth,
+        drawHeight: sourceHeight,
+        xPad: (modelWidth - sourceWidth) * 0.5,
+        yPad: (modelHeight - sourceHeight) * 0.5,
+        gain: 1
+      };
+    }
+    const ratio = Math.min(modelWidth / sourceWidth, modelHeight / sourceHeight);
+    const drawWidth = sourceWidth * ratio;
+    const drawHeight = sourceHeight * ratio;
+    return {
+      drawWidth,
+      drawHeight,
+      xPad: (modelWidth - drawWidth) * 0.5,
+      yPad: (modelHeight - drawHeight) * 0.5,
+      gain: Math.max(sourceWidth / modelWidth, sourceHeight / modelHeight)
+    };
+  }
+  getPreprocessContext(width, height) {
+    if (!this.preprocessCanvas) {
+      this.preprocessCanvas = document.createElement("canvas");
+    }
+    if (this.preprocessCanvas.width !== width) {
+      this.preprocessCanvas.width = width;
+    }
+    if (this.preprocessCanvas.height !== height) {
+      this.preprocessCanvas.height = height;
+    }
+    if (!this.preprocessContext) {
+      this.preprocessContext = this.preprocessCanvas.getContext("2d", { willReadFrequently: true });
+    }
+    if (!this.preprocessContext) {
+      throw new Error("Canvas 2D context is not available.");
+    }
+    return this.preprocessContext;
+  }
+  getPreprocessTensorData(size) {
+    if (!this.preprocessTensorData || this.preprocessTensorSize !== size) {
+      this.preprocessTensorData = new Float32Array(size);
+      this.preprocessTensorSize = size;
+    }
+    return this.preprocessTensorData;
+  }
+  getImageSourceSize(img) {
+    if (img instanceof HTMLImageElement) {
+      return {
+        width: img.naturalWidth || img.width,
+        height: img.naturalHeight || img.height
+      };
+    }
+    if (img instanceof HTMLVideoElement) {
+      return {
+        width: img.videoWidth || img.width,
+        height: img.videoHeight || img.height
+      };
+    }
+    if ("displayWidth" in img && "displayHeight" in img) {
+      return {
+        width: img.displayWidth || img.codedWidth,
+        height: img.displayHeight || img.codedHeight
+      };
+    }
+    if (img instanceof SVGImageElement) {
+      const width = img.width.baseVal.value || img.getBoundingClientRect().width;
+      const height = img.height.baseVal.value || img.getBoundingClientRect().height;
+      return { width, height };
+    }
+    return {
+      width: img.width,
+      height: img.height
+    };
+  }
+};
+
 // src/yolo.ts
 var DEFAULT_EXECUTION_PROVIDERS = ["wasm"];
 var DEFAULT_BOX_COLORS = [
@@ -1060,6 +1526,9 @@ var Yolo = class _Yolo {
     this.model = options.model;
     ensureOnnxRuntimeWebInitialized(options);
   }
+  get yoloOptions() {
+    return this.options;
+  }
   static async create(options) {
     const yolo = new _Yolo(options);
     if (options.model) {
@@ -1085,7 +1554,7 @@ var Yolo = class _Yolo {
   async load(model = this.requireModel()) {
     await this.dispose();
     this.session = await this.createSession(model);
-    this._onnxModel = await parseOnnxModel(this.session, model);
+    this._onnxModel = await parseOnnxModel(this.session, model, this.options);
     var modelVersion = this._onnxModel.modelVersion;
     var modelType = this._onnxModel.modelType;
     if (!this.isSupportedModel(modelVersion, modelType)) {
@@ -1110,6 +1579,9 @@ var Yolo = class _Yolo {
         break;
       case "RTDETR":
         this._handler = new RT_DETRHandler(this);
+        break;
+      case "RFDETR":
+        this._handler = new RF_DETRHandler(this);
         break;
       default:
         throw new Error("Unsupported model version: " + modelVersion);
@@ -1141,10 +1613,12 @@ var Yolo = class _Yolo {
     return this.ensureHandler().RunClassification(img, classes);
   }
   preprocessImage(img, roi = null) {
+    var _a;
     const inputShape = this.getInputShape();
     const [, channels, modelHeight, modelWidth] = inputShape;
     const sourceRect = this.getSourceRect(img, roi);
-    const { drawWidth, drawHeight, xPad, yPad, gain } = this.calculateProportionalResize(
+    const resizeMode = (_a = this.options.imageResize) != null ? _a : "proportional";
+    const { drawWidth, drawHeight, xPad, yPad, gain } = resizeMode === "stretch" ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 } : this.calculateProportionalResize(
       sourceRect.width,
       sourceRect.height,
       modelWidth,
@@ -1166,10 +1640,21 @@ var Yolo = class _Yolo {
     const imageData = context.getImageData(0, 0, modelWidth, modelHeight).data;
     const pixelCount = modelWidth * modelHeight;
     const tensorData = this.getPreprocessTensorData(channels * pixelCount);
+    const imageMean = this.options.imageMean;
+    const imageStd = this.options.imageStd;
     for (let i = 0, pixel = 0; i < imageData.length; i += 4, pixel += 1) {
-      tensorData[pixel] = imageData[i] / 255;
-      tensorData[pixelCount + pixel] = imageData[i + 1] / 255;
-      tensorData[pixelCount * 2 + pixel] = imageData[i + 2] / 255;
+      const r = imageData[i] / 255;
+      const g = imageData[i + 1] / 255;
+      const b = imageData[i + 2] / 255;
+      if (imageMean && imageStd) {
+        tensorData[pixel] = (r - imageMean[0]) / imageStd[0];
+        tensorData[pixelCount + pixel] = (g - imageMean[1]) / imageStd[1];
+        tensorData[pixelCount * 2 + pixel] = (b - imageMean[2]) / imageStd[2];
+      } else {
+        tensorData[pixel] = r;
+        tensorData[pixelCount + pixel] = g;
+        tensorData[pixelCount * 2 + pixel] = b;
+      }
     }
     return {
       tensorData,
@@ -1180,6 +1665,7 @@ var Yolo = class _Yolo {
       xPad,
       yPad,
       gain,
+      resizeMode,
       roi
     };
   }
@@ -1698,6 +2184,7 @@ var Yolo = class _Yolo {
       V12: allTasks,
       V26: allTasks,
       RTDETR: ["ObjectDetection"],
+      RFDETR: ["ObjectDetection"],
       WORLDV2: ["ObjectDetection"]
     };
     return supportMap[modelVersion].includes(modelType);

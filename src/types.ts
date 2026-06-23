@@ -45,7 +45,19 @@ export const YoloWebExecutionProviderOptions = [
 
 export type ModelType = 'Classification' | 'ObjectDetection' | 'ObbDetection' | 'Segmentation' | 'PoseEstimation';
 
-export type ModelVersion = 'V5U' | 'V8' | 'V8E' | 'V9' | 'V10' | 'V11' | 'V11E' | 'V12' | 'V26' | 'RTDETR' | 'WORLDV2';
+export type ModelVersion =
+  | 'V5U'
+  | 'V8'
+  | 'V8E'
+  | 'V9'
+  | 'V10'
+  | 'V11'
+  | 'V11E'
+  | 'V12'
+  | 'V26'
+  | 'RTDETR'
+  | 'RFDETR'
+  | 'WORLDV2';
 
 export type ModelDataType = 'Float' | 'Float16';
 
@@ -53,6 +65,8 @@ export interface LabelModel {
   index: number;
   name: string;
 }
+
+export type YoloLabels = readonly string[] | string;
 
 export interface Point {
   x: number;
@@ -136,6 +150,7 @@ export interface YoloPreprocessResult {
   xPad: number;
   yPad: number;
   gain: number;
+  resizeMode: 'proportional' | 'stretch';
   roi: Rect | null;
 }
 
@@ -234,6 +249,24 @@ export interface YoloOptions extends OnnxRuntimeWebOptions {
 
   /** Extra onnxruntime-web session options. */
   sessionOptions?: ort.InferenceSession.SessionOptions;
+
+  /** Optional model type override for ONNX models without custom metadata. */
+  modelType?: ModelType;
+
+  /** Optional model version override for ONNX models without custom metadata. */
+  modelVersion?: ModelVersion;
+
+  /** Optional labels override for ONNX models without embedded class names. Accepts string[] or class_names.txt text. */
+  labels?: YoloLabels;
+
+  /** Resize mode used before inference. Defaults to proportional letterbox. */
+  imageResize?: 'proportional' | 'stretch';
+
+  /** Optional channel-wise input mean after scaling pixels to 0..1. */
+  imageMean?: readonly [number, number, number];
+
+  /** Optional channel-wise input standard deviation after scaling pixels to 0..1. */
+  imageStd?: readonly [number, number, number];
 }
 
 export type YoloFeeds = ort.InferenceSession.FeedsType;

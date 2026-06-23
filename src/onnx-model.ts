@@ -1,5 +1,5 @@
 import type * as OrtTypes from 'onnxruntime-web';
-import type { LabelModel, ModelDataType, ModelType, ModelVersion, OnnxModel, YoloModelSource } from './types';
+import type { LabelModel, ModelDataType, ModelType, ModelVersion, OnnxModel, YoloLabels, YoloModelSource, YoloOptions } from './types';
 
 interface ProtobufField {
   fieldNumber: number;
@@ -18,20 +18,26 @@ const STRING_ENTRY_VALUE_FIELD = 2;
 export async function parseOnnxModel(
   session: OrtTypes.InferenceSession,
   model: YoloModelSource,
+  options: Pick<YoloOptions, 'labels' | 'modelType' | 'modelVersion'> = {},
 ): Promise<OnnxModel> {
   const customMetaData = await parseCustomMetadata(model);
   const inputShapes = getShapes(session.inputMetadata);
   const outputShapes = getShapes(session.outputMetadata);
   const firstInputShape = Object.values(inputShapes)[0] ?? [];
+  const labels = options.labels
+    ? mapLabels(parseLabelsInput(options.labels))
+    : customMetaData.names
+      ? mapLabelsAndColors(customMetaData.names)
+      : inferLabels(outputShapes);
 
   return {
     inputShapes,
     outputShapes,
     customMetaData,
     modelDataType: getModelDataType(session.inputMetadata),
-    modelType: getModelType(requireMetadata(customMetaData, 'task')),
-    modelVersion: getModelVersion(requireMetadata(customMetaData, 'description')),
-    labels: mapLabelsAndColors(requireMetadata(customMetaData, 'names')),
+    modelType: options.modelType ?? getModelType(customMetaData, outputShapes),
+    modelVersion: options.modelVersion ?? getModelVersion(customMetaData, outputShapes),
+    labels,
     inputShapeSize: calculateTotalInputShapeSize(firstInputShape),
   };
 }
@@ -93,7 +99,19 @@ function getModelDataType(metadata: readonly OrtTypes.InferenceSession.ValueMeta
   return firstTensor?.isTensor && firstTensor.type === 'float16' ? 'Float16' : 'Float';
 }
 
-function getModelType(modelType: string): ModelType {
+function getModelType(metadata: Record<string, string>, outputShapes: Record<string, number[]>): ModelType {
+  if (metadata.task) {
+    return getModelTypeFromMetadata(metadata.task);
+  }
+
+  if (isRfdetrOutput(outputShapes)) {
+    return 'ObjectDetection';
+  }
+
+  throw new Error('Unsupported task');
+}
+
+function getModelTypeFromMetadata(modelType: string): ModelType {
   switch (modelType) {
     case 'classify':
       return 'Classification';
@@ -110,7 +128,19 @@ function getModelType(modelType: string): ModelType {
   }
 }
 
-function getModelVersion(modelDescription: string): ModelVersion {
+function getModelVersion(metadata: Record<string, string>, outputShapes: Record<string, number[]>): ModelVersion {
+  if (metadata.description) {
+    return getModelVersionFromDescription(metadata.description);
+  }
+
+  if (isRfdetrOutput(outputShapes)) {
+    return 'RFDETR';
+  }
+
+  throw new Error('Onnx model not supported!');
+}
+
+function getModelVersionFromDescription(modelDescription: string): ModelVersion {
   const version = modelDescription.toLowerCase();
 
   if (version.startsWith('ultralytics yolov5')) return 'V5U';
@@ -135,6 +165,50 @@ function mapLabelsAndColors(onnxLabelData: string): LabelModel[] {
   return Object.entries(labels).map(([, name], index) => ({
     index,
     name,
+  }));
+}
+
+function mapLabels(labels: readonly string[]): LabelModel[] {
+  return labels.map((name, index) => ({ index, name }));
+}
+
+function parseLabelsInput(labels: YoloLabels): string[] {
+  if (typeof labels !== 'string') {
+    return labels.map(label => label.trim()).filter(Boolean);
+  }
+
+  const content = labels.trim();
+
+  if (!content) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(content);
+
+    if (Array.isArray(parsed)) {
+      return parsed.map(String).map(label => label.trim()).filter(Boolean);
+    }
+  } catch {
+    // Plain class_names.txt content is expected for most RF-DETR models.
+  }
+
+  return content
+    .split(/\r?\n|,/)
+    .map(label => label.trim())
+    .filter(Boolean);
+}
+
+function inferLabels(outputShapes: Record<string, number[]>): LabelModel[] {
+  const classCount = tryGetRfdetrClassCount(outputShapes);
+
+  if (classCount === null) {
+    throw new Error('ONNX custom metadata "names" is missing. Pass labels in YoloOptions for metadata-free models.');
+  }
+
+  return Array.from({ length: classCount }, (_, index) => ({
+    index,
+    name: index === 0 ? 'background_class' : `class_${index}`,
   }));
 }
 
@@ -177,14 +251,15 @@ function calculateTotalInputShapeSize(shape: number[]): number {
   return shapeSize;
 }
 
-function requireMetadata(metadata: Record<string, string>, key: string): string {
-  const value = metadata[key];
+function isRfdetrOutput(outputShapes: Record<string, number[]>): boolean {
+  const dets = outputShapes.dets;
+  const labels = outputShapes.labels;
 
-  if (value === undefined) {
-    throw new Error(`ONNX custom metadata "${key}" is missing.`);
-  }
+  return Boolean(dets && labels && dets.length === 3 && labels.length === 3 && dets[2] === 4);
+}
 
-  return value;
+function tryGetRfdetrClassCount(outputShapes: Record<string, number[]>): number | null {
+  return isRfdetrOutput(outputShapes) ? outputShapes.labels[2] : null;
 }
 
 function parseStringStringEntry(bytes: Uint8Array): { key: string; value: string } {
