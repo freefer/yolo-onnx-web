@@ -102,6 +102,7 @@ export interface DetectionDrawingOptions {
   drawConfidenceScore?: boolean;
   drawLabelBackground?: boolean;
   boundingBoxHexColors?: string[];
+  resultOpacity?: number;
   boundingBoxOpacity?: number;
   fontColor?: string;
 }

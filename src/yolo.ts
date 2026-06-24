@@ -347,13 +347,15 @@ export class Yolo {
     const drawConfidenceScore = options.drawConfidenceScore ?? true;
     const drawLabelBackground = options.drawLabelBackground ?? true;
     const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fontColor = this.withAlpha(options.fontColor ?? '#f8fafc', alpha);
 
     context.font = font;
     context.textBaseline = 'middle';
     context.lineWidth = lineWidth;
 
     for (const detection of detections) {
-      const color = this.getDetectionColor(detection, colors, options.strokeStyle, options.boundingBoxOpacity);
+      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
       const points = this.getObbCorners(detection.boundingBox, detection.orientationAngle);
 
       context.strokeStyle = color;
@@ -370,7 +372,7 @@ export class Yolo {
           font,
           drawConfidenceScore,
           drawLabelBackground,
-          fontColor: options.fontColor,
+          fontColor,
         });
       }
     }
@@ -457,10 +459,12 @@ export class Yolo {
   ): void {
     const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
     const lineWidth = options.lineWidth ?? Math.max(2, Math.round(Math.min(width, height) / 320));
-    const font = options.font ?? `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
+    const font = options.font ?? `${Math.max(14, Math.round(Math.min(width, height) / 70))}px Arial`;
     const drawLabel = options.drawLabel ?? true;
     const drawConfidenceScore = options.drawConfidenceScore ?? true;
     const drawLabelBackground = options.drawLabelBackground ?? true;
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fontColor = this.withAlpha(options.fontColor ?? '#f8fafc', alpha);
 
     context.lineWidth = lineWidth;
     context.font = font;
@@ -470,7 +474,7 @@ export class Yolo {
       const { left, top, right, bottom } = detection.boundingBox;
       const boxWidth = right - left;
       const boxHeight = bottom - top;
-      const color = this.getDetectionColor(detection, colors, options.strokeStyle, options.boundingBoxOpacity);
+      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
 
       if (boxWidth <= 0 || boxHeight <= 0) {
         continue;
@@ -484,7 +488,7 @@ export class Yolo {
           font,
           drawConfidenceScore,
           drawLabelBackground,
-          fontColor: options.fontColor,
+          fontColor,
         });
       }
     }
@@ -527,6 +531,14 @@ export class Yolo {
   ): string {
     const color = fallback ?? colors[detection.label.index % colors.length] ?? DEFAULT_BOX_COLORS[0];
     return this.withAlpha(color, alpha);
+  }
+
+  private getDetectionDrawingAlpha(options: DetectionDrawingOptions): number {
+    if (options.resultOpacity !== undefined) {
+      return Math.round(this.clamp(options.resultOpacity, 0, 1) * 255);
+    }
+
+    return options.boundingBoxOpacity ?? 255;
   }
 
   private withAlpha(color: string, alpha: number): string {
@@ -991,7 +1003,7 @@ export class Yolo {
       V12: allTasks,
       V26: allTasks,
       RTDETR: ['ObjectDetection'],
-      RFDETR: ['ObjectDetection'],
+      RFDETR: ['ObjectDetection', 'Segmentation'],
       WORLDV2: ['ObjectDetection'],
     };
 

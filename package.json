@@ -37,6 +37,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "build:example": "vite build --config vite.example.config.ts",
     "dev": "tsup --watch",
     "start": "vite",
     "prepublishOnly": "npm run build"

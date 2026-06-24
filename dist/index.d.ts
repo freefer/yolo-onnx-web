@@ -97,6 +97,7 @@ interface DetectionDrawingOptions {
     drawConfidenceScore?: boolean;
     drawLabelBackground?: boolean;
     boundingBoxHexColors?: string[];
+    resultOpacity?: number;
     boundingBoxOpacity?: number;
     fontColor?: string;
 }
@@ -272,6 +273,7 @@ declare class Yolo {
     private drawBoundingBoxes;
     private prepareDrawingCanvas;
     private getDetectionColor;
+    private getDetectionDrawingAlpha;
     private withAlpha;
     private drawDetectionLabel;
     private getCanvasFontSize;

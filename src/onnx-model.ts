@@ -104,6 +104,10 @@ function getModelType(metadata: Record<string, string>, outputShapes: Record<str
     return getModelTypeFromMetadata(metadata.task);
   }
 
+  if (isRfdetrSegmentationOutput(outputShapes)) {
+    return 'Segmentation';
+  }
+
   if (isRfdetrOutput(outputShapes)) {
     return 'ObjectDetection';
   }
@@ -256,6 +260,12 @@ function isRfdetrOutput(outputShapes: Record<string, number[]>): boolean {
   const labels = outputShapes.labels;
 
   return Boolean(dets && labels && dets.length === 3 && labels.length === 3 && dets[2] === 4);
+}
+
+function isRfdetrSegmentationOutput(outputShapes: Record<string, number[]>): boolean {
+  const masks = outputShapes.masks;
+
+  return Boolean(isRfdetrOutput(outputShapes) && masks && masks.length === 4);
 }
 
 function tryGetRfdetrClassCount(outputShapes: Record<string, number[]>): number | null {

@@ -12,8 +12,8 @@ import type {
   YoloModelSource,
 } from '../../src';
 
-const ORT_WASM_PATHS = '/examples/browser/ort-wasm/';
-const DEFAULT_MODEL_URL = '/examples/model/yolo26s.onnx';
+const ORT_WASM_PATHS = new URL('./ort-wasm/', window.location.href).toString();
+const DEFAULT_MODEL_URL = new URL('../model/yolo26s.onnx', window.location.href).toString();
 const CAMERA_WIDTH = 640;
 const CAMERA_HEIGHT = 640;
 
@@ -24,8 +24,10 @@ const modelFileInput = getElement<HTMLInputElement>('#modelFile');
 const classNamesFileInput = getElement<HTMLInputElement>('#classNamesFile');
 const confidenceInput = getElement<HTMLInputElement>('#confidenceInput');
 const iouInput = getElement<HTMLInputElement>('#iouInput');
+const resultOpacityInput = getElement<HTMLInputElement>('#resultOpacityInput');
 const confidenceValue = getElement<HTMLElement>('#confidenceValue');
 const iouValue = getElement<HTMLElement>('#iouValue');
+const resultOpacityValue = getElement<HTMLElement>('#resultOpacityValue');
 const imageFileInput = getElement<HTMLInputElement>('#imageFile');
 const imageInputGroup = getElement<HTMLElement>('#imageInputGroup');
 const startCameraButton = getElement<HTMLButtonElement>('#startCameraButton');
@@ -37,6 +39,8 @@ const preview = getElement<HTMLCanvasElement>('#preview');
 const fpsBadge = getElement<HTMLElement>('#fpsBadge');
 const modelInfo = getElement<HTMLPreElement>('#modelInfo');
 const output = getElement<HTMLPreElement>('#output');
+const loadingOverlay = getElement<HTMLElement>('#loadingOverlay');
+const loadingMessage = getElement<HTMLElement>('#loadingMessage');
 
 let yolo: Yolo | null = null;
 let activeExecutionProviders: readonly YoloExecutionProvider[] = [];
@@ -125,6 +129,11 @@ iouInput.addEventListener('input', () => {
   scheduleThresholdPreview();
 });
 
+resultOpacityInput.addEventListener('input', () => {
+  updateThresholdLabels();
+  scheduleThresholdPreview();
+});
+
 runButton.addEventListener('click', () => {
   handleRunButtonClick().catch(error => {
     writeOutput(error instanceof Error ? error.stack ?? error.message : String(error));
@@ -150,14 +159,17 @@ loadSelectedModel().catch(error => {
 
 async function loadSelectedModel(): Promise<void> {
   const token = ++loadingModelToken;
-  setLoadingModel(true);
+  setLoadingModel(true, '正在加载 WASM 与模型，请稍候...');
   writeModelInfo('正在加载模型...');
   writeOutput('模型加载中，请稍候。');
 
   try {
+    setLoadingModel(true, '正在读取模型与类别信息...');
     const model = await getModelSource();
     const labels = await getClassNames();
     const executionProvider = getSelectedExecutionProvider();
+
+    setLoadingModel(true, `正在初始化 ${executionProvider} 后端与 WASM...`);
     const nextYolo = await Yolo.create({
       model,
       labels,
@@ -467,6 +479,7 @@ function getThresholdValue(input: HTMLInputElement, fallback: number): number {
 function updateThresholdLabels(): void {
   confidenceValue.textContent = getThresholdValue(confidenceInput, 0.2).toFixed(2);
   iouValue.textContent = getThresholdValue(iouInput, 0.7).toFixed(2);
+  resultOpacityValue.textContent = getThresholdValue(resultOpacityInput, 1).toFixed(2);
 }
 
 function scheduleThresholdPreview(): void {
@@ -505,21 +518,24 @@ function drawInferenceResult(
   canvas: HTMLCanvasElement,
   drawSource = true,
 ): void {
+  const font = '12px Arial';
+  const resultOpacity = getThresholdValue(resultOpacityInput, 1);
+
   switch (inference.modelType) {
     case 'Classification':
-      yoloInstance.drawClassifications(source, inference.result, canvas, { drawSource });
+      yoloInstance.drawClassifications(source, inference.result, canvas, { drawSource,font: font });
       break;
     case 'ObjectDetection':
-      yoloInstance.drawObjectDetections(source, inference.result, canvas, { drawSource });
+      yoloInstance.drawObjectDetections(source, inference.result, canvas, { drawSource, font, resultOpacity });
       break;
     case 'ObbDetection':
-      yoloInstance.drawObbDetections(source, inference.result, canvas, { drawSource });
+      yoloInstance.drawObbDetections(source, inference.result, canvas, { drawSource, font, resultOpacity });
       break;
     case 'Segmentation':
-      yoloInstance.drawSegmentations(source, inference.result, canvas, { drawSource });
+      yoloInstance.drawSegmentations(source, inference.result, canvas, { drawSource, lineWidth: 2, resultOpacity });
       break;
     case 'PoseEstimation':
-      yoloInstance.drawPoseEstimations(source, inference.result, canvas, { drawSource });
+      yoloInstance.drawPoseEstimations(source, inference.result, canvas, { drawSource, font, resultOpacity });
       break;
     default:
       throw new Error(`Unsupported model type: ${inference satisfies never}`);
@@ -634,12 +650,15 @@ function formatModelInfo(model: OnnxModel): string {
   ].join('\n');
 }
 
-function setLoadingModel(isLoading: boolean): void {
+function setLoadingModel(isLoading: boolean, message = '正在加载 WASM 与模型，请稍候...'): void {
   backendSelect.disabled = isLoading;
   inputModeSelect.disabled = isLoading;
   modelFileInput.disabled = isLoading;
   classNamesFileInput.disabled = isLoading;
   modelUrlInput.disabled = isLoading;
+  loadingMessage.textContent = message;
+  loadingOverlay.classList.toggle('visible', isLoading);
+  loadingOverlay.setAttribute('aria-busy', String(isLoading));
   updateRunButton(isLoading);
 }
 
@@ -733,6 +752,7 @@ function updateInputMode(): void {
 
   if (!isCamera) {
     stopCamera();
+    viewer.style.aspectRatio = '';
     writeOutput('图片模式：请选择图片并点击运行推理。');
   } else {
     writeOutput('摄像头模式：请先打开摄像头，然后点击运行推理开始连续检测。');

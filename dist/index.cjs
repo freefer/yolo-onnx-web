@@ -186,6 +186,9 @@ function getModelType(metadata, outputShapes) {
   if (metadata.task) {
     return getModelTypeFromMetadata(metadata.task);
   }
+  if (isRfdetrSegmentationOutput(outputShapes)) {
+    return "Segmentation";
+  }
   if (isRfdetrOutput(outputShapes)) {
     return "ObjectDetection";
   }
@@ -301,6 +304,10 @@ function isRfdetrOutput(outputShapes) {
   const dets = outputShapes.dets;
   const labels = outputShapes.labels;
   return Boolean(dets && labels && dets.length === 3 && labels.length === 3 && dets[2] === 4);
+}
+function isRfdetrSegmentationOutput(outputShapes) {
+  const masks = outputShapes.masks;
+  return Boolean(isRfdetrOutput(outputShapes) && masks && masks.length === 4);
 }
 function tryGetRfdetrClassCount(outputShapes) {
   return isRfdetrOutput(outputShapes) ? outputShapes.labels[2] : null;
@@ -1095,28 +1102,26 @@ var RF_DETRHandler = class {
     const sourceRect = this.getSourceRect(img, roi);
     const resizeMode = (_a = this._yolo.yoloOptions.imageResize) != null ? _a : "stretch";
     const { drawWidth, drawHeight, xPad, yPad, gain } = resizeMode === "stretch" ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 } : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
-    const context = this.getPreprocessContext(sourceRect.width, sourceRect.height);
-    context.clearRect(0, 0, sourceRect.width, sourceRect.height);
+    const context = this.getPreprocessContext(modelWidth, modelHeight);
+    context.clearRect(0, 0, modelWidth, modelHeight);
     context.drawImage(
       img,
       sourceRect.x,
       sourceRect.y,
       sourceRect.width,
       sourceRect.height,
-      0,
-      0,
-      sourceRect.width,
-      sourceRect.height
+      xPad,
+      yPad,
+      drawWidth,
+      drawHeight
     );
-    const imageData = context.getImageData(0, 0, sourceRect.width, sourceRect.height).data;
+    const imageData = context.getImageData(0, 0, modelWidth, modelHeight).data;
     const pixelCount = modelWidth * modelHeight;
     const tensorData = this.getPreprocessTensorData(channels * pixelCount);
     const imageMean = (_b = this._yolo.yoloOptions.imageMean) != null ? _b : DEFAULT_IMAGE_MEAN;
     const imageStd = (_c = this._yolo.yoloOptions.imageStd) != null ? _c : DEFAULT_IMAGE_STD;
-    this.writePreprocessedTensor(
+    this.writeCanvasTensor(
       imageData,
-      sourceRect.width,
-      sourceRect.height,
       modelWidth,
       modelHeight,
       drawWidth,
@@ -1160,7 +1165,10 @@ var RF_DETRHandler = class {
     unsupportedTask("ObbDetection");
   }
   RunSegmentation(img, confidence, pixelConfidence, iou, roi = null) {
-    unsupportedTask("Segmentation");
+    if (this._yolo.onnxModel.modelType !== "Segmentation") {
+      unsupportedTask("Segmentation");
+    }
+    return this.runSegmentation(img, confidence, roi);
   }
   RunPoseEstimation(img, confidence, iou, roi = null) {
     unsupportedTask("PoseEstimation");
@@ -1180,9 +1188,119 @@ var RF_DETRHandler = class {
       (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
     );
     const labels = backgroundClassIndex >= 0 ? this._yolo.onnxModel.labels.filter((label) => label.index !== backgroundClassIndex).map((label, index) => ({ ...label, index })) : this._yolo.onnxModel.labels;
+    const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
+    const objects = [];
+    for (let i = 0; i < topCount; i += 1) {
+      const candidateConfidence = topScores[i];
+      if (candidateConfidence < confidence) {
+        continue;
+      }
+      const flatIndex = topIndices[i];
+      const prediction = Math.trunc(flatIndex / classCount);
+      const labelIndex = flatIndex - prediction * classCount;
+      if (labelIndex === backgroundClassIndex) {
+        continue;
+      }
+      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex ? labelIndex - 1 : labelIndex;
+      const label = labels[mappedLabelIndex];
+      if (!label) {
+        continue;
+      }
+      const boxOffset = prediction * 4;
+      const cx = dets[boxOffset];
+      const cy = dets[boxOffset + 1];
+      const w = dets[boxOffset + 2];
+      const h = dets[boxOffset + 3];
+      const x1 = cx - w / 2;
+      const y1 = cy - h / 2;
+      const x2 = cx + w / 2;
+      const y2 = cy + h / 2;
+      objects.push(new ObjectDetection({
+        label,
+        confidence: candidateConfidence,
+        boundingBox: this.scaleNormalizedBoundingBox(x1, y1, x2, y2, input)
+      }));
+    }
+    return objects;
+  }
+  async runSegmentation(img, confidence, roi) {
+    var _a, _b, _c;
+    const input = this.preprocessImage(img, roi);
+    const result = await this._yolo.run({
+      [input.inputName]: this._yolo.tensor("float32", input.tensorData, input.inputShape)
+    });
+    const dets = (_a = result.dets) == null ? void 0 : _a.data;
+    const logits = (_b = result.labels) == null ? void 0 : _b.data;
+    const masks = (_c = result.masks) == null ? void 0 : _c.data;
+    if (!dets || !logits || !masks) {
+      throw new Error(`Unsupported RF-DETR segmentation outputs: ${Object.keys(result).join(", ")}`);
+    }
+    return this.decodeSegmentations(dets, logits, masks, input, confidence);
+  }
+  decodeSegmentations(dets, logits, masks, input, confidence) {
+    const detsShape = this._yolo.onnxModel.outputShapes.dets;
+    const labelsShape = this._yolo.onnxModel.outputShapes.labels;
+    const masksShape = this._yolo.onnxModel.outputShapes.masks;
+    if (!detsShape || !labelsShape || !masksShape || detsShape.length !== 3 || labelsShape.length !== 3 || masksShape.length !== 4) {
+      throw new Error(`Unsupported RF-DETR segmentation output shapes: ${JSON.stringify(this._yolo.onnxModel.outputShapes)}`);
+    }
+    const predictions = detsShape[1];
+    const classCount = labelsShape[2];
+    const maskHeight = masksShape[2];
+    const maskWidth = masksShape[3];
+    const maskPlaneSize = maskWidth * maskHeight;
+    const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
+      (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
+    );
+    const labels = backgroundClassIndex >= 0 ? this._yolo.onnxModel.labels.filter((label) => label.index !== backgroundClassIndex).map((label, index) => ({ ...label, index })) : this._yolo.onnxModel.labels;
+    const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
+    const segmentations = [];
+    for (let i = 0; i < topCount; i += 1) {
+      const candidateConfidence = topScores[i];
+      if (candidateConfidence < confidence) {
+        continue;
+      }
+      const flatIndex = topIndices[i];
+      const prediction = Math.trunc(flatIndex / classCount);
+      const labelIndex = flatIndex - prediction * classCount;
+      if (labelIndex === backgroundClassIndex) {
+        continue;
+      }
+      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex ? labelIndex - 1 : labelIndex;
+      const label = labels[mappedLabelIndex];
+      if (!label) {
+        continue;
+      }
+      const boxOffset = prediction * 4;
+      const cx = dets[boxOffset];
+      const cy = dets[boxOffset + 1];
+      const w = dets[boxOffset + 2];
+      const h = dets[boxOffset + 3];
+      const x1 = cx - w / 2;
+      const y1 = cy - h / 2;
+      const x2 = cx + w / 2;
+      const y2 = cy + h / 2;
+      const boundingBox = this.scaleNormalizedBoundingBox(x1, y1, x2, y2, input);
+      const bitPackedPixelMask = this.packRfdetrMask(
+        masks,
+        prediction * maskPlaneSize,
+        maskWidth,
+        maskHeight,
+        boundingBox,
+        input
+      );
+      segmentations.push(new Segmentation({
+        label,
+        confidence: candidateConfidence,
+        boundingBox,
+        bitPackedPixelMask
+      }));
+    }
+    return segmentations;
+  }
+  getRankedCandidates(logits, predictions, classCount) {
     const maxDetections = predictions;
     const { topIndices, topScores } = this.getTopKBuffers(maxDetections);
-    const objects = [];
     let topCount = 0;
     let minScore = Number.POSITIVE_INFINITY;
     let minPosition = -1;
@@ -1218,38 +1336,67 @@ var RF_DETRHandler = class {
       }
     }
     this.sortTopKDescending(topIndices, topScores, topCount);
-    for (let i = 0; i < topCount; i += 1) {
-      const candidateConfidence = topScores[i];
-      if (candidateConfidence < confidence) {
-        continue;
-      }
-      const flatIndex = topIndices[i];
-      const prediction = Math.trunc(flatIndex / classCount);
-      const labelIndex = flatIndex - prediction * classCount;
-      if (labelIndex === backgroundClassIndex) {
-        continue;
-      }
-      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex ? labelIndex - 1 : labelIndex;
-      const label = labels[mappedLabelIndex];
-      if (!label) {
-        continue;
-      }
-      const boxOffset = prediction * 4;
-      const cx = dets[boxOffset];
-      const cy = dets[boxOffset + 1];
-      const w = dets[boxOffset + 2];
-      const h = dets[boxOffset + 3];
-      const x1 = cx - w / 2;
-      const y1 = cy - h / 2;
-      const x2 = cx + w / 2;
-      const y2 = cy + h / 2;
-      objects.push(new ObjectDetection({
-        label,
-        confidence: candidateConfidence,
-        boundingBox: this.scaleNormalizedBoundingBox(x1, y1, x2, y2, input)
-      }));
+    return { topIndices, topScores, topCount };
+  }
+  packRfdetrMask(masks, maskOffset, maskWidth, maskHeight, box, input) {
+    const targetWidth = box.right - box.left;
+    const targetHeight = box.bottom - box.top;
+    if (targetWidth <= 0 || targetHeight <= 0 || maskWidth <= 0 || maskHeight <= 0) {
+      return new Uint8Array();
     }
-    return objects;
+    const totalPixels = targetWidth * targetHeight;
+    const packed = new Uint8Array(Math.ceil(totalPixels / 8));
+    let cropLeft = 0;
+    let cropTop = 0;
+    let cropRight = maskWidth;
+    let cropBottom = maskHeight;
+    if (input.resizeMode !== "stretch") {
+      const inputWidth = input.inputShape[3];
+      const inputHeight = input.inputShape[2];
+      const scale = Math.min(inputWidth / input.sourceWidth, inputHeight / input.sourceHeight);
+      const scaledWidth = Math.trunc(input.sourceWidth * scale);
+      const scaledHeight = Math.trunc(input.sourceHeight * scale);
+      const padX = (inputWidth - scaledWidth) / 2;
+      const padY = (inputHeight - scaledHeight) / 2;
+      cropLeft = clamp(Math.round(padX * maskWidth / inputWidth), 0, maskWidth - 1);
+      cropTop = clamp(Math.round(padY * maskHeight / inputHeight), 0, maskHeight - 1);
+      cropRight = clamp(Math.round((padX + scaledWidth) * maskWidth / inputWidth), cropLeft + 1, maskWidth);
+      cropBottom = clamp(Math.round((padY + scaledHeight) * maskHeight / inputHeight), cropTop + 1, maskHeight);
+    }
+    const cropWidth = cropRight - cropLeft;
+    const cropHeight = cropBottom - cropTop;
+    const xScale = cropWidth / input.sourceWidth;
+    const yScale = cropHeight / input.sourceHeight;
+    for (let y = 0; y < targetHeight; y += 1) {
+      const absoluteY = box.top + y;
+      const sourceY = (absoluteY + 0.5) * yScale - 0.5;
+      const y0Local = clamp(Math.floor(sourceY), 0, cropHeight - 1);
+      const y1Local = y0Local < cropHeight - 1 ? y0Local + 1 : y0Local;
+      const yWeight = sourceY - y0Local;
+      const row0 = maskOffset + (cropTop + y0Local) * maskWidth;
+      const row1 = maskOffset + (cropTop + y1Local) * maskWidth;
+      const targetRow = y * targetWidth;
+      for (let x = 0; x < targetWidth; x += 1) {
+        const absoluteX = box.left + x;
+        const sourceX = (absoluteX + 0.5) * xScale - 0.5;
+        const x0Local = clamp(Math.floor(sourceX), 0, cropWidth - 1);
+        const x1Local = x0Local < cropWidth - 1 ? x0Local + 1 : x0Local;
+        const xWeight = sourceX - x0Local;
+        const x0 = cropLeft + x0Local;
+        const x1 = cropLeft + x1Local;
+        const topLeft = masks[row0 + x0];
+        const topRight = masks[row0 + x1];
+        const bottomLeft = masks[row1 + x0];
+        const bottomRight = masks[row1 + x1];
+        const top = topLeft + (topRight - topLeft) * xWeight;
+        const bottom = bottomLeft + (bottomRight - bottomLeft) * xWeight;
+        if (top + (bottom - top) * yWeight > 0) {
+          const pixelIndex = targetRow + x;
+          packed[pixelIndex >> 3] |= 1 << (pixelIndex & 7);
+        }
+      }
+    }
+    return packed;
   }
   getTopKBuffers(size) {
     if (!this.topIndices || this.topIndices.length < size) {
@@ -1304,6 +1451,58 @@ var RF_DETRHandler = class {
       throw new Error(`Unsupported RF-DETR input shape: ${JSON.stringify(shape)}`);
     }
     return [shape[0], shape[1], shape[2], shape[3]];
+  }
+  writeCanvasTensor(imageData, modelWidth, modelHeight, drawWidth, drawHeight, xPad, yPad, imageMean, imageStd, tensorData) {
+    const pixelCount = modelWidth * modelHeight;
+    const redScale = 1 / (255 * imageStd[0]);
+    const greenScale = 1 / (255 * imageStd[1]);
+    const blueScale = 1 / (255 * imageStd[2]);
+    const redBias = -imageMean[0] / imageStd[0];
+    const greenBias = -imageMean[1] / imageStd[1];
+    const blueBias = -imageMean[2] / imageStd[2];
+    const left = Math.max(0, Math.trunc(xPad));
+    const top = Math.max(0, Math.trunc(yPad));
+    const right = Math.min(modelWidth, Math.ceil(xPad + drawWidth));
+    const bottom = Math.min(modelHeight, Math.ceil(yPad + drawHeight));
+    const canUseUint32 = (imageData.byteOffset & 3) === 0 && (imageData.byteLength & 3) === 0;
+    const uint32Pixels = canUseUint32 ? new Uint32Array(imageData.buffer, imageData.byteOffset, pixelCount) : null;
+    if (left === 0 && top === 0 && right === modelWidth && bottom === modelHeight) {
+      if (uint32Pixels) {
+        for (let pixel = 0; pixel < pixelCount; pixel += 1) {
+          const rgba = uint32Pixels[pixel];
+          tensorData[pixel] = (rgba & 255) * redScale + redBias;
+          tensorData[pixelCount + pixel] = (rgba >>> 8 & 255) * greenScale + greenBias;
+          tensorData[pixelCount * 2 + pixel] = (rgba >>> 16 & 255) * blueScale + blueBias;
+        }
+        return;
+      }
+      for (let imageOffset = 0, pixel = 0; pixel < pixelCount; imageOffset += 4, pixel += 1) {
+        tensorData[pixel] = imageData[imageOffset] * redScale + redBias;
+        tensorData[pixelCount + pixel] = imageData[imageOffset + 1] * greenScale + greenBias;
+        tensorData[pixelCount * 2 + pixel] = imageData[imageOffset + 2] * blueScale + blueBias;
+      }
+      return;
+    }
+    tensorData.fill(0);
+    for (let y = top; y < bottom; y += 1) {
+      let imageOffset = y * modelWidth + left;
+      let pixel = y * modelWidth + left;
+      if (uint32Pixels) {
+        for (let x = left; x < right; x += 1, imageOffset += 1, pixel += 1) {
+          const rgba = uint32Pixels[imageOffset];
+          tensorData[pixel] = (rgba & 255) * redScale + redBias;
+          tensorData[pixelCount + pixel] = (rgba >>> 8 & 255) * greenScale + greenBias;
+          tensorData[pixelCount * 2 + pixel] = (rgba >>> 16 & 255) * blueScale + blueBias;
+        }
+      } else {
+        let byteOffset = imageOffset * 4;
+        for (let x = left; x < right; x += 1, byteOffset += 4, pixel += 1) {
+          tensorData[pixel] = imageData[byteOffset] * redScale + redBias;
+          tensorData[pixelCount + pixel] = imageData[byteOffset + 1] * greenScale + greenBias;
+          tensorData[pixelCount * 2 + pixel] = imageData[byteOffset + 2] * blueScale + blueBias;
+        }
+      }
+    }
   }
   writePreprocessedTensor(imageData, sourceWidth, sourceHeight, modelWidth, modelHeight, drawWidth, drawHeight, xPad, yPad, imageMean, imageStd, tensorData) {
     const pixelCount = modelWidth * modelHeight;
@@ -1710,7 +1909,7 @@ var Yolo = class _Yolo {
     }
   }
   drawObbDetections(source, detections, canvas, options = {}) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g;
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
     const font = (_a = options.font) != null ? _a : `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
     const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
@@ -1718,11 +1917,13 @@ var Yolo = class _Yolo {
     const drawConfidenceScore = (_d = options.drawConfidenceScore) != null ? _d : true;
     const drawLabelBackground = (_e = options.drawLabelBackground) != null ? _e : true;
     const colors = (_f = options.boundingBoxHexColors) != null ? _f : [...DEFAULT_BOX_COLORS];
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
     context.font = font;
     context.textBaseline = "middle";
     context.lineWidth = lineWidth;
     for (const detection of detections) {
-      const color = this.getDetectionColor(detection, colors, options.strokeStyle, options.boundingBoxOpacity);
+      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
       const points = this.getObbCorners(detection.boundingBox, detection.orientationAngle);
       context.strokeStyle = color;
       context.beginPath();
@@ -1737,7 +1938,7 @@ var Yolo = class _Yolo {
           font,
           drawConfidenceScore,
           drawLabelBackground,
-          fontColor: options.fontColor
+          fontColor
         });
       }
     }
@@ -1796,13 +1997,15 @@ var Yolo = class _Yolo {
     }
   }
   drawBoundingBoxes(context, detections, width, height, options = {}) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g;
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
     const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
-    const font = (_c = options.font) != null ? _c : `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
+    const font = (_c = options.font) != null ? _c : `${Math.max(14, Math.round(Math.min(width, height) / 70))}px Arial`;
     const drawLabel = (_d = options.drawLabel) != null ? _d : true;
     const drawConfidenceScore = (_e = options.drawConfidenceScore) != null ? _e : true;
     const drawLabelBackground = (_f = options.drawLabelBackground) != null ? _f : true;
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
     context.lineWidth = lineWidth;
     context.font = font;
     context.textBaseline = "middle";
@@ -1810,7 +2013,7 @@ var Yolo = class _Yolo {
       const { left, top, right, bottom } = detection.boundingBox;
       const boxWidth = right - left;
       const boxHeight = bottom - top;
-      const color = this.getDetectionColor(detection, colors, options.strokeStyle, options.boundingBoxOpacity);
+      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
       if (boxWidth <= 0 || boxHeight <= 0) {
         continue;
       }
@@ -1821,7 +2024,7 @@ var Yolo = class _Yolo {
           font,
           drawConfidenceScore,
           drawLabelBackground,
-          fontColor: options.fontColor
+          fontColor
         });
       }
     }
@@ -1848,6 +2051,13 @@ var Yolo = class _Yolo {
     var _a;
     const color = (_a = fallback != null ? fallback : colors[detection.label.index % colors.length]) != null ? _a : DEFAULT_BOX_COLORS[0];
     return this.withAlpha(color, alpha);
+  }
+  getDetectionDrawingAlpha(options) {
+    var _a;
+    if (options.resultOpacity !== void 0) {
+      return Math.round(this.clamp(options.resultOpacity, 0, 1) * 255);
+    }
+    return (_a = options.boundingBoxOpacity) != null ? _a : 255;
   }
   withAlpha(color, alpha) {
     if (!color.startsWith("#") || color.length !== 7) {
@@ -2184,7 +2394,7 @@ var Yolo = class _Yolo {
       V12: allTasks,
       V26: allTasks,
       RTDETR: ["ObjectDetection"],
-      RFDETR: ["ObjectDetection"],
+      RFDETR: ["ObjectDetection", "Segmentation"],
       WORLDV2: ["ObjectDetection"]
     };
     return supportMap[modelVersion].includes(modelType);
