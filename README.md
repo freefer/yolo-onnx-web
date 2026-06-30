@@ -21,6 +21,8 @@ Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-we
   - Segmentation
   - Pose estimation
 - Includes canvas drawing utilities for all supported task types.
+- Supports RF-DETR object detection and segmentation models.
+- Exports `DrawTool` so drawing helpers can be used independently from a `Yolo` instance.
 
 ## Installation
 
@@ -39,6 +41,8 @@ npm start
 The browser example runs at the fixed Vite port configured in `vite.config.ts`.
 
 ## Browser Runtime Setup
+
+This package currently depends on `onnxruntime-web@1.27.0`.
 
 `onnxruntime-web` needs access to its WASM files. Configure the path before creating a model:
 
@@ -62,6 +66,8 @@ const yolo = await Yolo.create({
   wasmPaths: '/ort-wasm/',
   executionProviders: ['webgpu', 'wasm'],
 });
+
+console.log(yolo.onnxModel.modelVersion); // e.g. V26, RTDETR, RFDETR
 
 const image = document.querySelector('img')!;
 const detections = await yolo.RunObjectDetection(image, 0.2, 0.7);
@@ -105,7 +111,16 @@ Support is selected from the ONNX metadata:
 | YOLOv12 (`V12`) | Yes | Yes | Yes | Yes | Yes | Uses YOLOv8-style output handlers |
 | YOLO26 (`V26`) | Yes | Yes | Yes | Yes | Yes | Dedicated YOLO26 handlers |
 | RT-DETR (`RTDETR`) | No | Yes | No | No | No | Dedicated RT-DETR detection handler |
+| RF-DETR (`RFDETR`) | No | Yes | No | Yes | No | Dedicated RF-DETR handler; supports detection and segmentation |
 | YOLO World V2 (`WORLDV2`) | No | Yes | No | No | No | Object detection only |
+
+You can inspect the current ONNX model metadata after loading:
+
+```ts
+console.log(yolo.onnxModel.modelType);    // ObjectDetection, Segmentation, ...
+console.log(yolo.onnxModel.modelVersion); // V8, V26, RTDETR, RFDETR, ...
+console.log(yolo.onnxModel.modelDataType);
+```
 
 ## Inference APIs
 
@@ -224,6 +239,35 @@ yolo.drawPoseEstimations(image, poses, canvas, {
   poseConfidence: 0.25,
   defaultPoseColor: '#22c55e',
   keyPointRadius: 4,
+});
+```
+
+`DrawTool` is also exported as a standalone helper. This is useful when inference and drawing live in different modules, or when you want to render cached results:
+
+```ts
+import { DrawTool, Yolo } from 'yolo-onnx-web';
+
+const yolo = await Yolo.create({
+  model: '/models/rf-detr-seg.onnx',
+  wasmPaths: '/ort-wasm/',
+  executionProviders: ['webgpu', 'wasm'],
+  modelVersion: 'RFDETR',
+  modelType: 'Segmentation',
+});
+
+const image = document.querySelector('img')!;
+const canvas = document.querySelector('canvas')!;
+const segmentations = await yolo.RunSegmentation(image, 0.35, 0.5, 0.7);
+const edgePoints = DrawTool.extractSegmentationsEdgePoints(segmentations);
+
+DrawTool.drawSegmentations(image, segmentations, canvas, {
+  drawSource: true,
+  drawBoundingBoxes: true,
+  drawLabel: true,
+  drawSegmentationPixelMask: false,
+  segmentationEdgePoints: edgePoints,
+  fillSegmentationEdgePoints: true,
+  resultOpacity: 0.7,
 });
 ```
 

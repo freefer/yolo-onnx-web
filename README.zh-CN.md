@@ -21,6 +21,8 @@ English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob
   - 实例分割
   - 姿态估计
 - 为所有支持的任务提供通用绘制方法。
+- 支持 RF-DETR 目标检测和实例分割模型。
+- 导出 `DrawTool`，可以脱离 `Yolo` 实例单独使用绘制工具。
 
 ## 安装
 
@@ -39,6 +41,8 @@ npm start
 浏览器示例使用 `vite.config.ts` 中配置的固定端口启动。
 
 ## 浏览器运行时配置
+
+当前包依赖的 ONNX Runtime Web 版本是 `onnxruntime-web@1.27.0`。
 
 `onnxruntime-web` 需要找到 WASM 文件。创建模型前可以这样配置：
 
@@ -62,6 +66,8 @@ const yolo = await Yolo.create({
   wasmPaths: '/ort-wasm/',
   executionProviders: ['webgpu', 'wasm'],
 });
+
+console.log(yolo.onnxModel.modelVersion); // 例如 V26、RTDETR、RFDETR
 
 const image = document.querySelector('img')!;
 const detections = await yolo.RunObjectDetection(image, 0.2, 0.7);
@@ -105,7 +111,16 @@ await Yolo.create({ model: new Uint8Array(await file.arrayBuffer()) });
 | YOLOv12 (`V12`) | 是 | 是 | 是 | 是 | 是 | 复用 YOLOv8 风格输出解析 |
 | YOLO26 (`V26`) | 是 | 是 | 是 | 是 | 是 | 独立 YOLO26 解析器 |
 | RT-DETR (`RTDETR`) | 否 | 是 | 否 | 否 | 否 | 独立 RT-DETR 检测解析器 |
+| RF-DETR (`RFDETR`) | 否 | 是 | 否 | 是 | 否 | 独立 RF-DETR 解析器，支持检测和分割 |
 | YOLO World V2 (`WORLDV2`) | 否 | 是 | 否 | 否 | 否 | 仅目标检测 |
+
+模型加载完成后，可以读取当前 ONNX 模型的识别信息：
+
+```ts
+console.log(yolo.onnxModel.modelType);    // ObjectDetection、Segmentation 等
+console.log(yolo.onnxModel.modelVersion); // V8、V26、RTDETR、RFDETR 等
+console.log(yolo.onnxModel.modelDataType);
+```
 
 ## 推理 API
 
@@ -224,6 +239,35 @@ yolo.drawPoseEstimations(image, poses, canvas, {
   poseConfidence: 0.25,
   defaultPoseColor: '#22c55e',
   keyPointRadius: 4,
+});
+```
+
+`DrawTool` 也可以作为独立绘制工具使用。适合推理和绘制分离、或者需要渲染缓存检测结果的场景：
+
+```ts
+import { DrawTool, Yolo } from 'yolo-onnx-web';
+
+const yolo = await Yolo.create({
+  model: '/models/rf-detr-seg.onnx',
+  wasmPaths: '/ort-wasm/',
+  executionProviders: ['webgpu', 'wasm'],
+  modelVersion: 'RFDETR',
+  modelType: 'Segmentation',
+});
+
+const image = document.querySelector('img')!;
+const canvas = document.querySelector('canvas')!;
+const segmentations = await yolo.RunSegmentation(image, 0.35, 0.5, 0.7);
+const edgePoints = DrawTool.extractSegmentationsEdgePoints(segmentations);
+
+DrawTool.drawSegmentations(image, segmentations, canvas, {
+  drawSource: true,
+  drawBoundingBoxes: true,
+  drawLabel: true,
+  drawSegmentationPixelMask: false,
+  segmentationEdgePoints: edgePoints,
+  fillSegmentationEdgePoints: true,
+  resultOpacity: 0.7,
 });
 ```
 
