@@ -258,14 +258,16 @@ const yolo = await Yolo.create({
 const image = document.querySelector('img')!;
 const canvas = document.querySelector('canvas')!;
 const segmentations = await yolo.RunSegmentation(image, 0.35, 0.5, 0.7);
-const edgePoints = DrawTool.extractSegmentationsEdgePoints(segmentations);
 
-DrawTool.drawSegmentations(image, segmentations, canvas, {
+segmentations.forEach(segmentation => {
+  segmentation.segmentationEdgePoints = DrawTool.extractSegmentationEdgePoints(segmentation);
+});
+
+DrawTool.drawSegmentationEdgePoints(image, segmentations, canvas, {
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,
-  drawSegmentationPixelMask: false,
-  segmentationEdgePoints: edgePoints,
+  drawSegmentationPixelMask: true,
   fillSegmentationEdgePoints: true,
   resultOpacity: 0.7,
 });
