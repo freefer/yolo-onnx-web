@@ -122,6 +122,8 @@ export interface SegmentationDrawingOptions extends DetectionDrawingOptions {
   drawContour?: boolean;
   contourThickness?: number;
   drawBoundingBoxes?: boolean;
+  segmentationEdgePoints?: readonly (readonly Point[])[];
+  fillSegmentationEdgePoints?: boolean;
 }
 
 export interface KeyPointConnection {
@@ -144,6 +146,7 @@ export interface PoseDrawingOptions extends DetectionDrawingOptions {
 
 export interface YoloPreprocessResult {
   tensorData: Float32Array;
+  inputTensor?: YoloTensor;
   inputName: string;
   inputShape: readonly [number, number, number, number];
   sourceWidth: number;
@@ -189,10 +192,11 @@ export class OBBDetection extends ObjectDetection {
 
 export class Segmentation extends ObjectDetection {
   bitPackedPixelMask: Uint8Array;
-
-  constructor(options: Detection & { bitPackedPixelMask: Uint8Array }) {
+  segmentationEdgePoints?: Point[];
+  constructor(options: Detection & { bitPackedPixelMask: Uint8Array, segmentationEdgePoints?: Point[] }) {
     super(options);
     this.bitPackedPixelMask = options.bitPackedPixelMask;
+    this.segmentationEdgePoints = options.segmentationEdgePoints ?? [];
   }
 }
 
@@ -268,6 +272,9 @@ export interface YoloOptions extends OnnxRuntimeWebOptions {
 
   /** Optional channel-wise input standard deviation after scaling pixels to 0..1. */
   imageStd?: readonly [number, number, number];
+
+  /** Optional preprocessing backend. Defaults to WebGPU when the WebGPU execution provider is used. */
+  preprocessBackend?: 'cpu' | 'webgpu';
 }
 
 export type YoloFeeds = ort.InferenceSession.FeedsType;

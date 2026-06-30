@@ -31,6 +31,9 @@ export class RF_DETRHandler implements IYoloHandler {
   private interpolationCacheKey = '';
   private topIndices: Int32Array | null = null;
   private topScores: Float32Array | null = null;
+  private webGpuPipeline: any = null;
+  private webGpuDevice: any = null;
+  private webGpuFallbackWarned = false;
 
   constructor(yolo: Yolo) {
     this._yolo = yolo;
@@ -46,8 +49,11 @@ export class RF_DETRHandler implements IYoloHandler {
         ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 }
         : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
     const context = this.getPreprocessContext(modelWidth, modelHeight);
+    const coversCanvas = xPad <= 0 && yPad <= 0 && drawWidth >= modelWidth && drawHeight >= modelHeight;
 
-    context.clearRect(0, 0, modelWidth, modelHeight);
+    if (!coversCanvas) {
+      context.clearRect(0, 0, modelWidth, modelHeight);
+    }
     context.drawImage(
       img,
       sourceRect.x,
@@ -93,6 +99,192 @@ export class RF_DETRHandler implements IYoloHandler {
     };
   }
 
+  private async preprocessImageForRun(img: YoloImageSource, roi: Rect | null = null): Promise<YoloPreprocessResult> {
+    if (this._yolo.preprocessBackend !== 'webgpu') {
+      return this.preprocessImage(img, roi);
+    }
+
+    try {
+      return await this.preprocessImageWebGpu(img, roi);
+    } catch (error) {
+      if (!this.webGpuFallbackWarned) {
+        console.warn('[RF-DETR] WebGPU preprocessing failed. Falling back to CPU preprocessing.', error);
+        this.webGpuFallbackWarned = true;
+      }
+
+      return this.preprocessImage(img, roi);
+    }
+  }
+
+  private async preprocessImageWebGpu(img: YoloImageSource, roi: Rect | null = null): Promise<YoloPreprocessResult> {
+    const inputShape = this.getInputShape();
+    const [, channels, modelHeight, modelWidth] = inputShape;
+
+    if (channels !== 3) {
+      return this.preprocessImage(img, roi);
+    }
+
+    const sourceRect = this.getSourceRect(img, roi);
+    const resizeMode = this._yolo.yoloOptions.imageResize ?? 'stretch';
+    const { drawWidth, drawHeight, xPad, yPad, gain } =
+      resizeMode === 'stretch'
+        ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 }
+        : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
+    const context = this.getPreprocessContext(modelWidth, modelHeight);
+    const coversCanvas = xPad <= 0 && yPad <= 0 && drawWidth >= modelWidth && drawHeight >= modelHeight;
+
+    if (!coversCanvas) {
+      context.clearRect(0, 0, modelWidth, modelHeight);
+    }
+
+    context.drawImage(
+      img,
+      sourceRect.x,
+      sourceRect.y,
+      sourceRect.width,
+      sourceRect.height,
+      xPad,
+      yPad,
+      drawWidth,
+      drawHeight,
+    );
+
+    const imageMean = this._yolo.yoloOptions.imageMean ?? DEFAULT_IMAGE_MEAN;
+    const imageStd = this._yolo.yoloOptions.imageStd ?? DEFAULT_IMAGE_STD;
+    const inputTensor = await this.createWebGpuInputTensor(context.canvas, inputShape, imageMean, imageStd);
+
+    return {
+      tensorData: new Float32Array(0),
+      inputTensor,
+      inputName: this._yolo.inputNames[0],
+      inputShape,
+      sourceWidth: sourceRect.width,
+      sourceHeight: sourceRect.height,
+      xPad,
+      yPad,
+      gain,
+      resizeMode,
+      roi,
+    };
+  }
+
+  private async createWebGpuInputTensor(
+    canvas: HTMLCanvasElement,
+    inputShape: readonly [number, number, number, number],
+    imageMean: readonly [number, number, number],
+    imageStd: readonly [number, number, number],
+  ) {
+    const [, channels, height, width] = inputShape;
+    const device = await this._yolo.getWebGpuDevice();
+    const usage = (globalThis as any).GPUBufferUsage;
+    const textureUsage = (globalThis as any).GPUTextureUsage;
+    const outputByteLength = channels * width * height * Float32Array.BYTES_PER_ELEMENT;
+    const texture = device.createTexture({
+      size: [width, height, 1],
+      format: 'rgba8unorm',
+      usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT,
+    });
+    const outputBuffer = device.createBuffer({
+      size: outputByteLength,
+      usage: usage.STORAGE | usage.COPY_SRC | usage.COPY_DST,
+    });
+    const paramsBuffer = device.createBuffer({
+      size: 48,
+      usage: usage.UNIFORM | usage.COPY_DST,
+    });
+    const params = new Float32Array([
+      width,
+      height,
+      0,
+      0,
+      1 / imageStd[0],
+      1 / imageStd[1],
+      1 / imageStd[2],
+      0,
+      -imageMean[0] / imageStd[0],
+      -imageMean[1] / imageStd[1],
+      -imageMean[2] / imageStd[2],
+      0,
+    ]);
+
+    device.queue.copyExternalImageToTexture(
+      { source: canvas },
+      { texture },
+      { width, height },
+    );
+    device.queue.writeBuffer(paramsBuffer, 0, params);
+
+    const pipeline = this.getWebGpuPreprocessPipeline(device);
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: texture.createView() },
+        { binding: 1, resource: { buffer: outputBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    texture.destroy();
+    paramsBuffer.destroy();
+
+    return this._yolo.tensorFromGpuBuffer(outputBuffer, inputShape, () => outputBuffer.destroy());
+  }
+
+  private getWebGpuPreprocessPipeline(device: any): any {
+    if (this.webGpuPipeline && this.webGpuDevice === device) {
+      return this.webGpuPipeline;
+    }
+
+    this.webGpuDevice = device;
+    this.webGpuPipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: device.createShaderModule({
+          code: `
+struct Params {
+  size: vec4<f32>,
+  scale: vec4<f32>,
+  bias: vec4<f32>,
+};
+
+@group(0) @binding(0) var inputTexture: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> outputTensor: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let width = u32(params.size.x);
+  let height = u32(params.size.y);
+
+  if (id.x >= width || id.y >= height) {
+    return;
+  }
+
+  let rgba = textureLoad(inputTexture, vec2<i32>(i32(id.x), i32(id.y)), 0);
+  let pixel = id.y * width + id.x;
+  let planeSize = width * height;
+
+  outputTensor[pixel] = rgba.r * params.scale.x + params.bias.x;
+  outputTensor[planeSize + pixel] = rgba.g * params.scale.y + params.bias.y;
+  outputTensor[planeSize * 2u + pixel] = rgba.b * params.scale.z + params.bias.z;
+}
+          `,
+        }),
+        entryPoint: 'main',
+      },
+    });
+
+    return this.webGpuPipeline;
+  }
+
   async RunObjectDetection(
     img: YoloImageSource,
     confidence: number,
@@ -103,11 +295,8 @@ export class RF_DETRHandler implements IYoloHandler {
       unsupportedTask('ObjectDetection');
     }
 
-    const input = this.preprocessImage(img, roi);
- 
-    const result = await this._yolo.run({
-      [input.inputName]: this._yolo.tensor('float32', input.tensorData, input.inputShape),
-    });
+    const input = await this.preprocessImageForRun(img, roi);
+    const result = await this.runWithPreprocessedInput(input);
     const dets = result.dets?.data as Float32Array | undefined;
     const labels = result.labels?.data as Float32Array | undefined;
 
@@ -177,11 +366,7 @@ export class RF_DETRHandler implements IYoloHandler {
     const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(label =>
       label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX),
     );
-    const labels = backgroundClassIndex >= 0
-      ? this._yolo.onnxModel.labels
-          .filter(label => label.index !== backgroundClassIndex)
-          .map((label, index) => ({ ...label, index }))
-      : this._yolo.onnxModel.labels;
+    const labels = this._yolo.onnxModel.labels;
     const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
     const objects: ObjectDetection[] = [];
 
@@ -200,10 +385,7 @@ export class RF_DETRHandler implements IYoloHandler {
         continue;
       }
 
-      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex
-        ? labelIndex - 1
-        : labelIndex;
-      const label = labels[mappedLabelIndex];
+      const label = labels[labelIndex];
 
       if (!label) {
         continue;
@@ -230,12 +412,11 @@ export class RF_DETRHandler implements IYoloHandler {
   }
 
   private async runSegmentation(img: YoloImageSource, confidence: number, roi: Rect | null): Promise<Segmentation[]> {
-    const input = this.preprocessImage(img, roi);
+    const input = await this.preprocessImageForRun(img, roi);
+ 
+    const result = await this.runWithPreprocessedInput(input);
+ 
     
-    const result = await this._yolo.run({
-      [input.inputName]: this._yolo.tensor('float32', input.tensorData, input.inputShape),
-    });
-  
     const dets = result.dets?.data as Float32Array | undefined;
     const logits = result.labels?.data as Float32Array | undefined;
     const masks = result.masks?.data as Float32Array | undefined;
@@ -244,7 +425,19 @@ export class RF_DETRHandler implements IYoloHandler {
       throw new Error(`Unsupported RF-DETR segmentation outputs: ${Object.keys(result).join(', ')}`);
     }
 
-    return this.decodeSegmentations(dets, logits, masks, input, confidence);
+     return this.decodeSegmentations(dets, logits, masks, input, confidence);
+  }
+
+  private async runWithPreprocessedInput(input: YoloPreprocessResult) {
+    const inputTensor = input.inputTensor ?? this._yolo.tensor('float32', input.tensorData, input.inputShape);
+
+    try {
+      return await this._yolo.run({
+        [input.inputName]: inputTensor,
+      });
+    } finally {
+      input.inputTensor?.dispose();
+    }
   }
 
   private decodeSegmentations(
@@ -277,14 +470,12 @@ export class RF_DETRHandler implements IYoloHandler {
     const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(label =>
       label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX),
     );
-    const labels = backgroundClassIndex >= 0
-      ? this._yolo.onnxModel.labels
-          .filter(label => label.index !== backgroundClassIndex)
-          .map((label, index) => ({ ...label, index }))
-      : this._yolo.onnxModel.labels;
+    const labels = this._yolo.onnxModel.labels;
+ 
+
     const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
     const segmentations: Segmentation[] = [];
-
+ 
     for (let i = 0; i < topCount; i += 1) {
       const candidateConfidence = topScores[i];
 
@@ -300,10 +491,7 @@ export class RF_DETRHandler implements IYoloHandler {
         continue;
       }
 
-      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex
-        ? labelIndex - 1
-        : labelIndex;
-      const label = labels[mappedLabelIndex];
+      const label = labels[labelIndex];
 
       if (!label) {
         continue;

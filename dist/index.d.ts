@@ -115,6 +115,8 @@ interface SegmentationDrawingOptions extends DetectionDrawingOptions {
     drawContour?: boolean;
     contourThickness?: number;
     drawBoundingBoxes?: boolean;
+    segmentationEdgePoints?: readonly (readonly Point[])[];
+    fillSegmentationEdgePoints?: boolean;
 }
 interface KeyPointConnection {
     index: number;
@@ -133,6 +135,7 @@ interface PoseDrawingOptions extends DetectionDrawingOptions {
 }
 interface YoloPreprocessResult {
     tensorData: Float32Array;
+    inputTensor?: YoloTensor;
     inputName: string;
     inputShape: readonly [number, number, number, number];
     sourceWidth: number;
@@ -162,8 +165,10 @@ declare class OBBDetection extends ObjectDetection {
 }
 declare class Segmentation extends ObjectDetection {
     bitPackedPixelMask: Uint8Array;
+    segmentationEdgePoints?: Point[];
     constructor(options: Detection & {
         bitPackedPixelMask: Uint8Array;
+        segmentationEdgePoints?: Point[];
     });
 }
 declare class PoseEstimation extends ObjectDetection {
@@ -217,6 +222,8 @@ interface YoloOptions extends OnnxRuntimeWebOptions {
     imageMean?: readonly [number, number, number];
     /** Optional channel-wise input standard deviation after scaling pixels to 0..1. */
     imageStd?: readonly [number, number, number];
+    /** Optional preprocessing backend. Defaults to WebGPU when the WebGPU execution provider is used. */
+    preprocessBackend?: 'cpu' | 'webgpu';
 }
 type YoloFeeds = ort.InferenceSession.FeedsType;
 type YoloFetches = ort.InferenceSession.FetchesType;
@@ -249,6 +256,7 @@ declare class Yolo {
     private preprocessTensorSize;
     constructor(options?: YoloOptions);
     get yoloOptions(): YoloOptions;
+    get preprocessBackend(): 'cpu' | 'webgpu';
     static create(options: YoloOptions): Promise<Yolo>;
     get isLoaded(): boolean;
     get inputNames(): readonly string[];
@@ -270,21 +278,17 @@ declare class Yolo {
     drawObbDetections(source: YoloImageSource, detections: readonly OBBDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
     drawSegmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     drawPoseEstimations(source: YoloImageSource, poseEstimations: readonly PoseEstimation[], canvas: HTMLCanvasElement, options?: PoseDrawingOptions): void;
-    private drawBoundingBoxes;
-    private prepareDrawingCanvas;
-    private getDetectionColor;
-    private getDetectionDrawingAlpha;
-    private withAlpha;
-    private drawDetectionLabel;
-    private getCanvasFontSize;
-    private getObbCorners;
-    private drawSegmentationMask;
-    private drawSegmentationContour;
-    private isPackedMaskSet;
-    private parseCanvasColor;
-    private drawPoseConnections;
-    private drawPoseConnection;
+    extractSegmentationEdgePoints(segmentation: Segmentation): {
+        x: number;
+        y: number;
+    }[];
+    extractSegmentationsEdgePoints(segmentations: readonly Segmentation[]): {
+        x: number;
+        y: number;
+    }[][];
     tensor<T extends ort.Tensor.Type>(type: T, data: ort.Tensor.DataTypeMap[T], dims?: readonly number[]): ort.Tensor;
+    getWebGpuDevice(): Promise<any>;
+    tensorFromGpuBuffer(gpuBuffer: ort.Tensor.GpuBufferType, dims: readonly number[], dispose?: () => void): ort.Tensor;
     dispose(): Promise<void>;
     private createSessionOptions;
     private createSession;
@@ -298,7 +302,48 @@ declare class Yolo {
     private getImageSourceSize;
     private ensureHandler;
     private requireModel;
+    private hasWebGpuExecutionProvider;
     private isSupportedModel;
 }
 
-export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };
+declare class DrawTool {
+    static drawObjectDetections(source: YoloImageSource, detections: readonly ObjectDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
+    static drawClassifications(source: YoloImageSource, classifications: readonly Classification[], canvas: HTMLCanvasElement, options?: ClassificationDrawingOptions): void;
+    static drawObbDetections(source: YoloImageSource, detections: readonly OBBDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
+    static drawSegmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
+    static drawPoseEstimations(source: YoloImageSource, poseEstimations: readonly PoseEstimation[], canvas: HTMLCanvasElement, options?: PoseDrawingOptions): void;
+    static extractSegmentationEdgePoints(segmentation: Segmentation): {
+        x: number;
+        y: number;
+    }[];
+    static extractSegmentationsEdgePoints(segmentations: readonly Segmentation[]): {
+        x: number;
+        y: number;
+    }[][];
+    private static traceOrderedEdgePoints;
+    private static traceEdgeComponent;
+    private static getNextEdgeNeighbor;
+    private static getDirectionIndex;
+    private static getTopLeftKey;
+    private static drawBoundingBoxes;
+    private static prepareDrawingCanvas;
+    private static getDetectionColor;
+    private static getDetectionDrawingAlpha;
+    private static withAlpha;
+    private static drawDetectionLabel;
+    private static getCanvasFontSize;
+    private static getObbCorners;
+    private static drawSegmentationMask;
+    private static drawSegmentationContour;
+    static drawSegmentationEdgePoints(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
+    private static drawOrderedEdgePoints;
+    private static isSegmentationEdgePixel;
+    private static isPackedMaskSet;
+    private static parseCanvasColor;
+    private static drawPoseConnections;
+    private static drawPoseConnection;
+    private static getImageSourceSize;
+    private static clamp;
+}
+
+export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };

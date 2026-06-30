@@ -14,8 +14,8 @@ import type {
 
 const ORT_WASM_PATHS = new URL('./ort-wasm/', window.location.href).toString();
 const DEFAULT_MODEL_URL = new URL('../model/yolo26s.onnx', window.location.href).toString();
-const CAMERA_WIDTH = 640;
-const CAMERA_HEIGHT = 640;
+const CAMERA_WIDTH = 1920;
+const CAMERA_HEIGHT = 1080;
 
 const backendSelect = getElement<HTMLSelectElement>('#backend');
 const inputModeSelect = getElement<HTMLSelectElement>('#inputMode');
@@ -149,6 +149,18 @@ startCameraButton.addEventListener('click', () => {
 stopCameraButton.addEventListener('click', () => {
   stopCamera();
 });
+
+window.addEventListener('resize', () => {
+  if (getInputMode() === 'camera') {
+    syncCameraViewport();
+  }
+});
+
+new ResizeObserver(() => {
+  if (getInputMode() === 'camera') {
+    syncCameraViewport();
+  }
+}).observe(viewer.parentElement ?? viewer);
 
 updateInputMode();
 updateRunButton();
@@ -320,7 +332,7 @@ async function runCameraInferenceLoop(): Promise<void> {
     const result = await runInferenceByModelType(yolo, cameraVideo);
     const elapsedMs = performance.now() - startedAt;
 
-    drawInferenceResult(yolo, cameraVideo, result, preview, false);
+     drawInferenceResult(yolo, cameraVideo, result, preview, false);
     updateFps(performance.now());
     writeOutput(formatInferenceResult(result, elapsedMs));
   } catch (error) {
@@ -410,6 +422,7 @@ async function startCamera(): Promise<void> {
   cameraVideo.srcObject = cameraStream;
   await cameraVideo.play();
   syncCameraViewport();
+  cameraVideo.addEventListener('loadedmetadata', () => syncCameraViewport(), { once: true });
   startCameraButton.disabled = true;
   stopCameraButton.disabled = false;
   writeOutput('摄像头已打开。点击运行推理开始连续检测。');
@@ -710,10 +723,25 @@ function resetFps(): void {
 }
 
 function syncCameraViewport(width = cameraVideo.videoWidth || CAMERA_WIDTH, height = cameraVideo.videoHeight || CAMERA_HEIGHT): void {
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+
   cameraVideo.width = width;
   cameraVideo.height = height;
   preview.width = width;
   preview.height = height;
+
+  const parentWidth = viewer.parentElement?.clientWidth || width;
+  const top = viewer.getBoundingClientRect().top || 0;
+  const availableHeight = Math.max(240, window.innerHeight - top - 24);
+  const scale = Math.min(parentWidth / width, availableHeight / height);
+  const displayWidth = Math.max(1, Math.round(width * scale));
+  const displayHeight = Math.max(1, Math.round(height * scale));
+
+  viewer.style.flex = '0 0 auto';
+  viewer.style.width = `${displayWidth}px`;
+  viewer.style.height = `${displayHeight}px`;
   viewer.style.aspectRatio = `${width} / ${height}`;
 }
 
@@ -753,6 +781,8 @@ function updateInputMode(): void {
   if (!isCamera) {
     stopCamera();
     viewer.style.aspectRatio = '';
+    viewer.style.width = '';
+    viewer.style.height = '';
     writeOutput('图片模式：请选择图片并点击运行推理。');
   } else {
     writeOutput('摄像头模式：请先打开摄像头，然后点击运行推理开始连续检测。');

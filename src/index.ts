@@ -11,6 +11,7 @@ export {
   YoloWebExecutionProviderOptions,
 } from './types';
 export { Yolo } from './yolo';
+export { DrawTool } from './draw-tool';
 export type {
   OnnxRuntimeWebOptions,
   OnnxModel,

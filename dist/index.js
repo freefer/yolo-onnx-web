@@ -81,8 +81,10 @@ var OBBDetection = class extends ObjectDetection {
 };
 var Segmentation = class extends ObjectDetection {
   constructor(options) {
+    var _a;
     super(options);
     this.bitPackedPixelMask = options.bitPackedPixelMask;
+    this.segmentationEdgePoints = (_a = options.segmentationEdgePoints) != null ? _a : [];
   }
 };
 var PoseEstimation = class extends ObjectDetection {
@@ -95,6 +97,590 @@ var Classification = class {
   constructor(label, confidence) {
     this.label = label;
     this.confidence = confidence;
+  }
+};
+
+// src/draw-tool.ts
+var DEFAULT_BOX_COLORS = [
+  "#22c55e",
+  "#3b82f6",
+  "#f97316",
+  "#e11d48",
+  "#8b5cf6",
+  "#14b8a6",
+  "#f59e0b",
+  "#06b6d4"
+];
+var DEFAULT_POSE_CONNECTIONS = [
+  [5, 7],
+  [7, 9],
+  [6, 8],
+  [8, 10],
+  [5, 6],
+  [5, 11],
+  [6, 12],
+  [11, 12],
+  [11, 13],
+  [13, 15],
+  [12, 14],
+  [14, 16],
+  [0, 1],
+  [0, 2],
+  [1, 3],
+  [2, 4]
+];
+var EDGE_NEIGHBOR_OFFSETS = [
+  { x: 1, y: 0 },
+  { x: 1, y: 1 },
+  { x: 0, y: 1 },
+  { x: -1, y: 1 },
+  { x: -1, y: 0 },
+  { x: -1, y: -1 },
+  { x: 0, y: -1 },
+  { x: 1, y: -1 }
+];
+var DEFAULT_EDGE_FILL_OPACITY = 64;
+var DrawTool = class {
+  static drawObjectDetections(source, detections, canvas, options = {}) {
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    this.drawBoundingBoxes(context, detections, width, height, options);
+  }
+  static drawClassifications(source, classifications, canvas, options = {}) {
+    var _a, _b, _c, _d, _e;
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const font = (_a = options.font) != null ? _a : `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
+    const fontColor = (_b = options.fontColor) != null ? _b : "#f8fafc";
+    const backgroundColor = (_c = options.backgroundColor) != null ? _c : "rgba(15, 23, 42, 0.72)";
+    const drawConfidenceScore = (_d = options.drawConfidenceScore) != null ? _d : true;
+    const drawLabelBackground = (_e = options.drawLabelBackground) != null ? _e : true;
+    const margin = 10;
+    const lineGap = 8;
+    context.font = font;
+    context.textBaseline = "top";
+    const lineHeight = this.getCanvasFontSize(font) + lineGap;
+    const labels = classifications.map((item) => `${item.label}${drawConfidenceScore ? ` (${(item.confidence * 100).toFixed(1)}%)` : ""}`);
+    const boxWidth = Math.max(0, ...labels.map((label) => context.measureText(label).width)) + margin * 2;
+    const boxHeight = labels.length * lineHeight + margin * 2 - lineGap;
+    if (drawLabelBackground && labels.length > 0) {
+      context.fillStyle = backgroundColor;
+      context.fillRect(8, 8, boxWidth, boxHeight);
+    }
+    context.fillStyle = fontColor;
+    for (let i = 0; i < labels.length; i += 1) {
+      context.fillText(labels[i], 8 + margin, 8 + margin + i * lineHeight);
+    }
+  }
+  static drawObbDetections(source, detections, canvas, options = {}) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const font = (_a = options.font) != null ? _a : `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
+    const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
+    const drawLabel = (_c = options.drawLabel) != null ? _c : true;
+    const drawConfidenceScore = (_d = options.drawConfidenceScore) != null ? _d : true;
+    const drawLabelBackground = (_e = options.drawLabelBackground) != null ? _e : true;
+    const colors = (_f = options.boundingBoxHexColors) != null ? _f : [...DEFAULT_BOX_COLORS];
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
+    context.font = font;
+    context.textBaseline = "middle";
+    context.lineWidth = lineWidth;
+    for (const detection of detections) {
+      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
+      const points = this.getObbCorners(detection.boundingBox, detection.orientationAngle);
+      context.strokeStyle = color;
+      context.beginPath();
+      context.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i += 1) {
+        context.lineTo(points[i].x, points[i].y);
+      }
+      context.closePath();
+      context.stroke();
+      if (drawLabel) {
+        this.drawDetectionLabel(context, detection, points[2].x, points[2].y, color, {
+          font,
+          drawConfidenceScore,
+          drawLabelBackground,
+          fontColor
+        });
+      }
+    }
+  }
+  static drawSegmentations(source, segmentations, canvas, options = {}) {
+    var _a, _b, _c, _d, _e, _f;
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
+    const drawMask = (_b = options.drawSegmentationPixelMask) != null ? _b : true;
+    const drawContour = (_c = options.drawContour) != null ? _c : false;
+    const drawBoundingBoxes = (_d = options.drawBoundingBoxes) != null ? _d : true;
+    const pixelMaskOpacity = (_e = options.pixelMaskOpacity) != null ? _e : 128;
+    if (drawMask) {
+      for (const segmentation of segmentations) {
+        this.drawSegmentationMask(context, segmentation, this.getDetectionColor(segmentation, colors, void 0, pixelMaskOpacity));
+      }
+    }
+    if (drawContour) {
+      for (let index = 0; index < segmentations.length; index += 1) {
+        const segmentation = segmentations[index];
+        this.drawSegmentationContour(
+          context,
+          segmentation,
+          this.getDetectionColor(segmentation, colors, options.strokeStyle),
+          (_f = options.contourThickness) != null ? _f : 2
+        );
+      }
+    }
+    if (drawBoundingBoxes || options.drawLabel !== false) {
+      this.drawBoundingBoxes(context, segmentations, width, height, options);
+    }
+  }
+  static drawPoseEstimations(source, poseEstimations, canvas, options = {}) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const confidence = (_a = options.poseConfidence) != null ? _a : 0.25;
+    const defaultPoseColor = (_b = options.defaultPoseColor) != null ? _b : "#22c55e";
+    const radius = (_c = options.keyPointRadius) != null ? _c : Math.max(3, Math.round(Math.min(width, height) / 260));
+    const lineWidth = (_d = options.lineWidth) != null ? _d : Math.max(2, Math.round(Math.min(width, height) / 360));
+    const markers = options.keyPointMarkers;
+    context.lineWidth = lineWidth;
+    for (const pose of poseEstimations) {
+      this.drawPoseConnections(context, pose.keyPoints, confidence, markers, defaultPoseColor);
+      for (let i = 0; i < pose.keyPoints.length; i += 1) {
+        const keyPoint = pose.keyPoints[i];
+        if (keyPoint.confidence < confidence) {
+          continue;
+        }
+        context.fillStyle = (_f = (_e = markers == null ? void 0 : markers[i]) == null ? void 0 : _e.color) != null ? _f : defaultPoseColor;
+        context.beginPath();
+        context.arc(keyPoint.x, keyPoint.y, radius, 0, Math.PI * 2);
+        context.fill();
+      }
+    }
+    if (((_g = options.drawBoundingBoxes) != null ? _g : true) || options.drawLabel !== false) {
+      this.drawBoundingBoxes(context, poseEstimations, width, height, options);
+    }
+  }
+  static extractSegmentationEdgePoints(segmentation) {
+    const { left, top, right, bottom } = segmentation.boundingBox;
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+      return [];
+    }
+    const edgeKeys = /* @__PURE__ */ new Set();
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const pixelIndex = y * width + x;
+        if (!this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, width, height)) {
+          continue;
+        }
+        edgeKeys.add(pixelIndex);
+      }
+    }
+    return this.traceOrderedEdgePoints(edgeKeys, left, top, width);
+  }
+  static extractSegmentationsEdgePoints(segmentations) {
+    return segmentations.map((segmentation) => this.extractSegmentationEdgePoints(segmentation));
+  }
+  static traceOrderedEdgePoints(edgeKeys, left, top, width) {
+    const remaining = new Set(edgeKeys);
+    const ordered = [];
+    while (remaining.size > 0) {
+      const startKey = this.getTopLeftKey(remaining, width);
+      const contour = this.traceEdgeComponent(startKey, remaining, width);
+      for (const key of contour) {
+        ordered.push({
+          x: left + key % width,
+          y: top + Math.floor(key / width)
+        });
+      }
+    }
+    return ordered;
+  }
+  static traceEdgeComponent(startKey, remaining, width) {
+    const contour = [];
+    let currentKey = startKey;
+    let previousKey = -1;
+    let directionIndex = 0;
+    while (remaining.has(currentKey)) {
+      contour.push(currentKey);
+      remaining.delete(currentKey);
+      const next = this.getNextEdgeNeighbor(currentKey, previousKey, directionIndex, remaining, width);
+      if (!next) {
+        break;
+      }
+      previousKey = currentKey;
+      currentKey = next.key;
+      directionIndex = next.directionIndex;
+    }
+    return contour;
+  }
+  static getNextEdgeNeighbor(currentKey, previousKey, directionIndex, remaining, width) {
+    const currentX = currentKey % width;
+    const currentY = Math.floor(currentKey / width);
+    const preferredDirection = previousKey >= 0 ? this.getDirectionIndex(previousKey, currentKey, width) : directionIndex;
+    for (let offset = -2; offset < EDGE_NEIGHBOR_OFFSETS.length - 2; offset += 1) {
+      const candidateDirection = (preferredDirection + offset + EDGE_NEIGHBOR_OFFSETS.length) % EDGE_NEIGHBOR_OFFSETS.length;
+      const neighbor = EDGE_NEIGHBOR_OFFSETS[candidateDirection];
+      const nextX = currentX + neighbor.x;
+      const nextY = currentY + neighbor.y;
+      if (nextX < 0 || nextX >= width || nextY < 0) {
+        continue;
+      }
+      const nextKey = nextY * width + nextX;
+      if (remaining.has(nextKey)) {
+        return { key: nextKey, directionIndex: candidateDirection };
+      }
+    }
+    return null;
+  }
+  static getDirectionIndex(fromKey, toKey, width) {
+    const fromX = fromKey % width;
+    const fromY = Math.floor(fromKey / width);
+    const toX = toKey % width;
+    const toY = Math.floor(toKey / width);
+    const dx = Math.sign(toX - fromX);
+    const dy = Math.sign(toY - fromY);
+    const index = EDGE_NEIGHBOR_OFFSETS.findIndex((offset) => offset.x === dx && offset.y === dy);
+    return index >= 0 ? index : 0;
+  }
+  static getTopLeftKey(keys, width) {
+    let topLeftKey = -1;
+    let topLeftX = Number.POSITIVE_INFINITY;
+    let topLeftY = Number.POSITIVE_INFINITY;
+    for (const key of keys) {
+      const x = key % width;
+      const y = Math.floor(key / width);
+      if (y < topLeftY || y === topLeftY && x < topLeftX) {
+        topLeftKey = key;
+        topLeftX = x;
+        topLeftY = y;
+      }
+    }
+    return topLeftKey;
+  }
+  static drawBoundingBoxes(context, detections, width, height, options = {}) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
+    const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
+    const font = (_c = options.font) != null ? _c : `${Math.max(14, Math.round(Math.min(width, height) / 70))}px Arial`;
+    const drawLabel = (_d = options.drawLabel) != null ? _d : true;
+    const drawConfidenceScore = (_e = options.drawConfidenceScore) != null ? _e : true;
+    const drawLabelBackground = (_f = options.drawLabelBackground) != null ? _f : true;
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
+    context.lineWidth = lineWidth;
+    context.font = font;
+    context.textBaseline = "middle";
+    for (const detection of detections) {
+      const { left, top, right, bottom } = detection.boundingBox;
+      const boxWidth = right - left;
+      const boxHeight = bottom - top;
+      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
+      if (boxWidth <= 0 || boxHeight <= 0) {
+        continue;
+      }
+      context.strokeStyle = color;
+      context.strokeRect(left, top, boxWidth, boxHeight);
+      if (drawLabel) {
+        this.drawDetectionLabel(context, detection, left, Math.max(0, top - this.getCanvasFontSize(font)), color, {
+          font,
+          drawConfidenceScore,
+          drawLabelBackground,
+          fontColor
+        });
+      }
+    }
+  }
+  static prepareDrawingCanvas(source, canvas, drawSource = true) {
+    const { width, height } = this.getImageSourceSize(source);
+    const context = canvas.getContext("2d");
+    if (!context) {
+      throw new Error("Canvas 2D context is not available.");
+    }
+    if (canvas.width !== width) {
+      canvas.width = width;
+    }
+    if (canvas.height !== height) {
+      canvas.height = height;
+    }
+    context.clearRect(0, 0, width, height);
+    if (drawSource) {
+      context.drawImage(source, 0, 0, width, height);
+    }
+    return { context, width, height };
+  }
+  static getDetectionColor(detection, colors, fallback, alpha = 255) {
+    var _a;
+    const color = (_a = fallback != null ? fallback : colors[detection.label.index % colors.length]) != null ? _a : DEFAULT_BOX_COLORS[0];
+    return this.withAlpha(color, alpha);
+  }
+  static getDetectionDrawingAlpha(options) {
+    var _a;
+    if (options.resultOpacity !== void 0) {
+      return Math.round(this.clamp(options.resultOpacity, 0, 1) * 255);
+    }
+    return (_a = options.boundingBoxOpacity) != null ? _a : 255;
+  }
+  static withAlpha(color, alpha) {
+    if (!color.startsWith("#") || color.length !== 7) {
+      return color;
+    }
+    const r = Number.parseInt(color.slice(1, 3), 16);
+    const g = Number.parseInt(color.slice(3, 5), 16);
+    const b = Number.parseInt(color.slice(5, 7), 16);
+    const normalizedAlpha = this.clamp(alpha, 0, 255) / 255;
+    return `rgba(${r}, ${g}, ${b}, ${normalizedAlpha})`;
+  }
+  static drawDetectionLabel(context, detection, x, y, backgroundColor, options) {
+    var _a;
+    const fontSize = this.getCanvasFontSize(options.font);
+    const margin = Math.max(4, Math.round(fontSize / 3));
+    const label = `${detection.label.name}${options.drawConfidenceScore ? ` ${(detection.confidence * 100).toFixed(1)}%` : ""}`;
+    const textWidth = context.measureText(label).width;
+    const boxWidth = textWidth + margin * 2;
+    const boxHeight = fontSize + margin * 2;
+    const left = this.clamp(Math.round(x), 0, Math.max(0, context.canvas.width - boxWidth));
+    const top = this.clamp(Math.round(y), 0, Math.max(0, context.canvas.height - boxHeight));
+    context.font = options.font;
+    context.textBaseline = "middle";
+    if (options.drawLabelBackground) {
+      context.fillStyle = backgroundColor;
+      context.fillRect(left, top, boxWidth, boxHeight);
+    }
+    context.fillStyle = (_a = options.fontColor) != null ? _a : "#f8fafc";
+    context.fillText(label, left + margin, top + boxHeight / 2);
+  }
+  static getCanvasFontSize(font) {
+    const match = font.match(/(\d+(?:\.\d+)?)px/);
+    return match ? Number(match[1]) : 14;
+  }
+  static getObbCorners(box, radians) {
+    const centerX = (box.left + box.right) / 2;
+    const centerY = (box.top + box.bottom) / 2;
+    const cos = Math.cos(radians);
+    const sin = Math.sin(radians);
+    const corners = [
+      { x: box.left, y: box.top },
+      { x: box.right, y: box.top },
+      { x: box.right, y: box.bottom },
+      { x: box.left, y: box.bottom }
+    ];
+    return corners.map((point) => {
+      const dx = point.x - centerX;
+      const dy = point.y - centerY;
+      return {
+        x: centerX + dx * cos - dy * sin,
+        y: centerY + dx * sin + dy * cos
+      };
+    });
+  }
+  static drawSegmentationMask(context, segmentation, color) {
+    const { left, top, right, bottom } = segmentation.boundingBox;
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+      return;
+    }
+    const imageData = context.createImageData(width, height);
+    const rgba = this.parseCanvasColor(color);
+    const maskCanvas = document.createElement("canvas");
+    const maskContext = maskCanvas.getContext("2d");
+    if (!maskContext) {
+      throw new Error("Canvas 2D context is not available.");
+    }
+    maskCanvas.width = width;
+    maskCanvas.height = height;
+    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+      if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
+        continue;
+      }
+      const offset = pixelIndex * 4;
+      imageData.data[offset] = rgba.r;
+      imageData.data[offset + 1] = rgba.g;
+      imageData.data[offset + 2] = rgba.b;
+      imageData.data[offset + 3] = rgba.a;
+    }
+    maskContext.putImageData(imageData, 0, 0);
+    context.drawImage(maskCanvas, left, top);
+  }
+  static drawSegmentationContour(context, segmentation, color, thickness) {
+    const { left, top, right, bottom } = segmentation.boundingBox;
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+      return;
+    }
+    context.fillStyle = color;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const pixelIndex = y * width + x;
+        if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
+          continue;
+        }
+        if (this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, width, height)) {
+          context.fillRect(left + x, top + y, thickness, thickness);
+        }
+      }
+    }
+  }
+  static drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
+    const thickness = (_b = options.contourThickness) != null ? _b : 2;
+    const drawBoundingBoxes = (_c = options.drawBoundingBoxes) != null ? _c : true;
+    for (let index = 0; index < segmentations.length; index += 1) {
+      const segmentation = segmentations[index];
+      const points = (_f = (_e = (_d = options.segmentationEdgePoints) == null ? void 0 : _d[index]) != null ? _e : segmentation.segmentationEdgePoints) != null ? _f : this.extractSegmentationEdgePoints(segmentation);
+      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle);
+      const fillColor = this.getDetectionColor(
+        segmentation,
+        colors,
+        options.fillStyle,
+        (_g = options.pixelMaskOpacity) != null ? _g : DEFAULT_EDGE_FILL_OPACITY
+      );
+      if (options.drawSegmentationPixelMask === true) {
+        this.drawOrderedEdgePoints(
+          context,
+          points,
+          strokeColor,
+          thickness,
+          options.fillSegmentationEdgePoints === true ? fillColor : void 0
+        );
+      }
+    }
+    if (drawBoundingBoxes || options.drawLabel !== false) {
+      this.drawBoundingBoxes(context, segmentations, width, height, options);
+    }
+  }
+  static drawOrderedEdgePoints(context, points, strokeColor, thickness, fillColor) {
+    if (points.length === 0) {
+      return;
+    }
+    context.save();
+    context.lineWidth = thickness;
+    context.lineJoin = "round";
+    context.lineCap = "round";
+    let previousPoint = null;
+    let hasPath = false;
+    context.beginPath();
+    for (const point of points) {
+      if (!previousPoint || Math.abs(point.x - previousPoint.x) > 1 || Math.abs(point.y - previousPoint.y) > 1) {
+        context.moveTo(point.x, point.y);
+      } else {
+        context.lineTo(point.x, point.y);
+      }
+      hasPath = true;
+      previousPoint = point;
+    }
+    if (hasPath && fillColor) {
+      context.closePath();
+      context.fillStyle = fillColor;
+      context.fill();
+    }
+    if (hasPath) {
+      context.strokeStyle = strokeColor;
+      context.stroke();
+    }
+    context.restore();
+  }
+  static isSegmentationEdgePixel(mask, pixelIndex, x, y, width, height) {
+    if (!this.isPackedMaskSet(mask, pixelIndex)) {
+      return false;
+    }
+    return x === 0 || x === width - 1 || y === 0 || y === height - 1 || !this.isPackedMaskSet(mask, pixelIndex - 1) || !this.isPackedMaskSet(mask, pixelIndex + 1) || !this.isPackedMaskSet(mask, pixelIndex - width) || !this.isPackedMaskSet(mask, pixelIndex + width);
+  }
+  static isPackedMaskSet(mask, pixelIndex) {
+    if (pixelIndex < 0) {
+      return false;
+    }
+    const byteIndex = pixelIndex >> 3;
+    if (byteIndex >= mask.byteLength) {
+      return false;
+    }
+    return (mask[byteIndex] & 1 << (pixelIndex & 7)) !== 0;
+  }
+  static parseCanvasColor(color) {
+    var _a, _b, _c, _d;
+    if (color.startsWith("#") && color.length === 7) {
+      return {
+        r: Number.parseInt(color.slice(1, 3), 16),
+        g: Number.parseInt(color.slice(3, 5), 16),
+        b: Number.parseInt(color.slice(5, 7), 16),
+        a: 255
+      };
+    }
+    const rgba = color.match(/rgba?\(([^)]+)\)/);
+    if (rgba) {
+      const parts = rgba[1].split(",").map((part) => Number(part.trim()));
+      return {
+        r: (_a = parts[0]) != null ? _a : 34,
+        g: (_b = parts[1]) != null ? _b : 197,
+        b: (_c = parts[2]) != null ? _c : 94,
+        a: Math.round(((_d = parts[3]) != null ? _d : 1) * 255)
+      };
+    }
+    return { r: 34, g: 197, b: 94, a: 128 };
+  }
+  static drawPoseConnections(context, keyPoints, confidence, markers, defaultColor) {
+    var _a, _b, _c;
+    if (markers && markers.length > 0) {
+      for (let sourceIndex = 0; sourceIndex < markers.length; sourceIndex += 1) {
+        const source = keyPoints[sourceIndex];
+        if (!source || source.confidence < confidence) {
+          continue;
+        }
+        for (const connection of (_b = (_a = markers[sourceIndex]) == null ? void 0 : _a.connections) != null ? _b : []) {
+          this.drawPoseConnection(context, source, keyPoints[connection.index], confidence, (_c = connection.color) != null ? _c : defaultColor);
+        }
+      }
+      return;
+    }
+    for (const [sourceIndex, targetIndex] of DEFAULT_POSE_CONNECTIONS) {
+      this.drawPoseConnection(context, keyPoints[sourceIndex], keyPoints[targetIndex], confidence, defaultColor);
+    }
+  }
+  static drawPoseConnection(context, source, target, confidence, color) {
+    if (!source || !target || source.confidence < confidence || target.confidence < confidence) {
+      return;
+    }
+    context.strokeStyle = color;
+    context.beginPath();
+    context.moveTo(source.x, source.y);
+    context.lineTo(target.x, target.y);
+    context.stroke();
+  }
+  static getImageSourceSize(img) {
+    if (img instanceof HTMLImageElement) {
+      return {
+        width: img.naturalWidth || img.width,
+        height: img.naturalHeight || img.height
+      };
+    }
+    if (img instanceof HTMLVideoElement) {
+      return {
+        width: img.videoWidth || img.width,
+        height: img.videoHeight || img.height
+      };
+    }
+    if ("displayWidth" in img && "displayHeight" in img) {
+      return {
+        width: img.displayWidth || img.codedWidth,
+        height: img.displayHeight || img.codedHeight
+      };
+    }
+    if (img instanceof SVGImageElement) {
+      const width = img.width.baseVal.value || img.getBoundingClientRect().width;
+      const height = img.height.baseVal.value || img.getBoundingClientRect().height;
+      return { width, height };
+    }
+    return {
+      width: img.width,
+      height: img.height
+    };
+  }
+  static clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
   }
 };
 
@@ -1072,6 +1658,9 @@ var RF_DETRHandler = class {
     this.interpolationCacheKey = "";
     this.topIndices = null;
     this.topScores = null;
+    this.webGpuPipeline = null;
+    this.webGpuDevice = null;
+    this.webGpuFallbackWarned = false;
     this._yolo = yolo;
   }
   preprocessImage(img, roi = null) {
@@ -1082,7 +1671,10 @@ var RF_DETRHandler = class {
     const resizeMode = (_a = this._yolo.yoloOptions.imageResize) != null ? _a : "stretch";
     const { drawWidth, drawHeight, xPad, yPad, gain } = resizeMode === "stretch" ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 } : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
     const context = this.getPreprocessContext(modelWidth, modelHeight);
-    context.clearRect(0, 0, modelWidth, modelHeight);
+    const coversCanvas = xPad <= 0 && yPad <= 0 && drawWidth >= modelWidth && drawHeight >= modelHeight;
+    if (!coversCanvas) {
+      context.clearRect(0, 0, modelWidth, modelHeight);
+    }
     context.drawImage(
       img,
       sourceRect.x,
@@ -1124,15 +1716,173 @@ var RF_DETRHandler = class {
       roi
     };
   }
+  async preprocessImageForRun(img, roi = null) {
+    if (this._yolo.preprocessBackend !== "webgpu") {
+      return this.preprocessImage(img, roi);
+    }
+    try {
+      return await this.preprocessImageWebGpu(img, roi);
+    } catch (error) {
+      if (!this.webGpuFallbackWarned) {
+        console.warn("[RF-DETR] WebGPU preprocessing failed. Falling back to CPU preprocessing.", error);
+        this.webGpuFallbackWarned = true;
+      }
+      return this.preprocessImage(img, roi);
+    }
+  }
+  async preprocessImageWebGpu(img, roi = null) {
+    var _a, _b, _c;
+    const inputShape = this.getInputShape();
+    const [, channels, modelHeight, modelWidth] = inputShape;
+    if (channels !== 3) {
+      return this.preprocessImage(img, roi);
+    }
+    const sourceRect = this.getSourceRect(img, roi);
+    const resizeMode = (_a = this._yolo.yoloOptions.imageResize) != null ? _a : "stretch";
+    const { drawWidth, drawHeight, xPad, yPad, gain } = resizeMode === "stretch" ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 } : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
+    const context = this.getPreprocessContext(modelWidth, modelHeight);
+    const coversCanvas = xPad <= 0 && yPad <= 0 && drawWidth >= modelWidth && drawHeight >= modelHeight;
+    if (!coversCanvas) {
+      context.clearRect(0, 0, modelWidth, modelHeight);
+    }
+    context.drawImage(
+      img,
+      sourceRect.x,
+      sourceRect.y,
+      sourceRect.width,
+      sourceRect.height,
+      xPad,
+      yPad,
+      drawWidth,
+      drawHeight
+    );
+    const imageMean = (_b = this._yolo.yoloOptions.imageMean) != null ? _b : DEFAULT_IMAGE_MEAN;
+    const imageStd = (_c = this._yolo.yoloOptions.imageStd) != null ? _c : DEFAULT_IMAGE_STD;
+    const inputTensor = await this.createWebGpuInputTensor(context.canvas, inputShape, imageMean, imageStd);
+    return {
+      tensorData: new Float32Array(0),
+      inputTensor,
+      inputName: this._yolo.inputNames[0],
+      inputShape,
+      sourceWidth: sourceRect.width,
+      sourceHeight: sourceRect.height,
+      xPad,
+      yPad,
+      gain,
+      resizeMode,
+      roi
+    };
+  }
+  async createWebGpuInputTensor(canvas, inputShape, imageMean, imageStd) {
+    const [, channels, height, width] = inputShape;
+    const device = await this._yolo.getWebGpuDevice();
+    const usage = globalThis.GPUBufferUsage;
+    const textureUsage = globalThis.GPUTextureUsage;
+    const outputByteLength = channels * width * height * Float32Array.BYTES_PER_ELEMENT;
+    const texture = device.createTexture({
+      size: [width, height, 1],
+      format: "rgba8unorm",
+      usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT
+    });
+    const outputBuffer = device.createBuffer({
+      size: outputByteLength,
+      usage: usage.STORAGE | usage.COPY_SRC | usage.COPY_DST
+    });
+    const paramsBuffer = device.createBuffer({
+      size: 48,
+      usage: usage.UNIFORM | usage.COPY_DST
+    });
+    const params = new Float32Array([
+      width,
+      height,
+      0,
+      0,
+      1 / imageStd[0],
+      1 / imageStd[1],
+      1 / imageStd[2],
+      0,
+      -imageMean[0] / imageStd[0],
+      -imageMean[1] / imageStd[1],
+      -imageMean[2] / imageStd[2],
+      0
+    ]);
+    device.queue.copyExternalImageToTexture(
+      { source: canvas },
+      { texture },
+      { width, height }
+    );
+    device.queue.writeBuffer(paramsBuffer, 0, params);
+    const pipeline = this.getWebGpuPreprocessPipeline(device);
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: texture.createView() },
+        { binding: 1, resource: { buffer: outputBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } }
+      ]
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    texture.destroy();
+    paramsBuffer.destroy();
+    return this._yolo.tensorFromGpuBuffer(outputBuffer, inputShape, () => outputBuffer.destroy());
+  }
+  getWebGpuPreprocessPipeline(device) {
+    if (this.webGpuPipeline && this.webGpuDevice === device) {
+      return this.webGpuPipeline;
+    }
+    this.webGpuDevice = device;
+    this.webGpuPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module: device.createShaderModule({
+          code: `
+struct Params {
+  size: vec4<f32>,
+  scale: vec4<f32>,
+  bias: vec4<f32>,
+};
+
+@group(0) @binding(0) var inputTexture: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> outputTensor: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let width = u32(params.size.x);
+  let height = u32(params.size.y);
+
+  if (id.x >= width || id.y >= height) {
+    return;
+  }
+
+  let rgba = textureLoad(inputTexture, vec2<i32>(i32(id.x), i32(id.y)), 0);
+  let pixel = id.y * width + id.x;
+  let planeSize = width * height;
+
+  outputTensor[pixel] = rgba.r * params.scale.x + params.bias.x;
+  outputTensor[planeSize + pixel] = rgba.g * params.scale.y + params.bias.y;
+  outputTensor[planeSize * 2u + pixel] = rgba.b * params.scale.z + params.bias.z;
+}
+          `
+        }),
+        entryPoint: "main"
+      }
+    });
+    return this.webGpuPipeline;
+  }
   async RunObjectDetection(img, confidence, iou, roi = null) {
     var _a, _b;
     if (this._yolo.onnxModel.modelType !== "ObjectDetection") {
       unsupportedTask("ObjectDetection");
     }
-    const input = this.preprocessImage(img, roi);
-    const result = await this._yolo.run({
-      [input.inputName]: this._yolo.tensor("float32", input.tensorData, input.inputShape)
-    });
+    const input = await this.preprocessImageForRun(img, roi);
+    const result = await this.runWithPreprocessedInput(input);
     const dets = (_a = result.dets) == null ? void 0 : _a.data;
     const labels = (_b = result.labels) == null ? void 0 : _b.data;
     if (!dets || !labels) {
@@ -1166,7 +1916,7 @@ var RF_DETRHandler = class {
     const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
       (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
     );
-    const labels = backgroundClassIndex >= 0 ? this._yolo.onnxModel.labels.filter((label) => label.index !== backgroundClassIndex).map((label, index) => ({ ...label, index })) : this._yolo.onnxModel.labels;
+    const labels = this._yolo.onnxModel.labels;
     const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
     const objects = [];
     for (let i = 0; i < topCount; i += 1) {
@@ -1180,8 +1930,7 @@ var RF_DETRHandler = class {
       if (labelIndex === backgroundClassIndex) {
         continue;
       }
-      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex ? labelIndex - 1 : labelIndex;
-      const label = labels[mappedLabelIndex];
+      const label = labels[labelIndex];
       if (!label) {
         continue;
       }
@@ -1204,10 +1953,8 @@ var RF_DETRHandler = class {
   }
   async runSegmentation(img, confidence, roi) {
     var _a, _b, _c;
-    const input = this.preprocessImage(img, roi);
-    const result = await this._yolo.run({
-      [input.inputName]: this._yolo.tensor("float32", input.tensorData, input.inputShape)
-    });
+    const input = await this.preprocessImageForRun(img, roi);
+    const result = await this.runWithPreprocessedInput(input);
     const dets = (_a = result.dets) == null ? void 0 : _a.data;
     const logits = (_b = result.labels) == null ? void 0 : _b.data;
     const masks = (_c = result.masks) == null ? void 0 : _c.data;
@@ -1215,6 +1962,17 @@ var RF_DETRHandler = class {
       throw new Error(`Unsupported RF-DETR segmentation outputs: ${Object.keys(result).join(", ")}`);
     }
     return this.decodeSegmentations(dets, logits, masks, input, confidence);
+  }
+  async runWithPreprocessedInput(input) {
+    var _a, _b;
+    const inputTensor = (_a = input.inputTensor) != null ? _a : this._yolo.tensor("float32", input.tensorData, input.inputShape);
+    try {
+      return await this._yolo.run({
+        [input.inputName]: inputTensor
+      });
+    } finally {
+      (_b = input.inputTensor) == null ? void 0 : _b.dispose();
+    }
   }
   decodeSegmentations(dets, logits, masks, input, confidence) {
     const detsShape = this._yolo.onnxModel.outputShapes.dets;
@@ -1231,7 +1989,7 @@ var RF_DETRHandler = class {
     const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
       (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
     );
-    const labels = backgroundClassIndex >= 0 ? this._yolo.onnxModel.labels.filter((label) => label.index !== backgroundClassIndex).map((label, index) => ({ ...label, index })) : this._yolo.onnxModel.labels;
+    const labels = this._yolo.onnxModel.labels;
     const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
     const segmentations = [];
     for (let i = 0; i < topCount; i += 1) {
@@ -1245,8 +2003,7 @@ var RF_DETRHandler = class {
       if (labelIndex === backgroundClassIndex) {
         continue;
       }
-      const mappedLabelIndex = backgroundClassIndex >= 0 && labelIndex > backgroundClassIndex ? labelIndex - 1 : labelIndex;
-      const label = labels[mappedLabelIndex];
+      const label = labels[labelIndex];
       if (!label) {
         continue;
       }
@@ -1663,34 +2420,6 @@ var RF_DETRHandler = class {
 
 // src/yolo.ts
 var DEFAULT_EXECUTION_PROVIDERS = ["wasm"];
-var DEFAULT_BOX_COLORS = [
-  "#22c55e",
-  "#3b82f6",
-  "#f97316",
-  "#e11d48",
-  "#8b5cf6",
-  "#14b8a6",
-  "#f59e0b",
-  "#06b6d4"
-];
-var DEFAULT_POSE_CONNECTIONS = [
-  [5, 7],
-  [7, 9],
-  [6, 8],
-  [8, 10],
-  [5, 6],
-  [5, 11],
-  [6, 12],
-  [11, 12],
-  [11, 13],
-  [13, 15],
-  [12, 14],
-  [14, 16],
-  [0, 1],
-  [0, 2],
-  [1, 3],
-  [2, 4]
-];
 var Yolo = class _Yolo {
   constructor(options = {}) {
     this.session = null;
@@ -1706,6 +2435,14 @@ var Yolo = class _Yolo {
   }
   get yoloOptions() {
     return this.options;
+  }
+  get preprocessBackend() {
+    var _a;
+    const requestedBackend = (_a = this.options.preprocessBackend) != null ? _a : this.hasWebGpuExecutionProvider() ? "webgpu" : "cpu";
+    if (requestedBackend !== "webgpu") {
+      return "cpu";
+    }
+    return this.hasWebGpuExecutionProvider() ? "webgpu" : "cpu";
   }
   static async create(options) {
     const yolo = new _Yolo(options);
@@ -1859,350 +2596,43 @@ var Yolo = class _Yolo {
     };
   }
   drawObjectDetections(source, detections, canvas, options = {}) {
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    this.drawBoundingBoxes(context, detections, width, height, options);
+    DrawTool.drawObjectDetections(source, detections, canvas, options);
   }
   drawClassifications(source, classifications, canvas, options = {}) {
-    var _a, _b, _c, _d, _e;
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const font = (_a = options.font) != null ? _a : `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
-    const fontColor = (_b = options.fontColor) != null ? _b : "#f8fafc";
-    const backgroundColor = (_c = options.backgroundColor) != null ? _c : "rgba(15, 23, 42, 0.72)";
-    const drawConfidenceScore = (_d = options.drawConfidenceScore) != null ? _d : true;
-    const drawLabelBackground = (_e = options.drawLabelBackground) != null ? _e : true;
-    const margin = 10;
-    const lineGap = 8;
-    context.font = font;
-    context.textBaseline = "top";
-    const lineHeight = this.getCanvasFontSize(font) + lineGap;
-    const labels = classifications.map((item) => `${item.label}${drawConfidenceScore ? ` (${(item.confidence * 100).toFixed(1)}%)` : ""}`);
-    const boxWidth = Math.max(0, ...labels.map((label) => context.measureText(label).width)) + margin * 2;
-    const boxHeight = labels.length * lineHeight + margin * 2 - lineGap;
-    if (drawLabelBackground && labels.length > 0) {
-      context.fillStyle = backgroundColor;
-      context.fillRect(8, 8, boxWidth, boxHeight);
-    }
-    context.fillStyle = fontColor;
-    for (let i = 0; i < labels.length; i += 1) {
-      context.fillText(labels[i], 8 + margin, 8 + margin + i * lineHeight);
-    }
+    DrawTool.drawClassifications(source, classifications, canvas, options);
   }
   drawObbDetections(source, detections, canvas, options = {}) {
-    var _a, _b, _c, _d, _e, _f, _g;
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const font = (_a = options.font) != null ? _a : `${Math.max(14, Math.round(Math.min(width, height) / 45))}px Arial`;
-    const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
-    const drawLabel = (_c = options.drawLabel) != null ? _c : true;
-    const drawConfidenceScore = (_d = options.drawConfidenceScore) != null ? _d : true;
-    const drawLabelBackground = (_e = options.drawLabelBackground) != null ? _e : true;
-    const colors = (_f = options.boundingBoxHexColors) != null ? _f : [...DEFAULT_BOX_COLORS];
-    const alpha = this.getDetectionDrawingAlpha(options);
-    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
-    context.font = font;
-    context.textBaseline = "middle";
-    context.lineWidth = lineWidth;
-    for (const detection of detections) {
-      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
-      const points = this.getObbCorners(detection.boundingBox, detection.orientationAngle);
-      context.strokeStyle = color;
-      context.beginPath();
-      context.moveTo(points[0].x, points[0].y);
-      for (let i = 1; i < points.length; i += 1) {
-        context.lineTo(points[i].x, points[i].y);
-      }
-      context.closePath();
-      context.stroke();
-      if (drawLabel) {
-        this.drawDetectionLabel(context, detection, points[2].x, points[2].y, color, {
-          font,
-          drawConfidenceScore,
-          drawLabelBackground,
-          fontColor
-        });
-      }
-    }
+    DrawTool.drawObbDetections(source, detections, canvas, options);
   }
   drawSegmentations(source, segmentations, canvas, options = {}) {
-    var _a, _b, _c, _d, _e, _f;
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
-    const drawMask = (_b = options.drawSegmentationPixelMask) != null ? _b : true;
-    const drawContour = (_c = options.drawContour) != null ? _c : false;
-    const drawBoundingBoxes = (_d = options.drawBoundingBoxes) != null ? _d : true;
-    const pixelMaskOpacity = (_e = options.pixelMaskOpacity) != null ? _e : 128;
-    if (drawMask) {
-      for (const segmentation of segmentations) {
-        this.drawSegmentationMask(context, segmentation, this.getDetectionColor(segmentation, colors, void 0, pixelMaskOpacity));
-      }
-    }
-    if (drawContour) {
-      for (const segmentation of segmentations) {
-        this.drawSegmentationContour(
-          context,
-          segmentation,
-          this.getDetectionColor(segmentation, colors, options.strokeStyle),
-          (_f = options.contourThickness) != null ? _f : 2
-        );
-      }
-    }
-    if (drawBoundingBoxes || options.drawLabel !== false) {
-      this.drawBoundingBoxes(context, segmentations, width, height, options);
-    }
+    DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
   drawPoseEstimations(source, poseEstimations, canvas, options = {}) {
-    var _a, _b, _c, _d, _e, _f, _g;
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const confidence = (_a = options.poseConfidence) != null ? _a : 0.25;
-    const defaultPoseColor = (_b = options.defaultPoseColor) != null ? _b : "#22c55e";
-    const radius = (_c = options.keyPointRadius) != null ? _c : Math.max(3, Math.round(Math.min(width, height) / 260));
-    const lineWidth = (_d = options.lineWidth) != null ? _d : Math.max(2, Math.round(Math.min(width, height) / 360));
-    const markers = options.keyPointMarkers;
-    context.lineWidth = lineWidth;
-    for (const pose of poseEstimations) {
-      this.drawPoseConnections(context, pose.keyPoints, confidence, markers, defaultPoseColor);
-      for (let i = 0; i < pose.keyPoints.length; i += 1) {
-        const keyPoint = pose.keyPoints[i];
-        if (keyPoint.confidence < confidence) {
-          continue;
-        }
-        context.fillStyle = (_f = (_e = markers == null ? void 0 : markers[i]) == null ? void 0 : _e.color) != null ? _f : defaultPoseColor;
-        context.beginPath();
-        context.arc(keyPoint.x, keyPoint.y, radius, 0, Math.PI * 2);
-        context.fill();
-      }
-    }
-    if (((_g = options.drawBoundingBoxes) != null ? _g : true) || options.drawLabel !== false) {
-      this.drawBoundingBoxes(context, poseEstimations, width, height, options);
-    }
+    DrawTool.drawPoseEstimations(source, poseEstimations, canvas, options);
   }
-  drawBoundingBoxes(context, detections, width, height, options = {}) {
-    var _a, _b, _c, _d, _e, _f, _g;
-    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
-    const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
-    const font = (_c = options.font) != null ? _c : `${Math.max(14, Math.round(Math.min(width, height) / 70))}px Arial`;
-    const drawLabel = (_d = options.drawLabel) != null ? _d : true;
-    const drawConfidenceScore = (_e = options.drawConfidenceScore) != null ? _e : true;
-    const drawLabelBackground = (_f = options.drawLabelBackground) != null ? _f : true;
-    const alpha = this.getDetectionDrawingAlpha(options);
-    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
-    context.lineWidth = lineWidth;
-    context.font = font;
-    context.textBaseline = "middle";
-    for (const detection of detections) {
-      const { left, top, right, bottom } = detection.boundingBox;
-      const boxWidth = right - left;
-      const boxHeight = bottom - top;
-      const color = this.getDetectionColor(detection, colors, options.strokeStyle, alpha);
-      if (boxWidth <= 0 || boxHeight <= 0) {
-        continue;
-      }
-      context.strokeStyle = color;
-      context.strokeRect(left, top, boxWidth, boxHeight);
-      if (drawLabel) {
-        this.drawDetectionLabel(context, detection, left, Math.max(0, top - this.getCanvasFontSize(font)), color, {
-          font,
-          drawConfidenceScore,
-          drawLabelBackground,
-          fontColor
-        });
-      }
-    }
+  extractSegmentationEdgePoints(segmentation) {
+    return DrawTool.extractSegmentationEdgePoints(segmentation);
   }
-  prepareDrawingCanvas(source, canvas, drawSource = true) {
-    const { width, height } = this.getImageSourceSize(source);
-    const context = canvas.getContext("2d");
-    if (!context) {
-      throw new Error("Canvas 2D context is not available.");
-    }
-    if (canvas.width !== width) {
-      canvas.width = width;
-    }
-    if (canvas.height !== height) {
-      canvas.height = height;
-    }
-    context.clearRect(0, 0, width, height);
-    if (drawSource) {
-      context.drawImage(source, 0, 0, width, height);
-    }
-    return { context, width, height };
-  }
-  getDetectionColor(detection, colors, fallback, alpha = 255) {
-    var _a;
-    const color = (_a = fallback != null ? fallback : colors[detection.label.index % colors.length]) != null ? _a : DEFAULT_BOX_COLORS[0];
-    return this.withAlpha(color, alpha);
-  }
-  getDetectionDrawingAlpha(options) {
-    var _a;
-    if (options.resultOpacity !== void 0) {
-      return Math.round(this.clamp(options.resultOpacity, 0, 1) * 255);
-    }
-    return (_a = options.boundingBoxOpacity) != null ? _a : 255;
-  }
-  withAlpha(color, alpha) {
-    if (!color.startsWith("#") || color.length !== 7) {
-      return color;
-    }
-    const r = Number.parseInt(color.slice(1, 3), 16);
-    const g = Number.parseInt(color.slice(3, 5), 16);
-    const b = Number.parseInt(color.slice(5, 7), 16);
-    const normalizedAlpha = this.clamp(alpha, 0, 255) / 255;
-    return `rgba(${r}, ${g}, ${b}, ${normalizedAlpha})`;
-  }
-  drawDetectionLabel(context, detection, x, y, backgroundColor, options) {
-    var _a;
-    const fontSize = this.getCanvasFontSize(options.font);
-    const margin = Math.max(4, Math.round(fontSize / 3));
-    const label = `${detection.label.name}${options.drawConfidenceScore ? ` ${(detection.confidence * 100).toFixed(1)}%` : ""}`;
-    const textWidth = context.measureText(label).width;
-    const boxWidth = textWidth + margin * 2;
-    const boxHeight = fontSize + margin * 2;
-    const left = this.clamp(Math.round(x), 0, Math.max(0, context.canvas.width - boxWidth));
-    const top = this.clamp(Math.round(y), 0, Math.max(0, context.canvas.height - boxHeight));
-    context.font = options.font;
-    context.textBaseline = "middle";
-    if (options.drawLabelBackground) {
-      context.fillStyle = backgroundColor;
-      context.fillRect(left, top, boxWidth, boxHeight);
-    }
-    context.fillStyle = (_a = options.fontColor) != null ? _a : "#f8fafc";
-    context.fillText(label, left + margin, top + boxHeight / 2);
-  }
-  getCanvasFontSize(font) {
-    const match = font.match(/(\d+(?:\.\d+)?)px/);
-    return match ? Number(match[1]) : 14;
-  }
-  getObbCorners(box, radians) {
-    const centerX = (box.left + box.right) / 2;
-    const centerY = (box.top + box.bottom) / 2;
-    const cos = Math.cos(radians);
-    const sin = Math.sin(radians);
-    const corners = [
-      { x: box.left, y: box.top },
-      { x: box.right, y: box.top },
-      { x: box.right, y: box.bottom },
-      { x: box.left, y: box.bottom }
-    ];
-    return corners.map((point) => {
-      const dx = point.x - centerX;
-      const dy = point.y - centerY;
-      return {
-        x: centerX + dx * cos - dy * sin,
-        y: centerY + dx * sin + dy * cos
-      };
-    });
-  }
-  drawSegmentationMask(context, segmentation, color) {
-    const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
-      return;
-    }
-    const imageData = context.createImageData(width, height);
-    const rgba = this.parseCanvasColor(color);
-    const maskCanvas = document.createElement("canvas");
-    const maskContext = maskCanvas.getContext("2d");
-    if (!maskContext) {
-      throw new Error("Canvas 2D context is not available.");
-    }
-    maskCanvas.width = width;
-    maskCanvas.height = height;
-    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
-      if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
-        continue;
-      }
-      const offset = pixelIndex * 4;
-      imageData.data[offset] = rgba.r;
-      imageData.data[offset + 1] = rgba.g;
-      imageData.data[offset + 2] = rgba.b;
-      imageData.data[offset + 3] = rgba.a;
-    }
-    maskContext.putImageData(imageData, 0, 0);
-    context.drawImage(maskCanvas, left, top);
-  }
-  drawSegmentationContour(context, segmentation, color, thickness) {
-    const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
-      return;
-    }
-    context.fillStyle = color;
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const pixelIndex = y * width + x;
-        if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
-          continue;
-        }
-        const isEdge = x === 0 || x === width - 1 || y === 0 || y === height - 1 || !this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex - 1) || !this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex + 1) || !this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex - width) || !this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex + width);
-        if (isEdge) {
-          context.fillRect(left + x, top + y, thickness, thickness);
-        }
-      }
-    }
-  }
-  isPackedMaskSet(mask, pixelIndex) {
-    if (pixelIndex < 0) {
-      return false;
-    }
-    const byteIndex = pixelIndex >> 3;
-    if (byteIndex >= mask.byteLength) {
-      return false;
-    }
-    return (mask[byteIndex] & 1 << (pixelIndex & 7)) !== 0;
-  }
-  parseCanvasColor(color) {
-    var _a, _b, _c, _d;
-    if (color.startsWith("#") && color.length === 7) {
-      return {
-        r: Number.parseInt(color.slice(1, 3), 16),
-        g: Number.parseInt(color.slice(3, 5), 16),
-        b: Number.parseInt(color.slice(5, 7), 16),
-        a: 255
-      };
-    }
-    const rgba = color.match(/rgba?\(([^)]+)\)/);
-    if (rgba) {
-      const parts = rgba[1].split(",").map((part) => Number(part.trim()));
-      return {
-        r: (_a = parts[0]) != null ? _a : 34,
-        g: (_b = parts[1]) != null ? _b : 197,
-        b: (_c = parts[2]) != null ? _c : 94,
-        a: Math.round(((_d = parts[3]) != null ? _d : 1) * 255)
-      };
-    }
-    return { r: 34, g: 197, b: 94, a: 128 };
-  }
-  drawPoseConnections(context, keyPoints, confidence, markers, defaultColor) {
-    var _a, _b, _c;
-    if (markers && markers.length > 0) {
-      for (let sourceIndex = 0; sourceIndex < markers.length; sourceIndex += 1) {
-        const source = keyPoints[sourceIndex];
-        if (!source || source.confidence < confidence) {
-          continue;
-        }
-        for (const connection of (_b = (_a = markers[sourceIndex]) == null ? void 0 : _a.connections) != null ? _b : []) {
-          this.drawPoseConnection(context, source, keyPoints[connection.index], confidence, (_c = connection.color) != null ? _c : defaultColor);
-        }
-      }
-      return;
-    }
-    for (const [sourceIndex, targetIndex] of DEFAULT_POSE_CONNECTIONS) {
-      this.drawPoseConnection(context, keyPoints[sourceIndex], keyPoints[targetIndex], confidence, defaultColor);
-    }
-  }
-  drawPoseConnection(context, source, target, confidence, color) {
-    if (!source || !target || source.confidence < confidence || target.confidence < confidence) {
-      return;
-    }
-    context.strokeStyle = color;
-    context.beginPath();
-    context.moveTo(source.x, source.y);
-    context.lineTo(target.x, target.y);
-    context.stroke();
+  extractSegmentationsEdgePoints(segmentations) {
+    return DrawTool.extractSegmentationsEdgePoints(segmentations);
   }
   tensor(type, data, dims) {
     return new ort.Tensor(type, data, dims);
+  }
+  async getWebGpuDevice() {
+    var _a;
+    const device = (_a = ort.env.webgpu) == null ? void 0 : _a.device;
+    if (!device) {
+      throw new Error("WebGPU device is not initialized by ONNX Runtime Web.");
+    }
+    return device;
+  }
+  tensorFromGpuBuffer(gpuBuffer, dims, dispose) {
+    return ort.Tensor.fromGpuBuffer(gpuBuffer, {
+      dataType: "float32",
+      dims,
+      dispose
+    });
   }
   async dispose() {
     if (!this.session) {
@@ -2354,6 +2784,16 @@ var Yolo = class _Yolo {
     }
     return this.model;
   }
+  hasWebGpuExecutionProvider() {
+    var _a, _b, _c;
+    const executionProviders = (_c = (_b = (_a = this.options.sessionOptions) == null ? void 0 : _a.executionProviders) != null ? _b : this.options.executionProviders) != null ? _c : DEFAULT_EXECUTION_PROVIDERS;
+    return executionProviders.some((executionProvider) => {
+      if (typeof executionProvider === "string") {
+        return executionProvider === "webgpu";
+      }
+      return (executionProvider == null ? void 0 : executionProvider.name) === "webgpu";
+    });
+  }
   isSupportedModel(modelVersion, modelType) {
     const allTasks = [
       "Classification",
@@ -2380,6 +2820,6 @@ var Yolo = class _Yolo {
   }
 };
 
-export { Classification, OBBDetection, ObjectDetection, PoseEstimation, Segmentation, TrackingInfo, Yolo, YoloExecutionProviderNames, YoloExecutionProviderOptions, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };
+export { Classification, DrawTool, OBBDetection, ObjectDetection, PoseEstimation, Segmentation, TrackingInfo, Yolo, YoloExecutionProviderNames, YoloExecutionProviderOptions, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map
