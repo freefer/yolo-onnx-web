@@ -115,7 +115,6 @@ interface SegmentationDrawingOptions extends DetectionDrawingOptions {
     drawContour?: boolean;
     contourThickness?: number;
     drawBoundingBoxes?: boolean;
-    segmentationEdgePoints?: readonly (readonly Point[])[];
     fillSegmentationEdgePoints?: boolean;
 }
 interface KeyPointConnection {

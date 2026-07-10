@@ -524,20 +524,20 @@ var DrawTool = class {
     }
   }
   static drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e;
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
     const thickness = (_b = options.contourThickness) != null ? _b : 2;
     const drawBoundingBoxes = (_c = options.drawBoundingBoxes) != null ? _c : true;
     for (let index = 0; index < segmentations.length; index += 1) {
       const segmentation = segmentations[index];
-      const points = (_f = (_e = (_d = options.segmentationEdgePoints) == null ? void 0 : _d[index]) != null ? _e : segmentation.segmentationEdgePoints) != null ? _f : this.extractSegmentationEdgePoints(segmentation);
+      const points = (_d = segmentation.segmentationEdgePoints) != null ? _d : this.extractSegmentationEdgePoints(segmentation);
       const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle);
       const fillColor = this.getDetectionColor(
         segmentation,
         colors,
         options.fillStyle,
-        (_g = options.pixelMaskOpacity) != null ? _g : DEFAULT_EDGE_FILL_OPACITY
+        (_e = options.pixelMaskOpacity) != null ? _e : DEFAULT_EDGE_FILL_OPACITY
       );
       if (options.drawSegmentationPixelMask === true) {
         this.drawOrderedEdgePoints(

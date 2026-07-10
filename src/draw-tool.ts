@@ -606,7 +606,7 @@ export class DrawTool {
 
     for (let index = 0; index < segmentations.length; index += 1) {
       const segmentation = segmentations[index];
-      const points = options.segmentationEdgePoints?.[index] ?? segmentation.segmentationEdgePoints ?? this.extractSegmentationEdgePoints(segmentation);
+      const points =   segmentation.segmentationEdgePoints ?? this.extractSegmentationEdgePoints(segmentation);
       const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle);
       const fillColor = this.getDetectionColor(
         segmentation,
