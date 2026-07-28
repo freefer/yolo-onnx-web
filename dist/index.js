@@ -529,15 +529,18 @@ var DrawTool = class {
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
     const thickness = (_b = options.contourThickness) != null ? _b : 2;
     const drawBoundingBoxes = (_c = options.drawBoundingBoxes) != null ? _c : true;
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fillBaseOpacity = (_d = options.pixelMaskOpacity) != null ? _d : DEFAULT_EDGE_FILL_OPACITY;
+    const fillOpacity = options.resultOpacity !== void 0 ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1)) : fillBaseOpacity;
     for (let index = 0; index < segmentations.length; index += 1) {
       const segmentation = segmentations[index];
-      const points = (_d = segmentation.segmentationEdgePoints) != null ? _d : this.extractSegmentationEdgePoints(segmentation);
-      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle);
+      const points = (_e = segmentation.segmentationEdgePoints) != null ? _e : this.extractSegmentationEdgePoints(segmentation);
+      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
       const fillColor = this.getDetectionColor(
         segmentation,
         colors,
         options.fillStyle,
-        (_e = options.pixelMaskOpacity) != null ? _e : DEFAULT_EDGE_FILL_OPACITY
+        fillOpacity
       );
       if (options.drawSegmentationPixelMask === true) {
         this.drawOrderedEdgePoints(
