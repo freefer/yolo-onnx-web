@@ -1,4 +1,10 @@
-import { Yolo, YoloWebExecutionProviderOptions } from '../../src';
+import {
+  canReuseOrtBundle,
+  getLoadedOrtBundle,
+  resolveOrtBundle,
+  Yolo,
+  YoloWebExecutionProviderOptions,
+} from '../../src';
 import type {
   Classification,
   ModelType,
@@ -14,6 +20,7 @@ import type {
 
 const ORT_WASM_PATHS = new URL('./ort-wasm/', window.location.href).toString();
 const DEFAULT_MODEL_URL = new URL('../model/yolo26s.onnx', window.location.href).toString();
+const BACKEND_STORAGE_KEY = 'yolo-onnx-web:backend';
 const CAMERA_WIDTH = 1920;
 const CAMERA_HEIGHT = 1080;
 
@@ -68,6 +75,12 @@ inputModeSelect.addEventListener('change', () => {
 });
 
 backendSelect.addEventListener('change', () => {
+  sessionStorage.setItem(BACKEND_STORAGE_KEY, backendSelect.value);
+
+  if (reloadPageIfOrtBundleIncompatible()) {
+    return;
+  }
+
   if (!hasModelSource()) {
     return;
   }
@@ -170,6 +183,10 @@ loadSelectedModel().catch(error => {
 });
 
 async function loadSelectedModel(): Promise<void> {
+  if (reloadPageIfOrtBundleIncompatible()) {
+    return;
+  }
+
   const token = ++loadingModelToken;
   setLoadingModel(true, '正在加载 WASM 与模型，请稍候...');
   writeModelInfo('正在加载模型...');
@@ -201,6 +218,13 @@ async function loadSelectedModel(): Promise<void> {
 
     writeModelInfo(formatModelInfo(yolo.onnxModel));
     writeOutput('模型已加载。请选择图片，然后点击运行推理。');
+  } catch (error) {
+    if (isOrtBundleReloadError(error)) {
+      reloadPageIfOrtBundleIncompatible(true);
+      return;
+    }
+
+    throw error;
   } finally {
     if (token === loadingModelToken) {
       setLoadingModel(false);
@@ -754,15 +778,41 @@ function getSelectedExecutionProvider(): YoloExecutionProvider {
 }
 
 function renderBackendOptions(): void {
+  const savedBackend = sessionStorage.getItem(BACKEND_STORAGE_KEY);
+
   backendSelect.replaceChildren(
     ...YoloWebExecutionProviderOptions.map(({ value, label }, index) => {
       const option = document.createElement('option');
       option.value = String(value);
       option.textContent = label;
-      option.selected = index === 0;
+      option.selected = savedBackend ? savedBackend === String(value) : index === 0;
 
       return option;
     }),
+  );
+}
+
+function reloadPageIfOrtBundleIncompatible(force = false): boolean {
+  const loaded = getLoadedOrtBundle();
+  const requested = resolveOrtBundle([getSelectedExecutionProvider()]);
+
+  if (!force && (!loaded || canReuseOrtBundle(loaded, requested))) {
+    return false;
+  }
+
+  sessionStorage.setItem(BACKEND_STORAGE_KEY, backendSelect.value);
+  setLoadingModel(true, `正在切换运行时包 (${loaded ?? 'none'} → ${requested})，页面刷新中...`);
+  writeModelInfo(`切换后端需要更换 onnxruntime-web 入口（${loaded ?? 'none'} → ${requested}），正在刷新页面...`);
+  window.location.reload();
+  return true;
+}
+
+function isOrtBundleReloadError(error: unknown): boolean {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: string }).code === 'ORT_BUNDLE_RELOAD_REQUIRED',
   );
 }
 

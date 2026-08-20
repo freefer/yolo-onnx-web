@@ -6,6 +6,8 @@
 
 GitHub 仓库：[https://github.com/freefer/yolo-onnx-web](https://github.com/freefer/yolo-onnx-web)
 
+在线 Demo：[https://freefer.github.io/yolo-onnx-web/](https://freefer.github.io/yolo-onnx-web/)
+
 English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob/main/README.md)
 
 ## 功能特性

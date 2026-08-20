@@ -11,7 +11,7 @@
     "type": "git",
     "url": "git+https://github.com/freefer/yolo-onnx-web.git"
   },
-  "homepage": "https://github.com/freefer/yolo-onnx-web#readme",
+  "homepage": "https://freefer.github.io/yolo-onnx-web/",
   "bugs": {
     "url": "https://github.com/freefer/yolo-onnx-web/issues"
   },
@@ -48,13 +48,14 @@
     "start": "vite",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {
-    "onnxruntime-web": "1.27.0"
-  },
   "devDependencies": {
     "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "coi-serviceworker": "^0.1.7",
     "tsup": "latest",
     "typescript": "^5.9.3",
     "vite": "^6.4.3"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.27.0"
   }
 }

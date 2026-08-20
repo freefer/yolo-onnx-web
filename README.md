@@ -6,6 +6,8 @@ This package loads Ultralytics-style ONNX models in the browser, parses model me
 
 Repository: [https://github.com/freefer/yolo-onnx-web](https://github.com/freefer/yolo-onnx-web)
 
+Online demo: [https://freefer.github.io/yolo-onnx-web/](https://freefer.github.io/yolo-onnx-web/)
+
 Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-web/blob/main/README.zh-CN.md)
 
 ## Features

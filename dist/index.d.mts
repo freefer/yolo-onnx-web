@@ -1,10 +1,9 @@
-import * as ort from 'onnxruntime-web';
-import * as all from 'onnxruntime-web/all';
-export { all as ort };
+import * as onnxruntime_web_webgpu from 'onnxruntime-web/webgpu';
+import * as ort$1 from 'onnxruntime-web';
 
 type YoloModelSource = string | ArrayBufferLike | Uint8Array;
 type YoloImageSource = CanvasImageSource;
-type YoloExecutionProvider = NonNullable<ort.InferenceSession.SessionOptions['executionProviders']>[number];
+type YoloExecutionProvider = NonNullable<ort$1.InferenceSession.SessionOptions['executionProviders']>[number];
 declare const YoloExecutionProviderNames: readonly ["coreml", "cpu", "cuda", "dml", "nnapi", "tensorrt", "wasm", "webgl", "webgpu", "webnn", "qnn", "xnnpack"];
 declare const YoloExecutionProviderOptions: readonly [{
     readonly value: "coreml";
@@ -201,6 +200,14 @@ interface OnnxRuntimeWebOptions {
     numThreads?: number;
     /** Whether to run wasm backend in a proxy worker. */
     proxy?: boolean;
+    /**
+     * Which onnxruntime-web package entry to load.
+     * Defaults to `auto`:
+     * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP)
+     * - webnn / webgl → `onnxruntime-web/all`
+     * - otherwise → `onnxruntime-web/wasm`
+     */
+    ortBundle?: 'auto' | 'webgpu' | 'wasm' | 'webgl' | 'all';
 }
 interface YoloOptions extends OnnxRuntimeWebOptions {
     /** ONNX model URL, ArrayBuffer, or Uint8Array. */
@@ -208,7 +215,7 @@ interface YoloOptions extends OnnxRuntimeWebOptions {
     /** Browser execution provider priority. Defaults to ['wasm']. */
     executionProviders?: readonly YoloExecutionProvider[];
     /** Extra onnxruntime-web session options. */
-    sessionOptions?: ort.InferenceSession.SessionOptions;
+    sessionOptions?: ort$1.InferenceSession.SessionOptions;
     /** Optional model type override for ONNX models without custom metadata. */
     modelType?: ModelType;
     /** Optional model version override for ONNX models without custom metadata. */
@@ -224,11 +231,11 @@ interface YoloOptions extends OnnxRuntimeWebOptions {
     /** Optional preprocessing backend. Defaults to WebGPU when the WebGPU execution provider is used. */
     preprocessBackend?: 'cpu' | 'webgpu';
 }
-type YoloFeeds = ort.InferenceSession.FeedsType;
-type YoloFetches = ort.InferenceSession.FetchesType;
-type YoloRunOptions = ort.InferenceSession.RunOptions;
-type YoloRunResult = ort.InferenceSession.ReturnType;
-type YoloTensor = ort.Tensor;
+type YoloFeeds = ort$1.InferenceSession.FeedsType;
+type YoloFetches = ort$1.InferenceSession.FetchesType;
+type YoloRunOptions = ort$1.InferenceSession.RunOptions;
+type YoloRunResult = ort$1.InferenceSession.ReturnType;
+type YoloTensor = ort$1.Tensor;
 interface IYoloHandler {
     preprocessImage(img: YoloImageSource, roi?: Rect | null): YoloPreprocessResult;
     RunObjectDetection(img: YoloImageSource, confidence: number, iou: number, roi?: Rect | null): Promise<ObjectDetection[]>;
@@ -238,10 +245,31 @@ interface IYoloHandler {
     RunClassification(img: YoloImageSource, classes: number): Promise<Classification[]>;
 }
 
+type OrtBundle = 'auto' | 'webgpu' | 'wasm' | 'webgl' | 'all';
+type OrtModule = typeof onnxruntime_web_webgpu;
+/**
+ * Resolve which onnxruntime-web entry to load.
+ *
+ * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP, also supports wasm)
+ * - webnn / webgl → `onnxruntime-web/all` (JSEP; required for WebNN)
+ * - otherwise → `onnxruntime-web/wasm`
+ *
+ * Do not use `/all` for WebGPU: its JSEP path is legacy and fails on some models
+ * (e.g. RT-DETR MaxPool ceil_mode).
+ */
+declare function resolveOrtBundle(executionProviders?: readonly YoloExecutionProvider[], ortBundle?: OrtBundle): Exclude<OrtBundle, 'auto'>;
+/** Whether an already-loaded ORT entry can serve the requested entry without a page reload. */
+declare function canReuseOrtBundle(loaded: Exclude<OrtBundle, 'auto'>, requested: Exclude<OrtBundle, 'auto'>): boolean;
 /**
  * Configure onnxruntime-web before creating an inference session.
+ * Lazily loads the matching package entry from `executionProviders` / `ortBundle`.
  */
-declare function initializeOnnxRuntimeWeb(options?: OnnxRuntimeWebOptions): void;
+declare function initializeOnnxRuntimeWeb(options?: YoloOptions): Promise<OrtModule>;
+declare function ensureOnnxRuntimeWebInitialized(options?: YoloOptions): Promise<OrtModule>;
+declare function getOrt(): OrtModule;
+declare function getLoadedOrtBundle(): Exclude<OrtBundle, 'auto'> | null;
+/** Compatible alias used after initialization (Tensor / InferenceSession / env). */
+declare const ort: OrtModule;
 
 declare class Yolo {
     private readonly options;
@@ -285,9 +313,9 @@ declare class Yolo {
         x: number;
         y: number;
     }[][];
-    tensor<T extends ort.Tensor.Type>(type: T, data: ort.Tensor.DataTypeMap[T], dims?: readonly number[]): ort.Tensor;
+    tensor<T extends ort$1.Tensor.Type>(type: T, data: ort$1.Tensor.DataTypeMap[T], dims?: readonly number[]): ort$1.Tensor;
     getWebGpuDevice(): Promise<any>;
-    tensorFromGpuBuffer(gpuBuffer: ort.Tensor.GpuBufferType, dims: readonly number[], dispose?: () => void): ort.Tensor;
+    tensorFromGpuBuffer(gpuBuffer: ort$1.Tensor.GpuBufferType, dims: readonly number[], dispose?: () => void): ort$1.Tensor;
     dispose(): Promise<void>;
     private createSessionOptions;
     private createSession;
@@ -345,4 +373,4 @@ declare class DrawTool {
     private static clamp;
 }
 
-export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };
+export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type OrtBundle, type OrtModule, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, ort, resolveOrtBundle };

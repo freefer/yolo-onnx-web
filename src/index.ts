@@ -1,4 +1,13 @@
-export { initializeOnnxRuntimeWeb, ort } from './runtime';
+export {
+  canReuseOrtBundle,
+  ensureOnnxRuntimeWebInitialized,
+  getLoadedOrtBundle,
+  getOrt,
+  initializeOnnxRuntimeWeb,
+  ort,
+  resolveOrtBundle,
+} from './runtime';
+export type { OrtBundle, OrtModule } from './runtime';
 export {
   Classification,
   OBBDetection,

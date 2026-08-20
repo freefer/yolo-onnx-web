@@ -1,5 +1,5 @@
 import basicSsl from '@vitejs/plugin-basic-ssl';
-import { cpSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 
@@ -21,6 +21,16 @@ export default defineConfig({
             cpSync(source, resolve(to), { recursive: true });
           }
         }
+
+        const coiSource = resolve('node_modules/coi-serviceworker/coi-serviceworker.min.js');
+        const coiTargetDir = resolve('dist-example/examples/browser');
+
+        if (existsSync(coiSource)) {
+          cpSync(coiSource, resolve(coiTargetDir, 'coi-serviceworker.min.js'));
+        }
+
+        // Prevent GitHub Pages Jekyll from ignoring underscored asset folders.
+        writeFileSync(resolve('dist-example/.nojekyll'), '');
 
         const generatedAssetsDir = resolve('dist-example/assets');
 

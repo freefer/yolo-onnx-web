@@ -48,7 +48,6 @@ export class Yolo {
   constructor(options: YoloOptions = {}) {
     this.options = options;
     this.model = options.model;
-    ensureOnnxRuntimeWebInitialized(options);
   }
 
   get yoloOptions(): YoloOptions {
@@ -66,6 +65,7 @@ export class Yolo {
   }
 
   static async create(options: YoloOptions): Promise<Yolo> {
+    await ensureOnnxRuntimeWebInitialized(options);
     const yolo = new Yolo(options);
 
     if (options.model) {
@@ -96,6 +96,7 @@ export class Yolo {
   }
 
   async load(model: YoloModelSource = this.requireModel()): Promise<this> {
+    await ensureOnnxRuntimeWebInitialized(this.options);
     await this.dispose();
 
     this.session = await this.createSession(model);

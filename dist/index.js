@@ -1,27 +1,116 @@
-import * as ort from 'onnxruntime-web/all';
-export { ort };
-
 // src/runtime.ts
-var configured = false;
-function initializeOnnxRuntimeWeb(options = {}) {
+var ortModule = null;
+var loadedBundle = null;
+var loadingPromise = null;
+function resolveOrtBundle(executionProviders = ["wasm"], ortBundle = "auto") {
+  if (ortBundle !== "auto") {
+    return ortBundle;
+  }
+  const names = new Set(
+    executionProviders.map((provider) => {
+      var _a;
+      if (typeof provider === "string") {
+        return provider;
+      }
+      return (_a = provider.name) != null ? _a : "";
+    })
+  );
+  if (names.has("webgpu")) {
+    return "webgpu";
+  }
+  if (names.has("webgl")) {
+    return "webgl";
+  }
+  if (names.has("webnn")) {
+    return "all";
+  }
+  return "wasm";
+}
+function canReuseOrtBundle(loaded, requested) {
+  if (loaded === requested) {
+    return true;
+  }
+  if (loaded === "webgpu" && requested === "wasm") {
+    return true;
+  }
+  if (loaded === "all" && (requested === "wasm" || requested === "webgl")) {
+    return true;
+  }
+  return false;
+}
+async function importOrtBundle(bundle) {
+  switch (bundle) {
+    case "webgpu":
+      return import('onnxruntime-web/webgpu');
+    case "webgl":
+      return import('onnxruntime-web/webgl');
+    case "all":
+      return import('onnxruntime-web/all');
+    case "wasm":
+    default:
+      return import('onnxruntime-web/wasm');
+  }
+}
+function applyOnnxRuntimeWebOptions(ort2, options) {
   if (options.wasmPaths !== void 0) {
-    ort.env.wasm.wasmPaths = options.wasmPaths;
+    ort2.env.wasm.wasmPaths = options.wasmPaths;
   }
   if (options.numThreads !== void 0) {
-    ort.env.wasm.numThreads = options.numThreads;
+    ort2.env.wasm.numThreads = options.numThreads;
   }
   if (options.proxy !== void 0) {
-    ort.env.wasm.proxy = options.proxy;
+    ort2.env.wasm.proxy = options.proxy;
   }
-  configured = true;
 }
-function ensureOnnxRuntimeWebInitialized(options = {}) {
-  if (configured) {
-    initializeOnnxRuntimeWeb(options);
-    return;
+function resolveRequestedBundle(options) {
+  var _a, _b, _c, _d;
+  const executionProviders = (_c = (_b = (_a = options.sessionOptions) == null ? void 0 : _a.executionProviders) != null ? _b : options.executionProviders) != null ? _c : ["wasm"];
+  return resolveOrtBundle(executionProviders, (_d = options.ortBundle) != null ? _d : "auto");
+}
+async function initializeOnnxRuntimeWeb(options = {}) {
+  const bundle = resolveRequestedBundle(options);
+  if (ortModule && loadedBundle) {
+    if (canReuseOrtBundle(loadedBundle, bundle)) {
+      applyOnnxRuntimeWebOptions(ortModule, options);
+      return ortModule;
+    }
+    const error = new Error(
+      `onnxruntime-web is already loaded as "${loadedBundle}", but "${bundle}" was requested. Reload the page before switching between WebGPU (native) and WebNN/WebGL (all/JSEP) bundles.`
+    );
+    error.code = "ORT_BUNDLE_RELOAD_REQUIRED";
+    error.loadedBundle = loadedBundle;
+    error.requestedBundle = bundle;
+    throw error;
   }
-  initializeOnnxRuntimeWeb(options);
+  if (!loadingPromise) {
+    loadingPromise = importOrtBundle(bundle).then((module2) => {
+      ortModule = module2;
+      loadedBundle = bundle;
+      loadingPromise = null;
+      return module2;
+    });
+  }
+  const module = await loadingPromise;
+  applyOnnxRuntimeWebOptions(module, options);
+  return module;
 }
+async function ensureOnnxRuntimeWebInitialized(options = {}) {
+  return initializeOnnxRuntimeWeb(options);
+}
+function getOrt() {
+  if (!ortModule) {
+    throw new Error("ONNX Runtime Web is not initialized. Call Yolo.create() / load() first.");
+  }
+  return ortModule;
+}
+function getLoadedOrtBundle() {
+  return loadedBundle;
+}
+var ort = new Proxy({}, {
+  get(_target, property, receiver) {
+    return Reflect.get(getOrt(), property, receiver);
+  }
+});
 
 // src/types.ts
 var YoloExecutionProviderNames = [
@@ -2434,7 +2523,6 @@ var Yolo = class _Yolo {
     this.preprocessTensorSize = 0;
     this.options = options;
     this.model = options.model;
-    ensureOnnxRuntimeWebInitialized(options);
   }
   get yoloOptions() {
     return this.options;
@@ -2448,6 +2536,7 @@ var Yolo = class _Yolo {
     return this.hasWebGpuExecutionProvider() ? "webgpu" : "cpu";
   }
   static async create(options) {
+    await ensureOnnxRuntimeWebInitialized(options);
     const yolo = new _Yolo(options);
     if (options.model) {
       await yolo.load(options.model);
@@ -2470,6 +2559,7 @@ var Yolo = class _Yolo {
     return this._onnxModel;
   }
   async load(model = this.requireModel()) {
+    await ensureOnnxRuntimeWebInitialized(this.options);
     await this.dispose();
     this.session = await this.createSession(model);
     this._onnxModel = await parseOnnxModel(this.session, model, this.options);
@@ -2823,6 +2913,6 @@ var Yolo = class _Yolo {
   }
 };
 
-export { Classification, DrawTool, OBBDetection, ObjectDetection, PoseEstimation, Segmentation, TrackingInfo, Yolo, YoloExecutionProviderNames, YoloExecutionProviderOptions, YoloWebExecutionProviderOptions, initializeOnnxRuntimeWeb };
+export { Classification, DrawTool, OBBDetection, ObjectDetection, PoseEstimation, Segmentation, TrackingInfo, Yolo, YoloExecutionProviderNames, YoloExecutionProviderOptions, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, ort, resolveOrtBundle };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

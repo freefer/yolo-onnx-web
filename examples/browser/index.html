@@ -4,6 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>yolo-onnx-web browser example</title>
+    <!-- GitHub Pages cannot set COOP/COEP headers; enable cross-origin isolation via SW. -->
+    <script src="./coi-serviceworker.min.js"></script>
     <style>
       html,
       body {
