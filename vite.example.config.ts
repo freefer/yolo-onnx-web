@@ -1,46 +1,50 @@
-import basicSsl from '@vitejs/plugin-basic-ssl';
-import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 
+const ORT_CDN_VERSION = '1.27.0';
+const ORT_CDN_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist`;
+
+/**
+ * Online demo / GitHub Pages only.
+ * Library source still imports `onnxruntime-web/*` (npm).
+ * This build rewrites those imports to CDN URLs so the published package stays npm-only.
+ */
 export default defineConfig({
+  define: {
+    'import.meta.env.YOLO_ORT_SOURCE': JSON.stringify('cdn'),
+    'import.meta.env.YOLO_DEMO_MODE': JSON.stringify('pages'),
+    'import.meta.env.YOLO_ORT_WASM_PATHS': JSON.stringify(`${ORT_CDN_BASE}/`),
+  },
+  resolve: {
+    alias: {
+      'onnxruntime-web/webgpu': `${ORT_CDN_BASE}/ort.webgpu.bundle.min.mjs`,
+      'onnxruntime-web/wasm': `${ORT_CDN_BASE}/ort.wasm.bundle.min.mjs`,
+      'onnxruntime-web/webgl': `${ORT_CDN_BASE}/ort.webgl.min.mjs`,
+      'onnxruntime-web/all': `${ORT_CDN_BASE}/ort.all.bundle.min.mjs`,
+    },
+  },
   plugins: [
-    basicSsl(),
     {
-      name: 'copy-example-static-assets',
+      name: 'copy-pages-static-assets',
       closeBundle() {
-        const assets = [
-          ['examples/browser/ort-wasm', 'dist-example/examples/browser/ort-wasm'],
-          ['examples/model', 'dist-example/examples/model'],
-        ] as const;
+        const modelSource = resolve('examples/model');
+        const modelTarget = resolve('dist-example/examples/model');
 
-        for (const [from, to] of assets) {
-          const source = resolve(from);
-
-          if (existsSync(source)) {
-            cpSync(source, resolve(to), { recursive: true });
-          }
+        if (existsSync(modelSource)) {
+          cpSync(modelSource, modelTarget, { recursive: true });
         }
 
         const coiSource = resolve('node_modules/coi-serviceworker/coi-serviceworker.min.js');
+        const coiFallback = resolve('examples/browser/coi-serviceworker.min.js');
+        const coiFile = existsSync(coiSource) ? coiSource : coiFallback;
         const coiTargetDir = resolve('dist-example/examples/browser');
 
-        if (existsSync(coiSource)) {
-          cpSync(coiSource, resolve(coiTargetDir, 'coi-serviceworker.min.js'));
+        if (existsSync(coiFile)) {
+          cpSync(coiFile, resolve(coiTargetDir, 'coi-serviceworker.min.js'));
         }
 
-        // Prevent GitHub Pages Jekyll from ignoring underscored asset folders.
         writeFileSync(resolve('dist-example/.nojekyll'), '');
-
-        const generatedAssetsDir = resolve('dist-example/assets');
-
-        if (existsSync(generatedAssetsDir)) {
-          for (const file of readdirSync(generatedAssetsDir)) {
-            if (/^ort-wasm.*\.wasm$/.test(file)) {
-              rmSync(resolve(generatedAssetsDir, file));
-            }
-          }
-        }
       },
     },
   ],
@@ -53,16 +57,7 @@ export default defineConfig({
         index: 'index.html',
         browser: 'examples/browser/index.html',
       },
-    },
-  },
-  server: {
-    host: '0.0.0.0',
-    port: 5173,
-    strictPort: true,
-    open: '/examples/browser/',
-    headers: {
-      'Cross-Origin-Embedder-Policy': 'require-corp',
-      'Cross-Origin-Opener-Policy': 'same-origin',
+      external: [/^https?:\/\//],
     },
   },
 });

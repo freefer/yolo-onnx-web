@@ -12,11 +12,12 @@ let loadingPromise: Promise<OrtModule> | null = null;
  * Resolve which onnxruntime-web entry to load.
  *
  * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP, also supports wasm)
- * - webnn / webgl → `onnxruntime-web/all` (JSEP; required for WebNN)
+ * - webgl → `onnxruntime-web/webgl`
+ * - webnn → `onnxruntime-web/all` (JSEP; required for WebNN)
  * - otherwise → `onnxruntime-web/wasm`
  *
- * Do not use `/all` for WebGPU: its JSEP path is legacy and fails on some models
- * (e.g. RT-DETR MaxPool ceil_mode).
+ * Published npm package always loads via package imports (not CDN).
+ * GitHub Pages demo may rewrite these imports to CDN at build time.
  */
 export function resolveOrtBundle(
   executionProviders: readonly YoloExecutionProvider[] = ['wasm'],
@@ -39,6 +40,7 @@ export function resolveOrtBundle(
   if (names.has('webgpu')) {
     return 'webgpu';
   }
+
   if (names.has('webgl')) {
     return 'webgl';
   }
@@ -111,7 +113,7 @@ function resolveRequestedBundle(options: YoloOptions): Exclude<OrtBundle, 'auto'
 
 /**
  * Configure onnxruntime-web before creating an inference session.
- * Lazily loads the matching package entry from `executionProviders` / `ortBundle`.
+ * Lazily loads the matching npm package entry from `executionProviders` / `ortBundle`.
  */
 export async function initializeOnnxRuntimeWeb(options: YoloOptions = {}): Promise<OrtModule> {
   const bundle = resolveRequestedBundle(options);

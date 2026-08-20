@@ -248,7 +248,8 @@ export interface OnnxRuntimeWebOptions {
    * Which onnxruntime-web package entry to load.
    * Defaults to `auto`:
    * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP)
-   * - webnn / webgl → `onnxruntime-web/all`
+   * - webgl → `onnxruntime-web/webgl`
+   * - webnn → `onnxruntime-web/all`
    * - otherwise → `onnxruntime-web/wasm`
    */
   ortBundle?: 'auto' | 'webgpu' | 'wasm' | 'webgl' | 'all';

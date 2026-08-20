@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>yolo-onnx-web browser example</title>
     <!-- GitHub Pages cannot set COOP/COEP headers; enable cross-origin isolation via SW. -->
+    <script>
+      window.coi = {
+        // Prefer credentialless so CDN ORT/WASM can load under cross-origin isolation.
+        coepCredentialless: true,
+      };
+    </script>
     <script src="./coi-serviceworker.min.js"></script>
     <style>
       html,
@@ -30,6 +36,35 @@
       h1 {
         margin: 0;
         font-size: 22px;
+      }
+
+      .title-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .mode-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+
+      .mode-badge[data-mode="local"] {
+        color: #175cd3;
+        background: #eff8ff;
+        border: 1px solid #b2ddff;
+      }
+
+      .mode-badge[data-mode="pages"] {
+        color: #6941c6;
+        background: #f9f5ff;
+        border: 1px solid #e9d7fe;
       }
 
       p {
@@ -342,8 +377,11 @@
   </head>
   <body>
     <main>
-      <h1>yolo-onnx-web 浏览器推理示例</h1>
-      <p>加载 ONNX 模型后，可上传图片或打开摄像头进行单帧检测。</p>
+      <div class="title-row">
+        <h1 id="demoTitle">yolo-onnx-web 浏览器推理示例</h1>
+        <span id="demoModeBadge" class="mode-badge" data-mode="local">本地 npm</span>
+      </div>
+      <p id="demoDescription">加载 ONNX 模型后，可上传图片或打开摄像头进行单帧检测。</p>
 
       <section class="panel">
         <div class="grid">

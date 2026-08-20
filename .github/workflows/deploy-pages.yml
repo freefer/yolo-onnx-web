@@ -30,14 +30,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build library
+      - name: Build library (npm onnxruntime-web, no CDN)
         run: npm run build
 
-      - name: Build browser demo
-        run: npm run build:example
+      - name: Build online demo (CDN via Vite alias only)
+        run: npm run build:pages
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

@@ -204,7 +204,8 @@ interface OnnxRuntimeWebOptions {
      * Which onnxruntime-web package entry to load.
      * Defaults to `auto`:
      * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP)
-     * - webnn / webgl → `onnxruntime-web/all`
+     * - webgl → `onnxruntime-web/webgl`
+     * - webnn → `onnxruntime-web/all`
      * - otherwise → `onnxruntime-web/wasm`
      */
     ortBundle?: 'auto' | 'webgpu' | 'wasm' | 'webgl' | 'all';
@@ -251,18 +252,19 @@ type OrtModule = typeof onnxruntime_web_webgpu;
  * Resolve which onnxruntime-web entry to load.
  *
  * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP, also supports wasm)
- * - webnn / webgl → `onnxruntime-web/all` (JSEP; required for WebNN)
+ * - webgl → `onnxruntime-web/webgl`
+ * - webnn → `onnxruntime-web/all` (JSEP; required for WebNN)
  * - otherwise → `onnxruntime-web/wasm`
  *
- * Do not use `/all` for WebGPU: its JSEP path is legacy and fails on some models
- * (e.g. RT-DETR MaxPool ceil_mode).
+ * Published npm package always loads via package imports (not CDN).
+ * GitHub Pages demo may rewrite these imports to CDN at build time.
  */
 declare function resolveOrtBundle(executionProviders?: readonly YoloExecutionProvider[], ortBundle?: OrtBundle): Exclude<OrtBundle, 'auto'>;
 /** Whether an already-loaded ORT entry can serve the requested entry without a page reload. */
 declare function canReuseOrtBundle(loaded: Exclude<OrtBundle, 'auto'>, requested: Exclude<OrtBundle, 'auto'>): boolean;
 /**
  * Configure onnxruntime-web before creating an inference session.
- * Lazily loads the matching package entry from `executionProviders` / `ortBundle`.
+ * Lazily loads the matching npm package entry from `executionProviders` / `ortBundle`.
  */
 declare function initializeOnnxRuntimeWeb(options?: YoloOptions): Promise<OrtModule>;
 declare function ensureOnnxRuntimeWebInitialized(options?: YoloOptions): Promise<OrtModule>;

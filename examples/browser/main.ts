@@ -18,7 +18,11 @@ import type {
   YoloModelSource,
 } from '../../src';
 
-const ORT_WASM_PATHS = new URL('./ort-wasm/', window.location.href).toString();
+const DEMO_MODE = import.meta.env.YOLO_DEMO_MODE === 'pages' ? 'pages' : 'local';
+const ORT_SOURCE = import.meta.env.YOLO_ORT_SOURCE === 'cdn' ? 'cdn' : 'npm';
+const ORT_WASM_PATHS =
+  import.meta.env.YOLO_ORT_WASM_PATHS ||
+  new URL('./ort-wasm/', window.location.href).toString();
 const DEFAULT_MODEL_URL = new URL('../model/yolo26s.onnx', window.location.href).toString();
 const BACKEND_STORAGE_KEY = 'yolo-onnx-web:backend';
 const CAMERA_WIDTH = 1920;
@@ -48,6 +52,9 @@ const modelInfo = getElement<HTMLPreElement>('#modelInfo');
 const output = getElement<HTMLPreElement>('#output');
 const loadingOverlay = getElement<HTMLElement>('#loadingOverlay');
 const loadingMessage = getElement<HTMLElement>('#loadingMessage');
+const demoTitle = getElement<HTMLElement>('#demoTitle');
+const demoDescription = getElement<HTMLElement>('#demoDescription');
+const demoModeBadge = getElement<HTMLElement>('#demoModeBadge');
 
 let yolo: Yolo | null = null;
 let activeExecutionProviders: readonly YoloExecutionProvider[] = [];
@@ -68,6 +75,7 @@ type InferenceResult =
   | { modelType: 'Segmentation'; result: Segmentation[] }
   | { modelType: 'PoseEstimation'; result: PoseEstimation[] };
 
+applyDemoModeUi();
 renderBackendOptions();
 
 inputModeSelect.addEventListener('change', () => {
@@ -198,7 +206,7 @@ async function loadSelectedModel(): Promise<void> {
     const labels = await getClassNames();
     const executionProvider = getSelectedExecutionProvider();
 
-    setLoadingModel(true, `正在初始化 ${executionProvider} 后端与 WASM...`);
+    setLoadingModel(true, `正在初始化 ${executionProvider} 后端（${ORT_SOURCE}）...`);
     const nextYolo = await Yolo.create({
       model,
       labels,
@@ -771,6 +779,22 @@ function syncCameraViewport(width = cameraVideo.videoWidth || CAMERA_WIDTH, heig
 
 function hasModelSource(): boolean {
   return Boolean(modelFileInput.files?.[0] || modelUrlInput.value.trim() || DEFAULT_MODEL_URL);
+}
+
+function applyDemoModeUi(): void {
+  const isPages = DEMO_MODE === 'pages';
+
+  demoModeBadge.dataset.mode = DEMO_MODE;
+  demoModeBadge.textContent = isPages ? '线上 CDN' : '本地 npm';
+  demoTitle.textContent = isPages
+    ? 'yolo-onnx-web 在线 Demo'
+    : 'yolo-onnx-web 浏览器推理示例';
+  demoDescription.textContent = isPages
+    ? 'GitHub Pages 预览：onnxruntime-web 从 jsDelivr CDN 加载；可上传图片或打开摄像头推理。'
+    : '本地开发：使用 npm 安装的 onnxruntime-web 与本地 WASM；可上传图片或打开摄像头推理。';
+  document.title = isPages
+    ? 'yolo-onnx-web Online Demo (CDN)'
+    : 'yolo-onnx-web browser example (local npm)';
 }
 
 function getSelectedExecutionProvider(): YoloExecutionProvider {
