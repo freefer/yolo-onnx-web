@@ -3,11 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>yolo-onnx-web browser example</title>
-    <!-- GitHub Pages cannot set COOP/COEP headers; enable cross-origin isolation via SW. -->
+    <title>SAM3 browser example</title>
     <script>
       window.coi = {
-        // Prefer credentialless so CDN ORT/WASM can load under cross-origin isolation.
         coepCredentialless: true,
       };
     </script>
@@ -45,16 +43,6 @@
         align-items: center;
       }
 
-      .mode-badge {
-        display: inline-flex;
-        align-items: center;
-        padding: 4px 10px;
-        border-radius: 999px;
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.02em;
-      }
-
       .demo-nav {
         display: inline-flex;
         overflow: hidden;
@@ -74,6 +62,16 @@
       .demo-nav a.is-active {
         color: #fff;
         background: #2563eb;
+      }
+
+      .mode-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
       }
 
       .mode-badge[data-mode="local"] {
@@ -168,7 +166,6 @@
       }
 
       pre {
-      
         height: 220px;
         margin: 0;
         padding: 12px;
@@ -213,67 +210,32 @@
         border-radius: 14px;
         box-sizing: border-box;
         flex: none;
+        width: 100%;
+        max-width: 100%;
+        cursor: crosshair;
       }
 
-      .viewer video,
       .viewer canvas {
         display: block;
-        width: 100%;
-        height: auto;
-        max-width: 100%;
-      }
-
-      .viewer:not(.camera-mode) {
-        width: 100%;
-        max-width: 100%;
-        flex: none;
-      }
-
-      .viewer:not(.camera-mode) canvas {
         width: auto;
+        max-width: 100%;
         max-height: calc(100vh - 426px);
         margin: 0 auto;
+        height: auto;
       }
 
-      .viewer video {
-        display: none;
-      }
-
-      .viewer.camera-mode video {
-        position: absolute;
-        inset: 0;
-        display: block;
-        width: 100%;
-        height: 100%;
-        object-fit: fill;
-      }
-
-      .viewer.camera-mode canvas {
-        position: absolute;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-      }
-
-      .fps-badge {
-        position: absolute;
-        top: 12px;
-        right: 12px;
-        z-index: 2;
-        display: none;
-        padding: 6px 10px;
-        color: #f8fafc;
+      .hint {
+        margin: 8px 0 0;
+        color: #667085;
         font-size: 13px;
-        font-weight: 700;
-        background: rgb(15 23 42 / 78%);
-        border: 1px solid rgb(255 255 255 / 16%);
-        border-radius: 999px;
-        pointer-events: none;
+        font-weight: 400;
       }
 
-      .viewer.camera-mode .fps-badge {
-        display: block;
+      .candidates {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
       }
 
       .loading-overlay {
@@ -400,54 +362,70 @@
     <main>
       <div class="title-row">
         <nav class="demo-nav" aria-label="示例切换">
-          <a class="is-active" href="./">YOLO</a>
-          <a href="./sam3.html">SAM3</a>
+          <a href="./">YOLO</a>
+          <a class="is-active" href="./sam3.html">SAM3</a>
         </nav>
-        <h1 id="demoTitle">yolo-onnx-web 浏览器推理示例</h1>
+        <h1 id="demoTitle">SAM3 交互分割示例</h1>
         <span id="demoModeBadge" class="mode-badge" data-mode="local">本地 npm</span>
       </div>
-      <p id="demoDescription">加载 ONNX 模型后，可上传图片或打开摄像头进行单帧检测。</p>
+      <p id="demoDescription">加载 SAM3 ONNX 后，可用文本做概念分割，或用点/框做实例分割并迭代修正。</p>
 
       <section class="panel">
         <div class="grid">
           <label>
-            推理后端<a href="https://onnxruntime.ai/docs/get-started/with-javascript/web.html#supported-versions" target="_blank">支持版本</a>
+            推理后端
             <select id="backend"></select>
           </label>
-
           <label>
-            输入方式
-            <select id="inputMode">
-              <option value="image">上传图片</option>
-              <option value="camera" selected>摄像头</option>
+            任务类型
+            <select id="taskMode">
+              <option value="pcs">概念分割 PCS（文本 / 范例）</option>
+              <option value="pvs">视觉分割 PVS（点 / 框 / 掩码）</option>
             </select>
           </label>
-
           <label>
-            模型 URL
-            <input id="modelUrl" placeholder="/examples/model/yolo26s.onnx" />
+            点击极性
+            <select id="promptPolarity">
+              <option value="positive">正例 / 前景</option>
+              <option value="negative">负例 / 背景</option>
+            </select>
           </label>
-
           <label>
-            本地 ONNX
-            <input id="modelFile" type="file" accept=".onnx" />
+            类别名称
+            <input id="textPrompt" placeholder="person, car, dog" autocomplete="off" />
           </label>
-
           <label>
-            类别文件 class_names.txt
-            <input id="classNamesFile" type="file" accept=".txt,.json" />
+            详细描述
+            <input id="textDescription" placeholder="可选，例如 wearing a red hat" autocomplete="off" />
           </label>
-
           <label>
-            <span class="range-label">置信度 <span id="confidenceValue" class="range-value">0.20</span></span>
-            <input id="confidenceInput" type="range" min="0" max="1" step="0.01" value="0.2" />
+            SAM3 模型目录
+            <input id="modelDirectory" type="file" webkitdirectory directory multiple />
           </label>
-
           <label>
-            <span class="range-label">IoU <span id="iouValue" class="range-value">0.70</span></span>
-            <input id="iouInput" type="range" min="0" max="1" step="0.01" value="0.7" />
+            视觉编码器
+            <input id="visionFile" type="file" accept=".onnx" />
           </label>
-
+          <label>
+            文本编码器
+            <input id="textFile" type="file" accept=".onnx" />
+          </label>
+          <label>
+            Grounding 解码器
+            <input id="groundingFile" type="file" accept=".onnx" />
+          </label>
+          <label>
+            Prompt 解码器
+            <input id="promptFile" type="file" accept=".onnx" />
+          </label>
+          <label>
+            Tokenizer
+            <input id="tokenizerFile" type="file" accept=".json" />
+          </label>
+          <label>
+            <span class="range-label">置信度 <span id="confidenceValue" class="range-value">0.50</span></span>
+            <input id="confidenceInput" type="range" min="0" max="1" step="0.01" value="0.5" />
+          </label>
           <label>
             <span class="range-label">结果透明度 <span id="resultOpacityValue" class="range-value">1.00</span></span>
             <input id="resultOpacityInput" type="range" min="0" max="1" step="0.01" value="1" />
@@ -457,27 +435,28 @@
 
       <section class="workspace">
         <div class="preview-panel">
-          <label id="imageInputGroup">
+          <label>
             上传图片
             <input id="imageFile" type="file" accept="image/*" />
           </label>
 
           <div class="controls">
-            <button id="startCameraButton" type="button" style="display: none">打开摄像头</button>
-            <button id="stopCameraButton" type="button" style="display: none" disabled>关闭摄像头</button>
-            <button id="runButton" disabled>运行推理</button>
+            <button id="loadButton" type="button">加载模型</button>
+            <button id="encodeButton" type="button" disabled>编码图像</button>
+            <button id="runTextButton" type="button" disabled>文本分割</button>
+            <button id="resetButton" type="button" disabled>重置提示</button>
           </div>
+          <div id="candidates" class="candidates"></div>
+          <p id="hint" class="hint">PCS：类别用逗号分隔，例如 person, car, dog。详细描述可选，用来补充颜色、姿态、场景；查询时会加到每个类别上，标签仍用类别名。</p>
 
           <div id="viewer" class="viewer">
-            <video id="cameraVideo" autoplay playsinline muted></video>
             <canvas id="preview"></canvas>
-            <div id="fpsBadge" class="fps-badge">FPS: --</div>
           </div>
         </div>
 
         <div class="side">
-          <pre id="modelInfo">等待加载模型...</pre>
-          <pre id="output">模型加载完成后选择输入并点击运行推理。</pre>
+          <pre id="modelInfo">等待加载 SAM3 模型...</pre>
+          <pre id="output">请选择 SAM3 模型目录，或分别选择 4 个 ONNX 与 clip_bpe.json，再点“加载模型”。优先 fp16 编码器与 WebGPU。</pre>
         </div>
       </section>
     </main>
@@ -485,11 +464,11 @@
     <div id="loadingOverlay" class="loading-overlay" aria-live="polite" aria-busy="true">
       <div class="loading-card">
         <div class="loading-spinner" aria-hidden="true"></div>
-        <div class="loading-title">正在加载运行环境</div>
+        <div id="loadingTitle" class="loading-title">正在加载 SAM3</div>
         <div id="loadingMessage" class="loading-message">正在加载 WASM 与模型，请稍候...</div>
       </div>
     </div>
 
-    <script type="module" src="./main.ts"></script>
+    <script type="module" src="./sam3.ts"></script>
   </body>
 </html>

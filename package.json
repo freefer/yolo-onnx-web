@@ -4,7 +4,7 @@
     "access": "public"
   },
   "version": "0.1.3",
-  "description": "YOLO browser inference client powered by onnxruntime-web",
+  "description": "YOLO and SAM 3 browser inference powered by onnxruntime-web",
   "author": "ShiFang Tech",
   "license": "MIT",
   "repository": {
@@ -23,6 +23,8 @@
     "rt-detr",
     "yolo-nas",
     "yolo26",
+    "sam3",
+    "segment-anything",
     "webgpu",
     "onnx",
     "onnxruntime-web",

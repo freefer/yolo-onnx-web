@@ -20,6 +20,7 @@ export {
   YoloWebExecutionProviderOptions,
 } from './types';
 export { Yolo } from './yolo';
+export { Sam3 } from './sam3';
 export { DrawTool } from './draw-tool';
 export type {
   OnnxRuntimeWebOptions,
@@ -51,3 +52,16 @@ export type {
   YoloRunResult,
   YoloTensor,
 } from './types';
+export type {
+  Sam3BoxPrompt,
+  Sam3ImageInput,
+  Sam3InferenceState,
+  Sam3MaskPrompt,
+  Sam3Options,
+  Sam3PcsPrompt,
+  Sam3PointPrompt,
+  Sam3PvsPrompt,
+  Sam3PvsResult,
+  Sam3TokenizerTables,
+} from './handler/sam3/types';
+export { SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, splitTextPrompts } from './handler/sam3/preprocess';

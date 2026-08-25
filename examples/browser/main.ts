@@ -1,3 +1,4 @@
+/// <reference path="./vite-env.d.ts" />
 import {
   canReuseOrtBundle,
   getLoadedOrtBundle,
@@ -790,7 +791,7 @@ function applyDemoModeUi(): void {
     ? 'yolo-onnx-web 在线 Demo'
     : 'yolo-onnx-web 浏览器推理示例';
   demoDescription.textContent = isPages
-    ? 'GitHub Pages 预览：onnxruntime-web 从 jsDelivr CDN 加载；可上传图片或打开摄像头推理。'
+    ? 'GitHub Pages 预览：onnxruntime-web 从 jsDelivr CDN 加载；可上传图片或打开摄像头推理。顶部可切换到 SAM3。'
     : '本地开发：使用 npm 安装的 onnxruntime-web 与本地 WASM；可上传图片或打开摄像头推理。';
   document.title = isPages
     ? 'yolo-onnx-web Online Demo (CDN)'

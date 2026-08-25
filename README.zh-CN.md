@@ -1,12 +1,12 @@
 # yolo-onnx-web
 
-基于 `onnxruntime-web` 的浏览器端 YOLO 推理库。
+基于 `onnxruntime-web` 的浏览器端 YOLO 与 SAM 3 推理库。
 
-本库可以在浏览器中加载 Ultralytics 风格的 ONNX 模型，解析模型元数据，根据模型版本和任务类型自动选择输出解析器，并提供分类、检测、分割、姿态估计、旋转框等任务的 Canvas 绘制方法。
+本库可以在浏览器中加载 Ultralytics 风格的 ONNX 模型，解析模型元数据，根据模型版本和任务类型自动选择输出解析器，并提供分类、检测、分割、姿态估计、旋转框等任务的 Canvas 绘制方法。同时提供 `Sam3`，用于 SAM 3.1 multiplex 的文本概念分割（PCS）和交互式视觉分割（PVS）。
 
 GitHub 仓库：[https://github.com/freefer/yolo-onnx-web](https://github.com/freefer/yolo-onnx-web)
 
-在线 Demo：[https://freefer.github.io/yolo-onnx-web/](https://freefer.github.io/yolo-onnx-web/)
+在线 Demo：[YOLO](https://freefer.github.io/yolo-onnx-web/examples/browser/) · [SAM 3](https://freefer.github.io/yolo-onnx-web/examples/browser/sam3.html)
 
 English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob/main/README.md)
 
@@ -24,6 +24,7 @@ English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob
   - 姿态估计
 - 为所有支持的任务提供通用绘制方法。
 - 支持 RF-DETR 目标检测和实例分割模型。
+- 提供 `Sam3`，用于 SAM 3.1 multiplex：文本概念分割（PCS）和交互式视觉分割（PVS）。
 - 导出 `DrawTool`，可以脱离 `Yolo` 实例单独使用绘制工具。
 
 ## 安装
@@ -56,7 +57,7 @@ initializeOnnxRuntimeWeb({
 });
 ```
 
-也可以直接传给 `Yolo.create()`。
+也可以直接传给 `Yolo.create()` 或 `Sam3.create()`。
 
 ## 快速开始
 
@@ -275,9 +276,111 @@ DrawTool.drawSegmentationEdgePoints(image, segmentations, canvas, {
 });
 ```
 
+## SAM 3
+
+`Sam3` 与 `Yolo` 是独立 API。SAM 3.1 multiplex 使用四张 ONNX 图，会缓存图像嵌入，并按提示逐步交互。它不走 `IYoloHandler`。
+
+### 导出 ONNX
+
+```bash
+python scripts/export_sam3_onnx.py --checkpoint sam3.1_multiplex.pt --output-dir ./sam3-onnx
+python scripts/export_sam3_onnx.py --output-dir ./sam3-onnx --fold-existing --convert-fp16
+```
+
+`--fold-existing` 会去掉恒为假的 `If` 节点，否则 onnxruntime-web 会在形状推断时报错。`--convert-fp16` 会生成 `*.fp16.onnx`。浏览器请加载 fp16 视觉/文本编码器。
+
+需要的文件：
+
+| 文件 | 作用 |
+| --- | --- |
+| `vision-encoder.fp16.onnx` | 图像 → 检测 FPN + PVS 嵌入 |
+| `text-encoder.fp16.onnx` | CLIP token → 语言特征 |
+| `grounding-decoder.onnx` | PCS（按概念找出全部实例） |
+| `prompt-decoder.onnx` | PVS（只分割当前提示的那一件） |
+| `clip_bpe.json` | CLIP BPE tokenizer 表 |
+
+图像会缩放到 1008×1008，mean/std 为 `0.5`。请优先使用 WebGPU，并设置 `numThreads: 1`。
+
+### 快速开始
+
+```ts
+import { Sam3 } from 'yolo-onnx-web';
+
+const sam3 = await Sam3.create({
+  visionEncoder: visionBytes,
+  textEncoder: textBytes,
+  groundingDecoder: groundingBytes,
+  promptDecoder: promptBytes,
+  tokenizer: '/models/clip_bpe.json',
+  wasmPaths: '/ort-wasm/',
+  executionProviders: ['webgpu'],
+  numThreads: 1,
+  confidenceThreshold: 0.5,
+  onLoadProgress: message => console.log(message),
+});
+
+const image = document.querySelector('img')!;
+const canvas = document.querySelector('canvas')!;
+await sam3.setImage(image);
+
+const pcs = await sam3.setTextPrompt('person, car, dog', 'wearing a red hat');
+sam3.drawSegmentationEdgePoints(image, pcs, canvas);
+
+const pvs = await sam3.addPoint({ x: 120, y: 80 }, 1);
+sam3.drawSegmentationEdgePoints(image, pvs.masks, canvas);
+
+await sam3.dispose();
+```
+
+模型来源与 `Yolo.create()` 相同，可以是 URL、`ArrayBuffer` 或 `Uint8Array`。
+
+### 概念分割（PCS）
+
+类别名**只按逗号**拆分（`person, car, dog` / `猫, 狗`），不要用空格拆词。可选的详细描述会拼进查询（`person, wearing a red hat`），界面标签仍用类别名。
+
+PCS 里的框和点是范例：模型会在全图找出同类实例，而不是只分割当前画出的那一件。
+
+```ts
+await sam3.setTextPrompt('person, car');
+await sam3.addGeometricPrompt({ x: 10, y: 20, width: 80, height: 120 }, true);
+await sam3.addGeometricPoint({ x: 40, y: 60 }, true);
+sam3.resetPrompts();
+```
+
+### 视觉分割（PVS）
+
+PVS 只分割当前提示的那一件。点标签：`1` 前景，`0` 背景。PVS 需要 `promptDecoder`。`iou_predictions` 是未校准回归，可能大于 1；展示时请把分数限制在 `[0, 1]`。
+
+```ts
+const byPoint = await sam3.addPoint({ x: 120, y: 80 }, 1);
+const byBox = await sam3.addBox({ x: 40, y: 50, width: 200, height: 160 });
+sam3.resetVisualPrompts();
+```
+
+### 绘制
+
+PCS 后处理会按 bbox 裁剪 mask，并填写 `segmentationEdgePoints`。请用 `sam3.drawSegmentationEdgePoints()` 或独立的 `DrawTool` 绘制。
+
+```ts
+sam3.drawSegmentationEdgePoints(image, masks, canvas, {
+  drawSource: true,
+  drawBoundingBoxes: true,
+  drawLabel: true,
+  drawSegmentationPixelMask: true,
+  fillSegmentationEdgePoints: true,
+  resultOpacity: 0.7,
+});
+```
+
 ## 浏览器示例
 
-启动：
+在线 Demo：
+
+- 入口：[https://freefer.github.io/yolo-onnx-web/](https://freefer.github.io/yolo-onnx-web/)
+- YOLO：[https://freefer.github.io/yolo-onnx-web/examples/browser/](https://freefer.github.io/yolo-onnx-web/examples/browser/)
+- SAM 3：[https://freefer.github.io/yolo-onnx-web/examples/browser/sam3.html](https://freefer.github.io/yolo-onnx-web/examples/browser/sam3.html)
+
+本地启动：
 
 ```bash
 npm start
@@ -286,25 +389,32 @@ npm start
 打开：
 
 ```text
+https://localhost:5173/
 https://localhost:5173/examples/browser/
+https://localhost:5173/examples/browser/sam3.html
 ```
 
-示例页默认使用摄像头模式。如果没有选择本地模型，也没有填写模型 URL，则默认使用：
+YOLO 示例页默认使用摄像头模式。如果没有选择本地模型，也没有填写模型 URL，则默认使用：
 
 ```text
 /examples/model/yolo26s.onnx
 ```
 
+SAM 3 示例不会托管数 GB 的 ONNX。请选择本地导出目录，或分别选择各个模型文件，再点「加载模型」。
+
 ## 构建
 
 ```bash
 npm run build
+npm run build:pages
 ```
 
-构建结果输出到 `dist/`。
+库构建结果输出到 `dist/`。GitHub Pages Demo 构建到 `dist-example/`（含 YOLO 与 SAM 3 页面，不含 SAM 3 权重）。
 
 ## 注意事项
 
-- 模型需要包含 Ultralytics 兼容的 ONNX metadata。
+- YOLO 模型需要包含 Ultralytics 兼容的 ONNX metadata。
+- SAM 3 图来自 `scripts/export_sam3_onnx.py`。浏览器请加载 fp16 视觉/文本编码器；全精度编码器很容易触发 WASM `bad_alloc`。
 - WebGPU、WebNN、WebGL 等后端是否可用取决于浏览器和设备。
 - WebGPU 通常需要 HTTPS 或 localhost 环境。
+- GitHub Pages 不托管数 GB 的 SAM 3 权重。在线 SAM 3 Demo 需要你选择本地导出目录。

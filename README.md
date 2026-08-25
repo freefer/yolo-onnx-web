@@ -1,12 +1,12 @@
 # yolo-onnx-web
 
-Browser-side YOLO inference powered by `onnxruntime-web`.
+Browser-side YOLO and SAM 3 inference powered by `onnxruntime-web`.
 
-This package loads Ultralytics-style ONNX models in the browser, parses model metadata, dispatches to the correct YOLO output handler, and provides drawing helpers for detection, classification, segmentation, pose estimation, and oriented bounding boxes.
+This package loads Ultralytics-style ONNX models in the browser, parses model metadata, dispatches to the correct YOLO output handler, and provides drawing helpers for detection, classification, segmentation, pose estimation, and oriented bounding boxes. It also ships `Sam3` for SAM 3.1 multiplex concept segmentation (PCS) and interactive visual segmentation (PVS).
 
 Repository: [https://github.com/freefer/yolo-onnx-web](https://github.com/freefer/yolo-onnx-web)
 
-Online demo: [https://freefer.github.io/yolo-onnx-web/](https://freefer.github.io/yolo-onnx-web/)
+Online demos: [YOLO](https://freefer.github.io/yolo-onnx-web/examples/browser/) · [SAM 3](https://freefer.github.io/yolo-onnx-web/examples/browser/sam3.html)
 
 Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-web/blob/main/README.zh-CN.md)
 
@@ -24,6 +24,7 @@ Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-we
   - Pose estimation
 - Includes canvas drawing utilities for all supported task types.
 - Supports RF-DETR object detection and segmentation models.
+- Adds `Sam3` for SAM 3.1 multiplex: text concept segmentation (PCS) and interactive visual segmentation (PVS).
 - Exports `DrawTool` so drawing helpers can be used independently from a `Yolo` instance.
 
 ## Installation
@@ -56,7 +57,7 @@ initializeOnnxRuntimeWeb({
 });
 ```
 
-You can also pass the same options to `Yolo.create()`.
+You can also pass the same options to `Yolo.create()` or `Sam3.create()`.
 
 ## Quick Start
 
@@ -275,9 +276,111 @@ DrawTool.drawSegmentationEdgePoints(image, segmentations, canvas, {
 });
 ```
 
+## SAM 3
+
+`Sam3` is a separate API from `Yolo`. SAM 3.1 multiplex uses four ONNX graphs, keeps image embeddings in memory, and applies prompts iteratively. It is not dispatched through `IYoloHandler`.
+
+### Export ONNX
+
+```bash
+python scripts/export_sam3_onnx.py --checkpoint sam3.1_multiplex.pt --output-dir ./sam3-onnx
+python scripts/export_sam3_onnx.py --output-dir ./sam3-onnx --fold-existing --convert-fp16
+```
+
+`--fold-existing` removes constant-false `If` nodes that otherwise fail onnxruntime-web shape inference. `--convert-fp16` writes `*.fp16.onnx` sidecars. In the browser, load the fp16 vision and text encoders.
+
+Required files:
+
+| File | Role |
+| --- | --- |
+| `vision-encoder.fp16.onnx` | Image → detector FPN + PVS embeddings |
+| `text-encoder.fp16.onnx` | CLIP tokens → language features |
+| `grounding-decoder.onnx` | PCS (find all instances of a concept) |
+| `prompt-decoder.onnx` | PVS (segment the prompted object) |
+| `clip_bpe.json` | CLIP BPE tokenizer tables |
+
+Images are resized to 1008×1008 with mean/std `0.5`. Prefer WebGPU and `numThreads: 1`.
+
+### Quick Start
+
+```ts
+import { Sam3 } from 'yolo-onnx-web';
+
+const sam3 = await Sam3.create({
+  visionEncoder: visionBytes,
+  textEncoder: textBytes,
+  groundingDecoder: groundingBytes,
+  promptDecoder: promptBytes,
+  tokenizer: '/models/clip_bpe.json',
+  wasmPaths: '/ort-wasm/',
+  executionProviders: ['webgpu'],
+  numThreads: 1,
+  confidenceThreshold: 0.5,
+  onLoadProgress: message => console.log(message),
+});
+
+const image = document.querySelector('img')!;
+const canvas = document.querySelector('canvas')!;
+await sam3.setImage(image);
+
+const pcs = await sam3.setTextPrompt('person, car, dog', 'wearing a red hat');
+sam3.drawSegmentationEdgePoints(image, pcs, canvas);
+
+const pvs = await sam3.addPoint({ x: 120, y: 80 }, 1);
+sam3.drawSegmentationEdgePoints(image, pvs.masks, canvas);
+
+await sam3.dispose();
+```
+
+Model sources accept a URL, `ArrayBuffer`, or `Uint8Array`, the same as `Yolo.create()`.
+
+### Concept segmentation (PCS)
+
+Class names are split on commas only (`person, car, dog` / `猫, 狗`). Spaces do not split classes. The optional description is appended to each class when querying (`person, wearing a red hat`); the displayed label stays the class name.
+
+Boxes and points in PCS are exemplars: the model finds all matching instances in the image, not only the drawn object.
+
+```ts
+await sam3.setTextPrompt('person, car');
+await sam3.addGeometricPrompt({ x: 10, y: 20, width: 80, height: 120 }, true);
+await sam3.addGeometricPoint({ x: 40, y: 60 }, true);
+sam3.resetPrompts();
+```
+
+### Visual segmentation (PVS)
+
+PVS segments only the prompted object. Points use `1` (foreground) or `0` (background). `promptDecoder` is required. The IoU head is uncalibrated and may exceed 1; clamp display scores to `[0, 1]`.
+
+```ts
+const byPoint = await sam3.addPoint({ x: 120, y: 80 }, 1);
+const byBox = await sam3.addBox({ x: 40, y: 50, width: 200, height: 160 });
+sam3.resetVisualPrompts();
+```
+
+### Drawing
+
+PCS postprocessing packs masks by bbox and fills `segmentationEdgePoints`. Draw with `sam3.drawSegmentationEdgePoints()` or the standalone `DrawTool`.
+
+```ts
+sam3.drawSegmentationEdgePoints(image, masks, canvas, {
+  drawSource: true,
+  drawBoundingBoxes: true,
+  drawLabel: true,
+  drawSegmentationPixelMask: true,
+  fillSegmentationEdgePoints: true,
+  resultOpacity: 0.7,
+});
+```
+
 ## Browser Demo
 
-Run:
+Online demos:
+
+- Hub: [https://freefer.github.io/yolo-onnx-web/](https://freefer.github.io/yolo-onnx-web/)
+- YOLO: [https://freefer.github.io/yolo-onnx-web/examples/browser/](https://freefer.github.io/yolo-onnx-web/examples/browser/)
+- SAM 3: [https://freefer.github.io/yolo-onnx-web/examples/browser/sam3.html](https://freefer.github.io/yolo-onnx-web/examples/browser/sam3.html)
+
+Run locally:
 
 ```bash
 npm start
@@ -286,21 +389,26 @@ npm start
 Open:
 
 ```text
+https://localhost:5173/
 https://localhost:5173/examples/browser/
+https://localhost:5173/examples/browser/sam3.html
 ```
 
-The demo defaults to camera mode and uses `/examples/model/yolo26s.onnx` if no model file or URL is provided.
+The YOLO demo defaults to camera mode and uses `/examples/model/yolo26s.onnx` if no model file or URL is provided. The SAM 3 demo does not bundle the multi-GB ONNX files; choose a local export directory or pick each file, then click Load.
 
 ## Build
 
 ```bash
 npm run build
+npm run build:pages
 ```
 
-The package is built with `tsup` into `dist/`.
+The package is built with `tsup` into `dist/`. The GitHub Pages demo is built into `dist-example/` (YOLO + SAM 3). SAM 3 weights are not bundled.
 
 ## Notes
 
-- Models should include Ultralytics-compatible ONNX metadata.
+- YOLO models should include Ultralytics-compatible ONNX metadata.
+- SAM 3 graphs come from `scripts/export_sam3_onnx.py`. In the browser, load fp16 vision/text encoders; full-precision encoders often hit WASM `bad_alloc`.
 - Browser support depends on the selected execution provider and the user's device/browser.
 - For WebGPU, use a browser with WebGPU enabled and HTTPS or localhost.
+- GitHub Pages does not host the multi-GB SAM 3 weights. The online SAM 3 demo asks you to select a local export directory.

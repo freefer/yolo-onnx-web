@@ -56,6 +56,7 @@ export default defineConfig({
       input: {
         index: 'index.html',
         browser: 'examples/browser/index.html',
+        sam3: 'examples/browser/sam3.html',
       },
       external: [/^https?:\/\//],
     },

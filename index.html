@@ -3,13 +3,124 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="refresh" content="0; url=examples/browser/" />
-    <title>yolo-onnx-web example</title>
+    <title>yolo-onnx-web demo</title>
+    <style>
+      html,
+      body {
+        min-height: 100%;
+      }
+
+      body {
+        margin: 0;
+        color: #172033;
+        font-family: Arial, "Microsoft YaHei", sans-serif;
+        background: #fff;
+      }
+
+      main {
+        box-sizing: border-box;
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 48px 20px 64px;
+      }
+
+      .eyebrow {
+        margin: 0 0 8px;
+        color: #2563eb;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 28px;
+      }
+
+      .lead {
+        margin: 10px 0 0;
+        color: #667085;
+        line-height: 1.55;
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+        margin-top: 28px;
+      }
+
+      .card {
+        display: grid;
+        gap: 8px;
+        padding: 18px;
+        color: inherit;
+        text-decoration: none;
+        background: #f8fafc;
+        border: 1px solid #edf0f5;
+        border-radius: 14px;
+      }
+
+      .card:hover {
+        border-color: #b2ddff;
+        background: #eff8ff;
+      }
+
+      .card-kicker {
+        color: #2563eb;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .card strong {
+        font-size: 20px;
+      }
+
+      .card span:last-child {
+        color: #667085;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .en {
+        margin: 22px 0 0;
+        color: #98a2b3;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      @media (max-width: 640px) {
+        h1 {
+          font-size: 24px;
+        }
+
+        .cards {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
   </head>
   <body>
-    <script>
-      window.location.replace('examples/browser/');
-    </script>
-    <p>正在打开示例页面：<a href="examples/browser/">examples/browser/</a></p>
+    <main>
+      <p class="eyebrow">yolo-onnx-web</p>
+      <h1>浏览器 ONNX 示例</h1>
+      <p class="lead">YOLO 检测与 SAM 3 交互分割，均由 onnxruntime-web 在浏览器中运行。</p>
+      <div class="cards">
+        <a class="card" href="examples/browser/">
+          <span class="card-kicker">Detection</span>
+          <strong>YOLO</strong>
+          <span>分类、检测、分割、姿态、旋转框。GitHub Pages 自带示例模型。</span>
+        </a>
+        <a class="card" href="examples/browser/sam3.html">
+          <span class="card-kicker">Segmentation</span>
+          <strong>SAM 3</strong>
+          <span>文本概念分割（PCS）与点/框视觉分割（PVS）。请自备导出的 ONNX 目录，不托管数 GB 权重。</span>
+        </a>
+      </div>
+      <p class="en">
+        English: browser ONNX demos for YOLO detection and SAM 3 interactive segmentation.
+        SAM 3 does not ship the multi-GB weights; choose a local export directory on the demo page.
+      </p>
+    </main>
   </body>
 </html>
