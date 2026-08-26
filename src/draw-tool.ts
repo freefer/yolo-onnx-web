@@ -230,6 +230,11 @@ export class DrawTool {
       return [];
     }
 
+    const expectedBytes = Math.ceil((width * height) / 8);
+    if (segmentation.bitPackedPixelMask.byteLength < expectedBytes) {
+      return segmentation.segmentationEdgePoints ?? [];
+    }
+
     const edgeKeys = new Set<number>();
 
     for (let y = 0; y < height; y += 1) {
@@ -425,6 +430,8 @@ export class DrawTool {
     context.clearRect(0, 0, width, height);
 
     if (drawSource) {
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
       context.drawImage(source, 0, 0, width, height);
     }
 
@@ -526,26 +533,28 @@ export class DrawTool {
 
   private static drawSegmentationMask(context: CanvasRenderingContext2D, segmentation: Segmentation, color: string): void {
     const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
+    const destWidth = right - left;
+    const destHeight = bottom - top;
+    const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
 
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
       return;
     }
 
-    const imageData = context.createImageData(width, height);
-    const rgba = this.parseCanvasColor(color);
     const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = maskWidth;
+    maskCanvas.height = maskHeight;
     const maskContext = maskCanvas.getContext('2d');
 
     if (!maskContext) {
       throw new Error('Canvas 2D context is not available.');
     }
 
-    maskCanvas.width = width;
-    maskCanvas.height = height;
+    const imageData = maskContext.createImageData(maskWidth, maskHeight);
+    const rgba = this.parseCanvasColor(color);
+    const total = maskWidth * maskHeight;
 
-    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+    for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
       if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
         continue;
       }
@@ -558,7 +567,7 @@ export class DrawTool {
     }
 
     maskContext.putImageData(imageData, 0, 0);
-    context.drawImage(maskCanvas, left, top);
+    context.drawImage(maskCanvas, left, top, destWidth, destHeight);
   }
 
   private static drawSegmentationContour(
@@ -621,13 +630,11 @@ export class DrawTool {
         fillOpacity,
       );
       if (options.drawSegmentationPixelMask === true) {
-        this.drawOrderedEdgePoints(
-          context,
-          points,
-          strokeColor,
-          thickness,
-          options.fillSegmentationEdgePoints === true ? fillColor : undefined,
-        );
+        if (options.fillSegmentationEdgePoints === true) {
+          this.drawSegmentationMask(context, segmentation, fillColor);
+        }
+
+        this.drawOrderedEdgePoints(context, points, strokeColor, thickness);
       }
     }
 
@@ -647,6 +654,9 @@ export class DrawTool {
       return;
     }
 
+    const step = this.estimateEdgeStep(points);
+    const maxGap = step * 1.51;
+
     context.save();
     context.lineWidth = thickness;
     context.lineJoin = 'round';
@@ -658,7 +668,11 @@ export class DrawTool {
     context.beginPath();
 
     for (const point of points) {
-      if (!previousPoint || Math.abs(point.x - previousPoint.x) > 1 || Math.abs(point.y - previousPoint.y) > 1) {
+      const gap = previousPoint
+        ? Math.max(Math.abs(point.x - previousPoint.x), Math.abs(point.y - previousPoint.y))
+        : Number.POSITIVE_INFINITY;
+
+      if (!previousPoint || gap > maxGap) {
         context.moveTo(point.x, point.y);
       } else {
         context.lineTo(point.x, point.y);
@@ -680,6 +694,47 @@ export class DrawTool {
     }
 
     context.restore();
+  }
+
+  private static resolvePackedMaskSize(segmentation: Segmentation): { width: number; height: number } {
+    const destWidth = Math.max(1, segmentation.boundingBox.right - segmentation.boundingBox.left);
+    const destHeight = Math.max(1, segmentation.boundingBox.bottom - segmentation.boundingBox.top);
+
+    if (segmentation.pixelMaskWidth && segmentation.pixelMaskHeight) {
+      return {
+        width: Math.max(1, Math.round(segmentation.pixelMaskWidth)),
+        height: Math.max(1, Math.round(segmentation.pixelMaskHeight)),
+      };
+    }
+
+    const expectedBytes = Math.ceil((destWidth * destHeight) / 8);
+    if (segmentation.bitPackedPixelMask.byteLength >= expectedBytes) {
+      return { width: destWidth, height: destHeight };
+    }
+
+    const packedBits = segmentation.bitPackedPixelMask.byteLength * 8;
+    const aspect = destWidth / destHeight;
+    const maskHeight = Math.max(1, Math.round(Math.sqrt(packedBits / Math.max(aspect, 1e-6))));
+    const maskWidth = Math.max(1, Math.round(maskHeight * aspect));
+    return { width: maskWidth, height: maskHeight };
+  }
+
+  private static estimateEdgeStep(points: readonly Point[]): number {
+    let minStep = Number.POSITIVE_INFINITY;
+    const limit = Math.min(points.length, 256);
+
+    for (let index = 1; index < limit; index += 1) {
+      const step = Math.max(
+        Math.abs((points[index]?.x ?? 0) - (points[index - 1]?.x ?? 0)),
+        Math.abs((points[index]?.y ?? 0) - (points[index - 1]?.y ?? 0)),
+      );
+
+      if (step > 1e-6 && step < minStep) {
+        minStep = step;
+      }
+    }
+
+    return Number.isFinite(minStep) ? minStep : 1;
   }
 
   private static isSegmentationEdgePixel(

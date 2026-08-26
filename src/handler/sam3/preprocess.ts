@@ -28,6 +28,51 @@ export function getImageSize(image: YoloImageSource): { width: number; height: n
   return { width: sized.width, height: sized.height };
 }
 
+function enableHighQualitySmoothing(context: CanvasRenderingContext2D): void {
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+}
+
+/**
+ * Progressive downsample before the official 1008×1008 stretch.
+ * A single canvas blit from a huge photo to 1008 aliases badly and tanks scores.
+ */
+export function drawImageHighQuality(
+  context: CanvasRenderingContext2D,
+  image: CanvasImageSource,
+  sourceWidth: number,
+  sourceHeight: number,
+  destWidth: number,
+  destHeight: number,
+): void {
+  enableHighQualitySmoothing(context);
+
+  let src: CanvasImageSource = image;
+  let width = sourceWidth;
+  let height = sourceHeight;
+
+  while (width > destWidth * 2 || height > destHeight * 2) {
+    const nextWidth = Math.max(destWidth, Math.floor(width / 2));
+    const nextHeight = Math.max(destHeight, Math.floor(height / 2));
+    const tmp = document.createElement('canvas');
+    tmp.width = nextWidth;
+    tmp.height = nextHeight;
+    const tmpContext = tmp.getContext('2d');
+
+    if (!tmpContext) {
+      break;
+    }
+
+    enableHighQualitySmoothing(tmpContext);
+    tmpContext.drawImage(src, 0, 0, width, height, 0, 0, nextWidth, nextHeight);
+    src = tmp;
+    width = nextWidth;
+    height = nextHeight;
+  }
+
+  context.drawImage(src, 0, 0, width, height, 0, 0, destWidth, destHeight);
+}
+
 export function preprocessSam3Image(
   image: YoloImageSource,
   imageSize = SAM3_IMAGE_SIZE,
@@ -42,7 +87,7 @@ export function preprocessSam3Image(
     throw new Error('Failed to create a 2D canvas context for SAM3 preprocessing.');
   }
 
-  context.drawImage(image, 0, 0, sourceWidth, sourceHeight, 0, 0, imageSize, imageSize);
+  drawImageHighQuality(context, image, sourceWidth, sourceHeight, imageSize, imageSize);
   const pixels = context.getImageData(0, 0, imageSize, imageSize).data;
   const plane = imageSize * imageSize;
   const data = new Float32Array(3 * plane);
@@ -78,6 +123,55 @@ export function splitTextPrompts(prompt: string): string[] {
 export function composeTextQuery(className: string, description?: string): string {
   const extra = description?.trim();
   return extra ? `${className}, ${extra}` : className;
+}
+
+/**
+ * grounding-decoder.onnx was traced with 1 box + 1 point (+ 1 CLS inside the graph).
+ * That freezes the fused prompt length at 32 (text) + 3 = 35. Feeding a second box
+ * plus the dummy point becomes 36 and crashes ORT reshape / the WASM page.
+ */
+export interface PackedPcsBox {
+  box: Rect;
+  label: boolean;
+  pad: boolean;
+}
+
+export interface PackedPcsPoint {
+  point: Point;
+  label: 0 | 1;
+  pad: boolean;
+}
+
+export function rectCenter(box: Rect): Point {
+  return { x: (box.left + box.right) / 2, y: (box.top + box.bottom) / 2 };
+}
+
+/**
+ * Pack PCS exemplars into the 1-box + 1-point layout the current ONNX graph accepts.
+ * Extra boxes become a point at the previous box center so two box draws still both count.
+ */
+export function packPcsGeometricPrompts(
+  boxes: readonly { box: Rect; label: boolean }[],
+  points: readonly { point: Point; label: number }[],
+): { boxes: PackedPcsBox[]; points: PackedPcsPoint[] } {
+  const lastBox = boxes[boxes.length - 1];
+  const packedBox: PackedPcsBox = lastBox
+    ? { box: lastBox.box, label: lastBox.label, pad: false }
+    : { box: { left: 0, top: 0, right: 1, bottom: 1 }, label: true, pad: true };
+
+  const lastPoint = points[points.length - 1];
+  let packedPoint: PackedPcsPoint;
+
+  if (lastPoint) {
+    packedPoint = { point: lastPoint.point, label: lastPoint.label > 0 ? 1 : 0, pad: false };
+  } else {
+    const extraBox = boxes.length >= 2 ? boxes[boxes.length - 2] : undefined;
+    packedPoint = extraBox
+      ? { point: rectCenter(extraBox.box), label: extraBox.label ? 1 : 0, pad: false }
+      : { point: { x: 0, y: 0 }, label: 1, pad: true };
+  }
+
+  return { boxes: [packedBox], points: [packedPoint] };
 }
 
 export function rectToCxcywh(box: Rect, sourceWidth: number, sourceHeight: number): [number, number, number, number] {

@@ -705,6 +705,67 @@ def _export(model, dummy, path: Path, input_names, output_names, dynamic_axes, o
     return _record_onnx_io(path)
 
 
+def _concat_padded_sequences_onnx(seq1, mask1, seq2, mask2, return_index: bool = False):
+    """ONNX-friendly concat. Official scatter packing bakes dummy seq lengths into Reshape."""
+    concatenated_sequence = torch.cat((seq1, seq2), dim=0)
+    concatenated_mask = torch.cat((mask1, mask2), dim=1)
+    if return_index:
+        index = torch.arange(seq2.shape[0], device=seq2.device)[:, None].expand(-1, seq2.shape[1])
+        index = index + seq1.shape[0]
+        return concatenated_sequence, concatenated_mask, index
+    return concatenated_sequence, concatenated_mask
+
+
+def _encode_prompt_skip_empty_visual(
+    self,
+    backbone_out,
+    find_input,
+    geometric_prompt,
+    visual_prompt_embed=None,
+    visual_prompt_mask=None,
+    encode_text=True,
+    prev_mask_pred=None,
+):
+    """Same as Sam3Image._encode_prompt but do not torch.cat empty visual tensors."""
+    txt_ids = find_input.text_ids
+    txt_feats = backbone_out["language_features"][:, txt_ids]
+    txt_masks = backbone_out["language_mask"][txt_ids]
+
+    feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
+    backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
+
+    if prev_mask_pred is not None:
+        img_feats = [img_feats[-1] + prev_mask_pred]
+    geo_feats, geo_masks = self.geometry_encoder(
+        geo_prompt=geometric_prompt,
+        img_feats=img_feats,
+        img_sizes=vis_feat_sizes,
+        img_pos_embeds=img_pos_embeds,
+    )
+    parts = []
+    masks = []
+    if encode_text:
+        parts.append(txt_feats)
+        masks.append(txt_masks)
+    parts.append(geo_feats)
+    masks.append(geo_masks)
+    if visual_prompt_embed is not None and visual_prompt_embed.numel() > 0:
+        parts.append(visual_prompt_embed)
+        masks.append(visual_prompt_mask)
+    prompt = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+    prompt_mask = masks[0] if len(masks) == 1 else torch.cat(masks, dim=1)
+    return prompt, prompt_mask, backbone_out
+
+
+def _patch_sam3_for_onnx_export() -> None:
+    """Keep prompt sequence length dynamic so N boxes / points do not freeze Reshape to 35."""
+    import sam3.model.geometry_encoders as geo
+    from sam3.model.sam3_image import Sam3Image
+
+    geo.concat_padded_sequences = _concat_padded_sequences_onnx
+    Sam3Image._encode_prompt = _encode_prompt_skip_empty_visual
+
+
 @torch.no_grad()
 def export_all(args):
     checkpoint = Path(args.checkpoint)
@@ -797,6 +858,7 @@ def export_all(args):
         torch.cuda.empty_cache()
 
     if "grounding" in modules:
+        _patch_sam3_for_onnx_export()
         wrapper = GroundingDecoderWrapper(detector).to(device).eval()
         _move_python_tensor_caches(wrapper, device)
         dummy = (

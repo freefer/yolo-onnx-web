@@ -193,10 +193,21 @@ export class OBBDetection extends ObjectDetection {
 export class Segmentation extends ObjectDetection {
   bitPackedPixelMask: Uint8Array;
   segmentationEdgePoints?: Point[];
-  constructor(options: Detection & { bitPackedPixelMask: Uint8Array, segmentationEdgePoints?: Point[] }) {
+  pixelMaskWidth?: number;
+  pixelMaskHeight?: number;
+  constructor(
+    options: Detection & {
+      bitPackedPixelMask: Uint8Array;
+      segmentationEdgePoints?: Point[];
+      pixelMaskWidth?: number;
+      pixelMaskHeight?: number;
+    },
+  ) {
     super(options);
     this.bitPackedPixelMask = options.bitPackedPixelMask;
     this.segmentationEdgePoints = options.segmentationEdgePoints ?? [];
+    this.pixelMaskWidth = options.pixelMaskWidth;
+    this.pixelMaskHeight = options.pixelMaskHeight;
   }
 }
 

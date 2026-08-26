@@ -19,6 +19,7 @@ import {
   rectToCxcywh,
   splitTextPrompts,
   composeTextQuery,
+  packPcsGeometricPrompts,
 } from './preprocess';
 import type {
   Sam3InferenceState,
@@ -213,13 +214,23 @@ export class Sam3Handler {
   async addGeometricPrompt(box: Rect, label: boolean, state: Sam3InferenceState): Promise<Segmentation[]> {
     this.ensureImage(state);
     state.boxes.push({ box, label });
-    return this.forwardAllTextPrompts(state);
+    try {
+      return await this.forwardAllTextPrompts(state);
+    } catch (error) {
+      state.boxes.pop();
+      throw error;
+    }
   }
 
   async addGeometricPoint(point: Point, label: boolean, state: Sam3InferenceState): Promise<Segmentation[]> {
     this.ensureImage(state);
     state.points.push({ point, label: label ? 1 : 0 });
-    return this.forwardAllTextPrompts(state);
+    try {
+      return await this.forwardAllTextPrompts(state);
+    } catch (error) {
+      state.points.pop();
+      throw error;
+    }
   }
 
   async removeGeometricPrompt(index: number, state: Sam3InferenceState): Promise<Segmentation[]> {
@@ -418,6 +429,11 @@ export class Sam3Handler {
   }
 
   private async encodeText(prompt: string, state: Sam3InferenceState): Promise<void> {
+    if (state.textEmbeddings) {
+      this.releaseTensors(state.textEmbeddings);
+      state.textEmbeddings = undefined;
+    }
+
     const ids = this.tokenizer.tokenize(prompt);
     const result = await this.textSession.run(
       pickFeeds(this.textSession, {
@@ -455,8 +471,9 @@ export class Sam3Handler {
       throw new Error('Text embeddings are missing. Call setTextPrompt() first.');
     }
 
-    const boxes = state.boxes.length > 0 ? state.boxes : [{ box: { left: 0, top: 0, right: 1, bottom: 1 }, label: true }];
-    const boxPad = state.boxes.length === 0;
+    const packed = packPcsGeometricPrompts(state.boxes, state.points);
+    const boxes = packed.boxes;
+    const points = packed.points;
     const boxCoords = new Float32Array(boxes.length * 4);
     const boxLabels = new Int32Array(boxes.length);
     const boxPadMask = new Uint8Array(boxes.length);
@@ -468,11 +485,9 @@ export class Sam3Handler {
       boxCoords[index * 4 + 2] = cxcywh[2];
       boxCoords[index * 4 + 3] = cxcywh[3];
       boxLabels[index] = boxes[index].label ? 1 : 0;
-      boxPadMask[index] = boxPad ? 1 : 0;
+      boxPadMask[index] = boxes[index].pad ? 1 : 0;
     }
 
-    const points = state.points.length > 0 ? state.points : [{ point: { x: 0, y: 0 }, label: 1 as const }];
-    const pointPad = state.points.length === 0;
     const pointCoords = new Float32Array(points.length * 2);
     const pointLabels = new Int32Array(points.length);
     const pointPadMask = new Uint8Array(points.length);
@@ -482,27 +497,35 @@ export class Sam3Handler {
       pointCoords[index * 2] = xy[0];
       pointCoords[index * 2 + 1] = xy[1];
       pointLabels[index] = points[index].label > 0 ? 1 : 0;
-      pointPadMask[index] = pointPad ? 1 : 0;
+      pointPadMask[index] = points[index].pad ? 1 : 0;
     }
 
-    const result = await this.groundingSession.run(
-      pickFeeds(this.groundingSession, {
-        det_fpn_0: state.vision.detFpn0,
-        det_fpn_1: state.vision.detFpn1,
-        det_fpn_2: state.vision.detFpn2,
-        det_pos_0: state.vision.detPos0,
-        det_pos_1: state.vision.detPos1,
-        det_pos_2: state.vision.detPos2,
-        language_features: state.textEmbeddings.languageFeatures,
-        language_mask: state.textEmbeddings.languageMask,
-        box_coords: tensorFloat(boxCoords, [boxes.length, 1, 4]),
-        box_labels: tensorInt64(boxLabels, [boxes.length, 1]),
-        box_pad_mask: tensorBool(boxPadMask, [1, boxes.length]),
-        point_coords: tensorFloat(pointCoords, [points.length, 1, 2]),
-        point_labels: tensorInt64(pointLabels, [points.length, 1]),
-        point_pad_mask: tensorBool(pointPadMask, [1, points.length]),
-      }),
-    );
+    let result: OrtTypes.InferenceSession.OnnxValueMapType;
+    try {
+      result = await this.groundingSession.run(
+        pickFeeds(this.groundingSession, {
+          det_fpn_0: state.vision.detFpn0,
+          det_fpn_1: state.vision.detFpn1,
+          det_fpn_2: state.vision.detFpn2,
+          det_pos_0: state.vision.detPos0,
+          det_pos_1: state.vision.detPos1,
+          det_pos_2: state.vision.detPos2,
+          language_features: state.textEmbeddings.languageFeatures,
+          language_mask: state.textEmbeddings.languageMask,
+          box_coords: tensorFloat(boxCoords, [boxes.length, 1, 4]),
+          box_labels: tensorInt64(boxLabels, [boxes.length, 1]),
+          box_pad_mask: tensorBool(boxPadMask, [1, boxes.length]),
+          point_coords: tensorFloat(pointCoords, [points.length, 1, 2]),
+          point_labels: tensorInt64(pointLabels, [points.length, 1]),
+          point_pad_mask: tensorBool(pointPadMask, [1, points.length]),
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `SAM3 grounding decoder failed with ${state.boxes.length} box(es) and ${state.points.length} point(s): ${message}`,
+      );
+    }
 
     const masks = decodePcsOutputs(
       asFloat32(pickOutput(result, 'pred_masks').data),
@@ -527,10 +550,14 @@ export class Sam3Handler {
     }
   }
 
-  private releaseVision(vision: Sam3VisionEmbeddings): void {
-    for (const tensor of Object.values(vision)) {
+  private releaseTensors(tensors: Record<string, OrtTypes.Tensor | undefined>): void {
+    for (const tensor of Object.values(tensors)) {
       tensor?.dispose?.();
     }
+  }
+
+  private releaseVision(vision: Sam3VisionEmbeddings): void {
+    this.releaseTensors(vision);
   }
 }
 

@@ -8,6 +8,10 @@ import {
   YoloWebExecutionProviderOptions,
 } from '../../src';
 import type { Point, Rect, Segmentation, SegmentationDrawingOptions, YoloExecutionProvider, YoloModelSource } from '../../src';
+import { drawImageHighQuality, getImageSize } from '../../src/handler/sam3/preprocess';
+
+const MAX_WORKING_IMAGE_SIDE = 1920;
+type DemoImage = HTMLImageElement | HTMLCanvasElement;
 
 const DEMO_MODE = import.meta.env.YOLO_DEMO_MODE === 'pages' ? 'pages' : 'local';
 const ORT_SOURCE = import.meta.env.YOLO_ORT_SOURCE === 'cdn' ? 'cdn' : 'npm';
@@ -53,7 +57,7 @@ type TaskMode = 'pcs' | 'pvs';
 type PromptPolarity = 'positive' | 'negative';
 
 let sam3: Sam3 | null = null;
-let sourceImage: HTMLImageElement | null = null;
+let sourceImage: DemoImage | null = null;
 let currentMasks: Segmentation[] = [];
 let lastPvsMasks: Segmentation[] = [];
 let lastPvsLowRes: Array<{ logits: Float32Array; width: number; height: number }> = [];
@@ -216,13 +220,20 @@ async function loadImageFile(): Promise<void> {
     return;
   }
 
-  sourceImage = await decodeImageFile(file);
+  const decoded = await decodeImageFile(file);
+  const original = getImageSize(decoded);
+  sourceImage = downscaleWorkingImage(decoded, MAX_WORKING_IMAGE_SIDE);
+  const working = getImageSize(sourceImage);
   currentMasks = [];
   lastPvsMasks = [];
   lastPvsLowRes = [];
   clearCandidates();
   redraw();
-  writeOutput(`已选择图片 ${sourceImage.naturalWidth}×${sourceImage.naturalHeight}。`);
+  writeOutput(
+    original.width === working.width && original.height === working.height
+      ? `已选择图片 ${working.width}×${working.height}。`
+      : `已选择图片 ${original.width}×${original.height}，工作分辨率 ${working.width}×${working.height}（大图已缩小，避免分数下降和等待过久）。`,
+  );
 
   if (sam3) {
     await encodeImage();
@@ -507,9 +518,12 @@ function redraw(): void {
   if (sam3 && currentMasks.length > 0) {
     sam3.drawSegmentationEdgePoints(sourceImage, currentMasks, preview, getSegmentationDrawOptions());
   } else {
-    preview.width = sourceImage.naturalWidth;
-    preview.height = sourceImage.naturalHeight;
-    context.drawImage(sourceImage, 0, 0);
+    const { width, height } = getImageSize(sourceImage);
+    preview.width = width;
+    preview.height = height;
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(sourceImage, 0, 0, width, height);
   }
 
   drawPromptOverlay(context);
@@ -721,6 +735,28 @@ async function decodeImageFile(file: File): Promise<HTMLImageElement> {
   }
 }
 
+function downscaleWorkingImage(image: HTMLImageElement, maxSide: number): DemoImage {
+  const { width, height } = getImageSize(image);
+  const side = Math.max(width, height);
+
+  if (side <= maxSide) {
+    return image;
+  }
+
+  const scale = maxSide / side;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  const context = canvas.getContext('2d');
+
+  if (!context) {
+    return image;
+  }
+
+  drawImageHighQuality(context, image, width, height, canvas.width, canvas.height);
+  return canvas;
+}
+
 function eventToImagePoint(event: PointerEvent): Point {
   const rect = preview.getBoundingClientRect();
   return {
@@ -783,7 +819,12 @@ function formatMaskResult(title: string, masks: readonly Segmentation[], elapsed
 }
 
 function formatError(error: unknown): string {
-  return error instanceof Error ? error.stack ?? error.message : String(error);
+  const message = error instanceof Error ? error.stack ?? error.message : String(error);
+  if (/reshape|OrtRun|input_shape_size/i.test(message)) {
+    return `${message}\n\n提示：几何范例推理失败。请点“重置提示”后再试；若仍失败请重新编码图像。`;
+  }
+
+  return message;
 }
 
 function applyDemoModeUi(): void {
