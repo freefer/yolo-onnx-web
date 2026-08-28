@@ -80,43 +80,64 @@ export class Sam3 {
 
     await this.dispose();
 
-    const progress = this.options.onLoadProgress;
-    progress?.('正在加载视觉编码器...');
-    this.visionSession = await this.createSession('vision', this.options.visionEncoder);
-    progress?.('正在加载文本编码器...');
-    this.textSession = await this.createSession('text', this.options.textEncoder);
-    progress?.('正在加载概念分割解码器...');
-    this.groundingSession = await this.createSession('grounding', this.options.groundingDecoder);
-    if (this.options.promptDecoder) {
-      progress?.('正在加载视觉分割解码器...');
-      this.promptSession = await this.createSession('prompt', this.options.promptDecoder);
-    } else {
-      this.promptSession = null;
-    }
-    progress?.('正在加载 CLIP tokenizer...');
-    this.tokenizer = this.options.tokenizer
-      ? await loadClipTokenizer(this.options.tokenizer)
-      : null;
+    try {
+      const progress = this.options.onLoadProgress;
+      progress?.('正在加载视觉编码器...');
+      this.visionSession = await this.createSession('vision', this.options.visionEncoder);
 
-    if (!this.tokenizer) {
-      throw new Error('SAM3 tokenizer tables are required. Pass tokenizer: clip_bpe.json or parsed tables.');
-    }
+      progress?.('正在加载文本 / Grounding / Prompt / tokenizer...');
+      const promptSource = this.options.promptDecoder;
+      const textPromise = this.createSession('text', this.options.textEncoder);
+      const groundingPromise = this.createSession('grounding', this.options.groundingDecoder);
+      const promptPromise = promptSource ? this.createSession('prompt', promptSource) : Promise.resolve(null);
+      const tokenizerPromise = this.options.tokenizer
+        ? loadClipTokenizer(this.options.tokenizer)
+        : Promise.resolve(null);
 
-    this.handler = new Sam3Handler(
-      this.visionSession,
-      this.textSession,
-      this.groundingSession,
-      this.promptSession,
-      this.tokenizer,
-      {
-        confidenceThreshold: this.options.confidenceThreshold ?? 0.5,
-        pixelConfidence: this.options.pixelConfidence ?? 0.5,
-        imageSize: this.options.imageSize ?? SAM3_IMAGE_SIZE,
-        maskSize: this.options.maskSize ?? SAM3_MASK_SIZE,
-        webGpu: this.webGpu,
-      },
-    );
-    return this;
+      try {
+        const [textSession, groundingSession, promptSession, tokenizer] = await Promise.all([
+          textPromise,
+          groundingPromise,
+          promptPromise,
+          tokenizerPromise,
+        ]);
+        this.textSession = textSession;
+        this.groundingSession = groundingSession;
+        this.promptSession = promptSession;
+        this.tokenizer = tokenizer;
+      } catch (error) {
+        const settled = await Promise.allSettled([textPromise, groundingPromise, promptPromise]);
+        await Promise.all(
+          settled.map(item =>
+            item.status === 'fulfilled' && item.value ? item.value.release() : Promise.resolve(),
+          ),
+        );
+        throw error;
+      }
+
+      if (!this.tokenizer) {
+        throw new Error('SAM3 tokenizer tables are required. Pass tokenizer: clip_bpe.json or parsed tables.');
+      }
+
+      this.handler = new Sam3Handler(
+        this.visionSession,
+        this.textSession,
+        this.groundingSession,
+        this.promptSession,
+        this.tokenizer,
+        {
+          confidenceThreshold: this.options.confidenceThreshold ?? 0.5,
+          pixelConfidence: this.options.pixelConfidence ?? 0.5,
+          imageSize: this.options.imageSize ?? SAM3_IMAGE_SIZE,
+          maskSize: this.options.maskSize ?? SAM3_MASK_SIZE,
+          webGpu: this.webGpu,
+        },
+      );
+      return this;
+    } catch (error) {
+      await this.dispose();
+      throw error;
+    }
   }
 
   async setImage(image: Sam3ImageInput): Promise<Sam3InferenceState> {
@@ -155,7 +176,7 @@ export class Sam3 {
   async setConfidenceThreshold(threshold: number): Promise<Segmentation[] | Sam3InferenceState> {
     this.ensureHandler().setConfidenceThreshold(threshold);
     const state = this.ensureState();
-    if (state.textEmbeddings) {
+    if (state.lastPcsRaw?.length || state.textEmbeddings) {
       return this.ensureHandler().applyConfidenceThreshold(state);
     }
     return state;
@@ -179,6 +200,10 @@ export class Sam3 {
 
   async addMask(mask: Sam3MaskPrompt): Promise<Sam3PvsResult> {
     return this.ensureHandler().addMask(mask, this.ensureState());
+  }
+
+  selectVisualCandidate(index: number): Sam3PvsResult {
+    return this.ensureHandler().selectPvsCandidate(index, this.ensureState());
   }
 
   async removePoint(index: number): Promise<Sam3PvsResult> {
@@ -227,11 +252,12 @@ export class Sam3 {
     const userExtra = (userOptions.extra ?? {}) as Record<string, unknown>;
     const userSession = (userExtra.session ?? {}) as Record<string, unknown>;
     const keepVisionOnGpu = this.webGpu && kind === 'vision';
+    const disableGraphOpt = kind === 'vision' || kind === 'text';
     const options: OrtTypes.InferenceSession.SessionOptions = {
       enableCpuMemArena: true,
       enableMemPattern: true,
       ...userOptions,
-      graphOptimizationLevel: userOptions.graphOptimizationLevel ?? 'disabled',
+      graphOptimizationLevel: userOptions.graphOptimizationLevel ?? (disableGraphOpt ? 'disabled' : 'all'),
       extra: {
         ...userExtra,
         session: {
@@ -275,6 +301,14 @@ export class Sam3 {
       if (kind === 'vision' && this.webGpu && options.preferredOutputLocation === 'gpu-buffer') {
         try {
           return await this.createSessionWithOptions(model, { ...options, preferredOutputLocation: undefined });
+        } catch {
+          // fall through
+        }
+      }
+
+      if (options.graphOptimizationLevel === 'all') {
+        try {
+          return await this.createSessionWithOptions(model, { ...options, graphOptimizationLevel: 'disabled' });
         } catch {
           // fall through to the original error
         }
@@ -329,6 +363,7 @@ export type {
   Sam3MaskPrompt,
   Sam3Options,
   Sam3PcsPrompt,
+  Sam3PcsRawOutput,
   Sam3PointPrompt,
   Sam3PvsPrompt,
   Sam3PvsResult,

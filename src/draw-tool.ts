@@ -56,6 +56,38 @@ const EDGE_NEIGHBOR_OFFSETS = [
 ] as const;
 const DEFAULT_EDGE_FILL_OPACITY = 64;
 
+let pooledMaskCanvas: HTMLCanvasElement | null = null;
+let pooledMaskContext: CanvasRenderingContext2D | null = null;
+let pooledMaskImageData: ImageData | null = null;
+
+function getPooledMaskTarget(width: number, height: number): {
+  canvas: HTMLCanvasElement;
+  context: CanvasRenderingContext2D;
+  imageData: ImageData;
+} {
+  if (!pooledMaskCanvas || !pooledMaskContext) {
+    pooledMaskCanvas = document.createElement('canvas');
+    pooledMaskContext = pooledMaskCanvas.getContext('2d');
+    if (!pooledMaskContext) {
+      throw new Error('Canvas 2D context is not available.');
+    }
+  }
+
+  if (pooledMaskCanvas.width < width || pooledMaskCanvas.height < height) {
+    pooledMaskCanvas.width = Math.max(width, pooledMaskCanvas.width);
+    pooledMaskCanvas.height = Math.max(height, pooledMaskCanvas.height);
+    pooledMaskImageData = null;
+  }
+
+  if (!pooledMaskImageData || pooledMaskImageData.width !== width || pooledMaskImageData.height !== height) {
+    pooledMaskImageData = pooledMaskContext.createImageData(width, height);
+  } else {
+    pooledMaskImageData.data.fill(0);
+  }
+
+  return { canvas: pooledMaskCanvas, context: pooledMaskContext, imageData: pooledMaskImageData };
+}
+
 export class DrawTool {
   static drawObjectDetections(
     source: YoloImageSource,
@@ -541,18 +573,10 @@ export class DrawTool {
       return;
     }
 
-    const maskCanvas = document.createElement('canvas');
-    maskCanvas.width = maskWidth;
-    maskCanvas.height = maskHeight;
-    const maskContext = maskCanvas.getContext('2d');
-
-    if (!maskContext) {
-      throw new Error('Canvas 2D context is not available.');
-    }
-
-    const imageData = maskContext.createImageData(maskWidth, maskHeight);
+    const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
     const rgba = this.parseCanvasColor(color);
     const total = maskWidth * maskHeight;
+    const pixels = imageData.data;
 
     for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
       if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
@@ -560,14 +584,14 @@ export class DrawTool {
       }
 
       const offset = pixelIndex * 4;
-      imageData.data[offset] = rgba.r;
-      imageData.data[offset + 1] = rgba.g;
-      imageData.data[offset + 2] = rgba.b;
-      imageData.data[offset + 3] = rgba.a;
+      pixels[offset] = rgba.r;
+      pixels[offset + 1] = rgba.g;
+      pixels[offset + 2] = rgba.b;
+      pixels[offset + 3] = rgba.a;
     }
 
     maskContext.putImageData(imageData, 0, 0);
-    context.drawImage(maskCanvas, left, top, destWidth, destHeight);
+    context.drawImage(maskCanvas, 0, 0, maskWidth, maskHeight, left, top, destWidth, destHeight);
   }
 
   private static drawSegmentationContour(

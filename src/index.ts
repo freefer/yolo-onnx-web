@@ -60,6 +60,7 @@ export type {
   Sam3MaskPrompt,
   Sam3Options,
   Sam3PcsPrompt,
+  Sam3PcsRawOutput,
   Sam3PointPrompt,
   Sam3PvsPrompt,
   Sam3PvsResult,

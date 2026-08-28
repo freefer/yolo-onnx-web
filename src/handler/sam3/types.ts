@@ -53,7 +53,17 @@ export interface Sam3VisionEmbeddings {
 export interface Sam3TextEmbeddings {
   languageMask: ort.Tensor;
   languageFeatures: ort.Tensor;
-  languageEmbeds: ort.Tensor;
+  languageEmbeds?: ort.Tensor;
+}
+
+export interface Sam3PcsRawOutput {
+  predMasks: Float32Array;
+  predBoxes: Float32Array;
+  predLogits: Float32Array;
+  presenceLogits: Float32Array;
+  maskShape: number[];
+  boxShape: number[];
+  label: string;
 }
 
 export interface Sam3InferenceState {
@@ -70,6 +80,7 @@ export interface Sam3InferenceState {
   pvsBox: Rect | null;
   pvsMaskInput: Sam3MaskPrompt | null;
   lastPcs?: Segmentation[];
+  lastPcsRaw?: Sam3PcsRawOutput[];
   lastPvs?: Sam3PvsResult;
 }
 
@@ -78,6 +89,8 @@ export interface Sam3PvsResult {
   lowResMasks: Float32Array[];
   ious: number[];
   objectScores: number[];
+  maskWidth?: number;
+  maskHeight?: number;
 }
 
 export interface Sam3Options extends OnnxRuntimeWebOptions {

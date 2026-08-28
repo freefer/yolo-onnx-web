@@ -24,10 +24,15 @@ import type {
   Sam3InferenceState,
   Sam3MaskPrompt,
   Sam3PcsPrompt,
+  Sam3PcsRawOutput,
   Sam3PvsPrompt,
   Sam3PvsResult,
+  Sam3TextEmbeddings,
   Sam3VisionEmbeddings,
 } from './types';
+
+const TEXT_OUTPUT_NAMES = ['language_mask', 'language_features'] as const;
+const TEXT_CACHE_LIMIT = 32;
 
 function asFloat32(data: OrtTypes.Tensor.DataType): Float32Array {
   if (data instanceof Float32Array) {
@@ -35,6 +40,10 @@ function asFloat32(data: OrtTypes.Tensor.DataType): Float32Array {
   }
 
   return Float32Array.from(data as ArrayLike<number>);
+}
+
+function copyFloat32(data: Float32Array): Float32Array {
+  return new Float32Array(data);
 }
 
 function pickFeeds(
@@ -85,12 +94,12 @@ function tensorInt64(values: ArrayLike<number>, dims: readonly number[]): OrtTyp
   return new ort.Tensor('int64', data, [...dims]);
 }
 
-function tensorInt32(values: ArrayLike<number>, dims: readonly number[]): OrtTypes.Tensor {
-  return new ort.Tensor('int32', Int32Array.from(values), [...dims]);
+function tensorInt32(values: Int32Array, dims: readonly number[]): OrtTypes.Tensor {
+  return new ort.Tensor('int32', values, [...dims]);
 }
 
-function tensorBool(values: ArrayLike<boolean | number>, dims: readonly number[]): OrtTypes.Tensor {
-  return new ort.Tensor('bool', Uint8Array.from(values, value => (value ? 1 : 0)), [...dims]);
+function tensorBool(values: Uint8Array, dims: readonly number[]): OrtTypes.Tensor {
+  return new ort.Tensor('bool', values, [...dims]);
 }
 
 function selectPvsMaskIndices(maskCount: number, ious: Float32Array, wantMulti: boolean): number[] {
@@ -105,15 +114,25 @@ function selectPvsMaskIndices(maskCount: number, ious: Float32Array, wantMulti: 
   return wantMulti ? Array.from({ length: maskCount }, (_, index) => index) : [argmax(ious)];
 }
 
-function prepareMaskInput(maskInput: Sam3MaskPrompt | null | undefined, maskSize: number): Float32Array {
-  const maskData = new Float32Array(maskSize * maskSize);
+function ensureFloat32(current: Float32Array | null, length: number): Float32Array {
+  return current && current.length >= length ? current : new Float32Array(length);
+}
+
+function ensureInt32(current: Int32Array | null, length: number): Int32Array {
+  return current && current.length >= length ? current : new Int32Array(length);
+}
+
+function fillMaskInput(target: Float32Array | null, maskInput: Sam3MaskPrompt | null | undefined, maskSize: number): Float32Array {
+  const needed = maskSize * maskSize;
+  const maskData = ensureFloat32(target, needed);
+  maskData.fill(0, 0, needed);
 
   if (!maskInput) {
     return maskData;
   }
 
   if (maskInput.width === maskSize && maskInput.height === maskSize) {
-    maskData.set(maskInput.logits.subarray(0, maskData.length));
+    maskData.set(maskInput.logits.subarray(0, needed));
     return maskData;
   }
 
@@ -121,8 +140,81 @@ function prepareMaskInput(maskInput: Sam3MaskPrompt | null | undefined, maskSize
   return maskData;
 }
 
+function cloneCpuTensor(tensor: OrtTypes.Tensor): OrtTypes.Tensor {
+  const dims = [...tensor.dims];
+
+  if (tensor.type === 'bool') {
+    return new ort.Tensor('bool', Uint8Array.from(tensor.data as Uint8Array), dims);
+  }
+
+  if (tensor.type === 'int64') {
+    return new ort.Tensor('int64', BigInt64Array.from(tensor.data as BigInt64Array), dims);
+  }
+
+  if (tensor.type === 'int32') {
+    return new ort.Tensor('int32', Int32Array.from(tensor.data as Int32Array), dims);
+  }
+
+  return new ort.Tensor('float32', copyFloat32(asFloat32(tensor.data)), dims);
+}
+
+function sliceAlongAxis(
+  data: Float32Array | Uint8Array,
+  dims: readonly number[],
+  axis: number,
+  index: number,
+): { data: Float32Array | Uint8Array; dims: number[] } {
+  const inner = dims.slice(axis + 1).reduce((product, dim) => product * dim, 1);
+  const outer = dims.slice(0, axis).reduce((product, dim) => product * dim, 1);
+  const axisSize = dims[axis] ?? 1;
+  const out = data instanceof Uint8Array ? new Uint8Array(outer * inner) : new Float32Array(outer * inner);
+
+  for (let prefix = 0; prefix < outer; prefix += 1) {
+    const source = (prefix * axisSize + index) * inner;
+    out.set(data.subarray(source, source + inner) as typeof out, prefix * inner);
+  }
+
+  return {
+    data: out,
+    dims: dims.map((dim, dimIndex) => (dimIndex === axis ? 1 : dim)),
+  };
+}
+
+function featureBatchAxis(dims: readonly number[], batch: number): number {
+  if (dims.length >= 3 && dims[1] === batch) {
+    return 1;
+  }
+
+  if (dims[0] === batch) {
+    return 0;
+  }
+
+  const axis = dims.indexOf(batch);
+  if (axis < 0) {
+    throw new Error(`Text encoder output shape [${dims.join(', ')}] has no batch=${batch} axis.`);
+  }
+
+  return axis;
+}
+
+async function runTextSession(
+  session: OrtTypes.InferenceSession,
+  feeds: OrtTypes.InferenceSession.FeedsType,
+): Promise<OrtTypes.InferenceSession.OnnxValueMapType> {
+  try {
+    return await session.run(feeds, [...TEXT_OUTPUT_NAMES]);
+  } catch {
+    return session.run(feeds);
+  }
+}
+
 export class Sam3Handler {
   private readonly webGpuPreprocessor: Sam3WebGpuPreprocessor | null;
+  private readonly textEmbeddingCache = new Map<string, Sam3TextEmbeddings>();
+  private pvsMaskScratch: Float32Array | null = null;
+  private pvsCoordsScratch: Float32Array | null = null;
+  private pvsLabelsScratch: Int32Array | null = null;
+  private readonly pvsHasMaskScratch = new Float32Array(1);
 
   constructor(
     private readonly visionSession: OrtTypes.InferenceSession,
@@ -147,11 +239,24 @@ export class Sam3Handler {
   }
 
   async applyConfidenceThreshold(state: Sam3InferenceState): Promise<Segmentation[]> {
+    if (state.lastPcsRaw?.length) {
+      const merged: Segmentation[] = [];
+      for (const raw of state.lastPcsRaw) {
+        merged.push(...this.decodePcsRaw(state, raw));
+      }
+      state.lastPcs = merged;
+      return merged;
+    }
+
     return this.forwardAllTextPrompts(state);
   }
 
   dispose(): void {
     this.webGpuPreprocessor?.dispose();
+    for (const embeddings of this.textEmbeddingCache.values()) {
+      this.releaseTensors(embeddings);
+    }
+    this.textEmbeddingCache.clear();
   }
 
   async setImage(image: YoloImageSource, state?: Sam3InferenceState | null): Promise<Sam3InferenceState> {
@@ -162,9 +267,6 @@ export class Sam3Handler {
     const preprocessStarted = performance.now();
     const input = await this.prepareImage(image);
     const preprocessMs = performance.now() - preprocessStarted;
-    if (typeof (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler?.yield === 'function') {
-      await (globalThis as { scheduler?: { yield: () => Promise<void> } }).scheduler!.yield();
-    }
     let imageTensor = input.tensor ?? tensorFloat(input.data, [1, 3, input.height, input.width]);
     let result: OrtTypes.InferenceSession.OnnxValueMapType;
     let runMs = 0;
@@ -189,6 +291,7 @@ export class Sam3Handler {
         runMs = performance.now() - runStarted;
       }
 
+      // gpu-buffer 的 run() 只表示命令已提交。必须等队列跑完，UI 才能真的去点选。
       if (this.options.webGpu) {
         const fenceStarted = performance.now();
         await waitForWebGpuOutputs(result);
@@ -232,6 +335,7 @@ export class Sam3Handler {
     state.boxes = [];
     state.points = [];
     state.lastPcs = undefined;
+    state.lastPcsRaw = undefined;
     return state;
   }
 
@@ -344,8 +448,11 @@ export class Sam3Handler {
       concatPoints.push({ x: 0, y: 0, label: -1 });
     }
 
-    const coords = new Float32Array(concatPoints.length * 2);
-    const labels = new Int32Array(concatPoints.length);
+    const coordLength = concatPoints.length * 2;
+    this.pvsCoordsScratch = ensureFloat32(this.pvsCoordsScratch, coordLength);
+    this.pvsLabelsScratch = ensureInt32(this.pvsLabelsScratch, concatPoints.length);
+    const coords = this.pvsCoordsScratch.subarray(0, coordLength);
+    const labels = this.pvsLabelsScratch.subarray(0, concatPoints.length);
 
     for (let index = 0; index < concatPoints.length; index += 1) {
       coords[index * 2] = concatPoints[index].x;
@@ -354,7 +461,10 @@ export class Sam3Handler {
     }
 
     const maskSize = this.options.maskSize;
-    const hasMask = maskInput ? 1 : 0;
+    this.pvsHasMaskScratch[0] = maskInput ? 1 : 0;
+    this.pvsMaskScratch = fillMaskInput(this.pvsMaskScratch, maskInput, maskSize);
+    const maskData = this.pvsMaskScratch.subarray(0, maskSize * maskSize);
+
     const result = await this.promptSession.run(
       pickFeeds(this.promptSession, {
         image_embed: state.vision.pvsImageEmbed,
@@ -362,8 +472,8 @@ export class Sam3Handler {
         high_res_1: state.vision.pvsHighRes1,
         point_coords: tensorFloat(coords, [1, concatPoints.length, 2]),
         point_labels: tensorInt32(labels, [1, concatPoints.length]),
-        mask_input: tensorFloat(prepareMaskInput(maskInput, maskSize), [1, 1, maskSize, maskSize]),
-        has_mask_input: tensorFloat(Float32Array.from([hasMask]), [1]),
+        mask_input: tensorFloat(maskData, [1, 1, maskSize, maskSize]),
+        has_mask_input: tensorFloat(this.pvsHasMaskScratch, [1]),
       }),
     );
 
@@ -410,6 +520,8 @@ export class Sam3Handler {
       lowResMasks,
       ious: selectedIous,
       objectScores: selectedScores,
+      maskWidth: width,
+      maskHeight: height,
     };
     state.pvsPoints = points;
     state.pvsBox = box;
@@ -421,6 +533,29 @@ export class Sam3Handler {
       height,
     };
     return pvsResult;
+  }
+
+  selectPvsCandidate(index: number, state: Sam3InferenceState): Sam3PvsResult {
+    const last = state.lastPvs;
+    const mask = last?.masks[index];
+    const logits = last?.lowResMasks[index];
+
+    if (!last || !mask || !logits) {
+      throw new Error(`PVS candidate ${index} is not available. Run predictVisual() first.`);
+    }
+
+    const width = last.maskWidth ?? this.options.maskSize;
+    const height = last.maskHeight ?? this.options.maskSize;
+    state.pvsMaskInput = { logits, width, height };
+
+    return {
+      masks: [mask],
+      lowResMasks: [logits],
+      ious: [last.ious[index] ?? 0],
+      objectScores: [last.objectScores[index] ?? last.objectScores[0] ?? 0],
+      maskWidth: width,
+      maskHeight: height,
+    };
   }
 
   async addPoint(point: Point, label: 0 | 1, state: Sam3InferenceState): Promise<Sam3PvsResult> {
@@ -472,43 +607,149 @@ export class Sam3Handler {
     return this.predictVisual({ points: state.pvsPoints, box: state.pvsBox, maskInput: null }, state);
   }
 
-  private async encodeText(prompt: string, state: Sam3InferenceState): Promise<void> {
-    if (state.textEmbeddings) {
-      this.releaseTensors(state.textEmbeddings);
-      state.textEmbeddings = undefined;
+  private cacheTextEmbeddings(query: string, embeddings: Sam3TextEmbeddings): void {
+    const previous = this.textEmbeddingCache.get(query);
+    if (previous && previous !== embeddings) {
+      this.releaseTensors(previous);
     }
 
-    const ids = this.tokenizer.tokenize(prompt);
-    const result = await this.textSession.run(
+    this.textEmbeddingCache.delete(query);
+    this.textEmbeddingCache.set(query, embeddings);
+
+    while (this.textEmbeddingCache.size > TEXT_CACHE_LIMIT) {
+      const oldest = this.textEmbeddingCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+
+      const stale = this.textEmbeddingCache.get(oldest);
+      this.textEmbeddingCache.delete(oldest);
+      if (stale) {
+        this.releaseTensors(stale);
+      }
+    }
+  }
+
+  private async encodeTextUncached(query: string): Promise<void> {
+    const ids = this.tokenizer.tokenize(query);
+    const result = await runTextSession(
+      this.textSession,
       pickFeeds(this.textSession, {
         input_ids: tensorInt64(ids, [1, ids.length]),
       }),
     );
-    state.textEmbeddings = {
-      languageMask: pickOutput(result, 'language_mask'),
-      languageFeatures: pickOutput(result, 'language_features'),
-      languageEmbeds: pickOutput(result, 'language_embeds'),
-    };
+    this.cacheTextEmbeddings(query, {
+      languageMask: cloneCpuTensor(pickOutput(result, 'language_mask')),
+      languageFeatures: cloneCpuTensor(pickOutput(result, 'language_features')),
+    });
+  }
+
+  private async encodeTextsBatched(queries: readonly string[]): Promise<void> {
+    const batch = queries.length;
+    const length = this.tokenizer.contextLength;
+    const ids = new BigInt64Array(batch * length);
+
+    for (let index = 0; index < batch; index += 1) {
+      const tokens = this.tokenizer.tokenize(queries[index] ?? '');
+      for (let token = 0; token < length; token += 1) {
+        ids[index * length + token] = BigInt(tokens[token] ?? 0);
+      }
+    }
+
+    const result = await runTextSession(
+      this.textSession,
+      pickFeeds(this.textSession, {
+        input_ids: new ort.Tensor('int64', ids, [batch, length]),
+      }),
+    );
+    const maskTensor = pickOutput(result, 'language_mask');
+    const featureTensor = pickOutput(result, 'language_features');
+    const maskDims = maskTensor.dims;
+    const featureDims = featureTensor.dims;
+    const maskAxis = maskDims[0] === batch ? 0 : featureBatchAxis(maskDims, batch);
+    const featureAxis = featureBatchAxis(featureDims, batch);
+    const maskData = maskTensor.data instanceof Uint8Array ? maskTensor.data : Uint8Array.from(maskTensor.data as ArrayLike<number>);
+    const featureData = asFloat32(featureTensor.data);
+
+    for (let index = 0; index < batch; index += 1) {
+      const maskSlice = sliceAlongAxis(maskData, maskDims, maskAxis, index);
+      const featureSlice = sliceAlongAxis(featureData, featureDims, featureAxis, index);
+      this.cacheTextEmbeddings(queries[index] ?? '', {
+        languageMask: new ort.Tensor('bool', maskSlice.data as Uint8Array, maskSlice.dims),
+        languageFeatures: new ort.Tensor('float32', featureSlice.data as Float32Array, featureSlice.dims),
+      });
+    }
+  }
+
+  private async ensureTextEmbeddings(queries: readonly string[]): Promise<void> {
+    const missing = [...new Set(queries)].filter(query => !this.textEmbeddingCache.has(query));
+    if (missing.length === 0) {
+      return;
+    }
+
+    if (missing.length === 1) {
+      await this.encodeTextUncached(missing[0] ?? '');
+      return;
+    }
+
+    try {
+      await this.encodeTextsBatched(missing);
+    } catch (error) {
+      console.warn('[SAM3] Batched text encode failed, falling back to sequential.', error);
+      for (const query of missing) {
+        if (!this.textEmbeddingCache.has(query)) {
+          await this.encodeTextUncached(query);
+        }
+      }
+    }
   }
 
   private async forwardAllTextPrompts(state: Sam3InferenceState): Promise<Segmentation[]> {
     this.ensureImage(state);
     const original = state.text?.trim() || 'visual';
     const texts = state.texts?.length ? state.texts : splitTextPrompts(original);
-    const merged: Segmentation[] = [];
+    const queries = texts.map(text => composeTextQuery(text, state.textDescription));
+    await this.ensureTextEmbeddings(queries);
 
-    for (const text of texts) {
-      await this.encodeText(composeTextQuery(text, state.textDescription), state);
-      merged.push(...(await this.forwardGrounding(state, text)));
+    const merged: Segmentation[] = [];
+    const rawOutputs: Sam3PcsRawOutput[] = [];
+
+    for (let index = 0; index < texts.length; index += 1) {
+      const embeddings = this.textEmbeddingCache.get(queries[index] ?? '');
+      if (!embeddings) {
+        throw new Error(`Text embeddings are missing for "${queries[index]}".`);
+      }
+
+      state.textEmbeddings = embeddings;
+      const raw = await this.runGrounding(state, texts[index] ?? original);
+      rawOutputs.push(raw);
+      merged.push(...this.decodePcsRaw(state, raw));
     }
 
     state.text = original;
     state.texts = texts;
+    state.lastPcsRaw = rawOutputs;
     state.lastPcs = merged;
     return merged;
   }
 
-  private async forwardGrounding(state: Sam3InferenceState, label?: string): Promise<Segmentation[]> {
+  private decodePcsRaw(state: Sam3InferenceState, raw: Sam3PcsRawOutput): Segmentation[] {
+    return decodePcsOutputs(
+      raw.predMasks,
+      raw.predBoxes,
+      raw.predLogits,
+      raw.presenceLogits,
+      raw.maskShape,
+      raw.boxShape,
+      state.sourceWidth,
+      state.sourceHeight,
+      raw.label,
+      this.options.confidenceThreshold,
+      this.options.pixelConfidence,
+    );
+  }
+
+  private async runGrounding(state: Sam3InferenceState, label?: string): Promise<Sam3PcsRawOutput> {
     this.ensureImage(state);
 
     if (!state.textEmbeddings) {
@@ -571,21 +812,18 @@ export class Sam3Handler {
       );
     }
 
-    const masks = decodePcsOutputs(
-      asFloat32(pickOutput(result, 'pred_masks').data),
-      asFloat32(pickOutput(result, 'pred_boxes').data),
-      asFloat32(pickOutput(result, 'pred_logits').data),
-      asFloat32(pickOutput(result, 'presence_logits').data),
-      pickOutput(result, 'pred_masks').dims,
-      pickOutput(result, 'pred_boxes').dims,
-      state.sourceWidth,
-      state.sourceHeight,
-      label ?? state.texts?.[0] ?? state.text ?? 'visual',
-      this.options.confidenceThreshold,
-      this.options.pixelConfidence,
-    );
-    state.lastPcs = masks;
-    return masks;
+    const predMasks = pickOutput(result, 'pred_masks');
+    const predBoxes = pickOutput(result, 'pred_boxes');
+
+    return {
+      predMasks: copyFloat32(asFloat32(predMasks.data)),
+      predBoxes: copyFloat32(asFloat32(predBoxes.data)),
+      predLogits: copyFloat32(asFloat32(pickOutput(result, 'pred_logits').data)),
+      presenceLogits: copyFloat32(asFloat32(pickOutput(result, 'presence_logits').data)),
+      maskShape: [...predMasks.dims],
+      boxShape: [...predBoxes.dims],
+      label: label ?? state.texts?.[0] ?? state.text ?? 'visual',
+    };
   }
 
   private async prepareImage(image: YoloImageSource) {

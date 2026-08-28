@@ -59,8 +59,6 @@ type PromptPolarity = 'positive' | 'negative';
 let sam3: Sam3 | null = null;
 let sourceImage: DemoImage | null = null;
 let currentMasks: Segmentation[] = [];
-let lastPvsMasks: Segmentation[] = [];
-let lastPvsLowRes: Array<{ logits: Float32Array; width: number; height: number }> = [];
 let dragStart: Point | null = null;
 let dragCurrent: Point | null = null;
 let pendingPrompt: { box?: Rect; point?: Point; positive: boolean } | null = null;
@@ -188,8 +186,6 @@ async function loadModels(): Promise<void> {
     sam3 = next;
     sourceImage = null;
     currentMasks = [];
-    lastPvsMasks = [];
-    lastPvsLowRes = [];
     clearCandidates();
 
     writeModelInfo(
@@ -227,8 +223,6 @@ async function loadImageFile(): Promise<void> {
   sourceImage = downscaleWorkingImage(decoded, MAX_WORKING_IMAGE_SIDE);
   const working = getImageSize(sourceImage);
   currentMasks = [];
-  lastPvsMasks = [];
-  lastPvsLowRes = [];
   clearCandidates();
   redraw();
   writeOutput(
@@ -264,8 +258,6 @@ async function encodeImage(): Promise<void> {
   try {
     await sam3.setImage(sourceImage);
     currentMasks = [];
-    lastPvsMasks = [];
-    lastPvsLowRes = [];
     clearCandidates();
     redraw();
     writeOutput(`图像已编码，耗时 ${(performance.now() - startedAt).toFixed(0)} ms。现在可以输入文本或在图上点选。`);
@@ -293,8 +285,6 @@ async function runTextPrompt(): Promise<void> {
   try {
     taskModeSelect.value = 'pcs';
     currentMasks = await sam3.setTextPrompt(prompt, description);
-    lastPvsMasks = [];
-    lastPvsLowRes = [];
     clearCandidates();
     redraw();
     writeOutput(formatMaskResult('PCS 文本分割', currentMasks, performance.now() - startedAt));
@@ -304,7 +294,7 @@ async function runTextPrompt(): Promise<void> {
 }
 
 async function applyConfidence(): Promise<void> {
-  if (!sam3?.inferenceState?.textEmbeddings) {
+  if (!sam3?.inferenceState?.lastPcsRaw?.length && !sam3?.inferenceState?.textEmbeddings) {
     return;
   }
 
@@ -329,8 +319,6 @@ function resetPrompts(): void {
 
   if (getTaskMode() === 'pvs') {
     sam3.resetVisualPrompts();
-    lastPvsMasks = [];
-    lastPvsLowRes = [];
     clearCandidates();
   } else {
     sam3.resetPrompts();
@@ -407,15 +395,17 @@ async function runPcsInteraction(start: Point, end: Point, isBox: boolean, posit
   const startedAt = performance.now();
 
   try {
-    if (sam3.inferenceState?.text !== prompt || sam3.inferenceState?.textDescription !== description) {
-      await sam3.setTextPrompt(prompt, description);
-    }
-
-    if (isBox) {
-      currentMasks = await sam3.addGeometricPrompt(normalizeRect(start, end), positive);
-    } else {
-      currentMasks = await sam3.addGeometricPoint(start, positive);
-    }
+    const state = sam3.inferenceState;
+    currentMasks = await sam3.predictConcept({
+      text: prompt,
+      description,
+      boxes: isBox
+        ? [...(state?.boxes ?? []), { box: normalizeRect(start, end), label: positive }]
+        : state?.boxes,
+      points: isBox
+        ? state?.points
+        : [...(state?.points ?? []), { point: start, label: positive ? 1 : 0 }],
+    });
 
     redraw();
     writeOutput(formatMaskResult(positive ? 'PCS 正例修正' : 'PCS 负例修正', currentMasks, performance.now() - startedAt));
@@ -439,13 +429,6 @@ async function runPvsInteraction(start: Point, end: Point, isBox: boolean, negat
       ? await sam3.addBox(normalizeRect(start, end))
       : await sam3.addPoint(start, negative ? 0 : 1);
 
-    lastPvsMasks = result.masks;
-    const maskSize = sam3.inferenceState?.pvsMaskInput;
-    lastPvsLowRes = result.lowResMasks.map(logits => ({
-      logits,
-      width: maskSize?.width ?? 288,
-      height: maskSize?.height ?? 288,
-    }));
     const bestIndex = argmax(result.ious);
     currentMasks = [result.masks[bestIndex] ?? result.masks[0]].filter(Boolean);
     renderCandidates(result.ious, bestIndex);
@@ -463,31 +446,15 @@ async function runPvsInteraction(start: Point, end: Point, isBox: boolean, negat
 }
 
 async function usePvsCandidate(index: number): Promise<void> {
-  const mask = lastPvsMasks[index];
-  const lowRes = lastPvsLowRes[index];
-
-  if (!sam3 || !mask || !lowRes) {
+  if (!sam3) {
     return;
   }
 
-  currentMasks = [mask];
-  await setBusy(true, `正在锁定候选 ${index + 1}`);
-
-  try {
-    const result = await sam3.addMask(lowRes);
-    const bestIndex = argmax(result.ious);
-    currentMasks = [result.masks[bestIndex] ?? result.masks[0]].filter(Boolean);
-    lastPvsMasks = result.masks;
-    lastPvsLowRes = result.lowResMasks.map(logits => ({
-      logits,
-      width: lowRes.width,
-      height: lowRes.height,
-    }));
-    redraw();
-    writeOutput(`已选择候选 ${index + 1}。继续点击可在此掩码上精细化。`);
-  } finally {
-    await setBusy(false);
-  }
+  const result = sam3.selectVisualCandidate(index);
+  currentMasks = result.masks;
+  renderCandidates(sam3.inferenceState?.lastPvs?.ious ?? result.ious, index);
+  redraw();
+  writeOutput(`已选择候选 ${index + 1}。继续点击可在此掩码上精细化。`);
 }
 
 function renderCandidates(ious: readonly number[], selectedIndex: number): void {
@@ -525,7 +492,10 @@ function redraw(): void {
   }
 
   if (sam3 && currentMasks.length > 0) {
-    sam3.drawSegmentationEdgePoints(sourceImage, currentMasks, preview, getSegmentationDrawOptions());
+    sam3.drawSegmentationEdgePoints(sourceImage, currentMasks, preview, {
+      ...getSegmentationDrawOptions(),
+      fillSegmentationEdgePoints: !dragStart,
+    });
   } else {
     const { width, height } = getImageSize(sourceImage);
     preview.width = width;
@@ -910,7 +880,13 @@ async function setBusy(busy: boolean, message = '处理中...'): Promise<void> {
   updateButtons();
 
   if (shouldPaint) {
-    await yieldToUi();
+    if (getSelectedExecutionProvider() === 'webgpu') {
+      await new Promise<void>(resolve => {
+        requestAnimationFrame(() => resolve());
+      });
+    } else {
+      await yieldToUi();
+    }
   }
 }
 
