@@ -4,6 +4,7 @@ export {
   getLoadedOrtBundle,
   getOrt,
   initializeOnnxRuntimeWeb,
+  isWebAssemblyJspiAvailable,
   ort,
   resolveOrtBundle,
 } from './runtime';

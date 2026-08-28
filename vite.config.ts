@@ -22,4 +22,7 @@ export default defineConfig({
       'Cross-Origin-Opener-Policy': 'same-origin',
     },
   },
+  optimizeDeps: {
+    include: ['onnxruntime-web/webgpu', 'onnxruntime-web/jspi', 'onnxruntime-web/wasm'],
+  },
 });

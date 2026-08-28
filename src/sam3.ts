@@ -18,6 +18,18 @@ import { ensureOnnxRuntimeWebInitialized, ort } from './runtime';
 import type { Point, Rect, Segmentation, SegmentationDrawingOptions, YoloModelSource } from './types';
 
 const DEFAULT_EXECUTION_PROVIDERS = ['wasm'] as const;
+type Sam3SessionKind = 'vision' | 'text' | 'grounding' | 'prompt';
+
+function usesWebGpu(options: Sam3Options): boolean {
+  const providers = options.sessionOptions?.executionProviders ?? options.executionProviders ?? DEFAULT_EXECUTION_PROVIDERS;
+  return providers.some(provider => {
+    if (typeof provider === 'string') {
+      return provider === 'webgpu';
+    }
+
+    return (provider as { name?: string }).name === 'webgpu';
+  });
+}
 
 export class Sam3 {
   private visionSession: OrtTypes.InferenceSession | null = null;
@@ -27,8 +39,11 @@ export class Sam3 {
   private handler: Sam3Handler | null = null;
   private tokenizer: ClipBpeTokenizer | null = null;
   private state: Sam3InferenceState | null = null;
+  private readonly webGpu: boolean;
 
-  constructor(private readonly options: Sam3Options) {}
+  constructor(private readonly options: Sam3Options) {
+    this.webGpu = usesWebGpu(options);
+  }
 
   static async create(options: Sam3Options): Promise<Sam3> {
     const sam3 = new Sam3(options);
@@ -45,23 +60,36 @@ export class Sam3 {
   }
 
   async load(): Promise<this> {
+    const defaultNumThreads = this.webGpu ? 0 : 1;
     await ensureOnnxRuntimeWebInitialized({
       ...this.options,
-      numThreads: this.options.numThreads ?? 1,
+      numThreads: this.options.numThreads ?? defaultNumThreads,
     });
+    if (ort.env.wasm) {
+      ort.env.wasm.numThreads = this.options.numThreads ?? defaultNumThreads;
+      ort.env.wasm.proxy = this.options.proxy ?? false;
+      ort.env.wasm.simd = true;
+    }
+
+    if (this.webGpu) {
+      const webgpu = (ort.env as { webgpu?: { powerPreference?: 'low-power' | 'high-performance' } }).webgpu;
+      if (webgpu && webgpu.powerPreference === undefined) {
+        webgpu.powerPreference = 'high-performance';
+      }
+    }
+
     await this.dispose();
 
-    const sessionOptions = this.createSessionOptions();
     const progress = this.options.onLoadProgress;
     progress?.('正在加载视觉编码器...');
-    this.visionSession = await this.createSession(this.options.visionEncoder, sessionOptions, 'vision-encoder');
+    this.visionSession = await this.createSession('vision', this.options.visionEncoder);
     progress?.('正在加载文本编码器...');
-    this.textSession = await this.createSession(this.options.textEncoder, sessionOptions, 'text-encoder');
+    this.textSession = await this.createSession('text', this.options.textEncoder);
     progress?.('正在加载概念分割解码器...');
-    this.groundingSession = await this.createSession(this.options.groundingDecoder, sessionOptions, 'grounding-decoder');
+    this.groundingSession = await this.createSession('grounding', this.options.groundingDecoder);
     if (this.options.promptDecoder) {
       progress?.('正在加载视觉分割解码器...');
-      this.promptSession = await this.createSession(this.options.promptDecoder, sessionOptions, 'prompt-decoder');
+      this.promptSession = await this.createSession('prompt', this.options.promptDecoder);
     } else {
       this.promptSession = null;
     }
@@ -85,6 +113,7 @@ export class Sam3 {
         pixelConfidence: this.options.pixelConfidence ?? 0.5,
         imageSize: this.options.imageSize ?? SAM3_IMAGE_SIZE,
         maskSize: this.options.maskSize ?? SAM3_MASK_SIZE,
+        webGpu: this.webGpu,
       },
     );
     return this;
@@ -181,6 +210,7 @@ export class Sam3 {
   }
 
   async dispose(): Promise<void> {
+    this.handler?.dispose();
     const sessions = [this.visionSession, this.textSession, this.groundingSession, this.promptSession];
     this.visionSession = null;
     this.textSession = null;
@@ -192,45 +222,64 @@ export class Sam3 {
     await Promise.all(sessions.filter(Boolean).map(session => session?.release()));
   }
 
-  private createSessionOptions(): OrtTypes.InferenceSession.SessionOptions {
+  private createSessionOptions(kind: Sam3SessionKind): OrtTypes.InferenceSession.SessionOptions {
     const userOptions = this.options.sessionOptions ?? {};
     const userExtra = (userOptions.extra ?? {}) as Record<string, unknown>;
     const userSession = (userExtra.session ?? {}) as Record<string, unknown>;
-
-    return {
-      enableCpuMemArena: false,
-      enableMemPattern: false,
+    const keepVisionOnGpu = this.webGpu && kind === 'vision';
+    const options: OrtTypes.InferenceSession.SessionOptions = {
+      enableCpuMemArena: true,
+      enableMemPattern: true,
       ...userOptions,
       graphOptimizationLevel: userOptions.graphOptimizationLevel ?? 'disabled',
       extra: {
         ...userExtra,
         session: {
           strict_shape_type_inference: '0',
+          ...(keepVisionOnGpu ? { use_device_allocator_for_initializers: '1' } : {}),
           ...userSession,
         },
       },
-      executionProviders:
-        userOptions.executionProviders ??
-        ([...(this.options.executionProviders ?? DEFAULT_EXECUTION_PROVIDERS)] as OrtTypes.InferenceSession.SessionOptions['executionProviders']),
+      executionProviders: userOptions.executionProviders ?? this.createExecutionProviders(),
     };
+
+    if (keepVisionOnGpu && options.preferredOutputLocation == null) {
+      options.preferredOutputLocation = 'gpu-buffer';
+    }
+
+    return options;
   }
 
-  private async createSession(
-    model: YoloModelSource,
-    options: OrtTypes.InferenceSession.SessionOptions,
-    label: string,
-  ): Promise<OrtTypes.InferenceSession> {
+  private createExecutionProviders(): OrtTypes.InferenceSession.SessionOptions['executionProviders'] {
+    const providers = [...(this.options.executionProviders ?? DEFAULT_EXECUTION_PROVIDERS)];
+    if (!this.webGpu) {
+      return providers as OrtTypes.InferenceSession.SessionOptions['executionProviders'];
+    }
+
+    return providers.map(provider => {
+      if (provider === 'webgpu') {
+        return { name: 'webgpu', preferredLayout: 'NCHW', validationMode: 'wgpuOnly' };
+      }
+
+      return provider;
+    }) as OrtTypes.InferenceSession.SessionOptions['executionProviders'];
+  }
+
+  private async createSession(kind: Sam3SessionKind, model: YoloModelSource): Promise<OrtTypes.InferenceSession> {
+    const label = `${kind}-encoder`;
+    const options = this.createSessionOptions(kind);
+
     try {
-      if (typeof model === 'string') {
-        return await ort.InferenceSession.create(model, options);
-      }
-
-      if (model instanceof Uint8Array) {
-        return await ort.InferenceSession.create(model, options);
-      }
-
-      return await ort.InferenceSession.create(model, options);
+      return await this.createSessionWithOptions(model, options);
     } catch (error) {
+      if (kind === 'vision' && this.webGpu && options.preferredOutputLocation === 'gpu-buffer') {
+        try {
+          return await this.createSessionWithOptions(model, { ...options, preferredOutputLocation: undefined });
+        } catch {
+          // fall through to the original error
+        }
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       if (/bad_alloc/i.test(message)) {
         throw new Error(
@@ -239,6 +288,21 @@ export class Sam3 {
       }
       throw new Error(`Failed to create SAM3 session "${label}": ${message}`);
     }
+  }
+
+  private async createSessionWithOptions(
+    model: YoloModelSource,
+    options: OrtTypes.InferenceSession.SessionOptions,
+  ): Promise<OrtTypes.InferenceSession> {
+    if (typeof model === 'string') {
+      return ort.InferenceSession.create(model, options);
+    }
+
+    if (model instanceof Uint8Array) {
+      return ort.InferenceSession.create(model, options);
+    }
+
+    return ort.InferenceSession.create(model, options);
   }
 
   private ensureHandler(): Sam3Handler {

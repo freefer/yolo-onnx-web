@@ -168,6 +168,7 @@ async function loadModels(): Promise<void> {
   try {
     const sources = await resolveModelSources();
     const executionProvider = getSelectedExecutionProvider();
+    const wasmMode = executionProvider === 'wasm';
     const next = await Sam3.create({
       visionEncoder: sources.vision,
       textEncoder: sources.text,
@@ -176,7 +177,7 @@ async function loadModels(): Promise<void> {
       tokenizer: sources.tokenizer,
       wasmPaths: ORT_WASM_PATHS,
       executionProviders: [executionProvider],
-      numThreads: 1,
+      numThreads: wasmMode ? 1 : 0,
       confidenceThreshold: getThresholdValue(confidenceInput, 0.5),
       onLoadProgress: message => {
         void setBusy(true, message);
@@ -195,6 +196,7 @@ async function loadModels(): Promise<void> {
       [
         'SAM3 模型已加载',
         `executionProviders: ${executionProvider}`,
+        `ortBundle: ${getLoadedOrtBundle() ?? 'unknown'}`,
         `ortSource: ${ORT_SOURCE}`,
         'sessions: vision / text / grounding / prompt',
         'tokenizer: clip_bpe.json',
@@ -249,7 +251,14 @@ async function encodeImage(): Promise<void> {
     throw new Error('请先选择一张图片。');
   }
 
-  await setBusy(true, '正在编码图像特征...');
+  await setBusy(
+    true,
+    getSelectedExecutionProvider() === 'wasm'
+      ? '正在编码图像特征...'
+      : getLoadedOrtBundle() === 'jspi'
+        ? '正在编码图像特征（WebGPU + JSPI，特征保留在显存）...'
+        : '正在编码图像特征（WebGPU，特征保留在显存）...',
+  );
   const startedAt = performance.now();
 
   try {

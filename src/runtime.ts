@@ -1,7 +1,7 @@
 import type * as OrtTypes from 'onnxruntime-web';
 import type { OnnxRuntimeWebOptions, YoloExecutionProvider, YoloOptions } from './types';
 
-export type OrtBundle = 'auto' | 'webgpu' | 'wasm' | 'webgl' | 'all';
+export type OrtBundle = 'auto' | 'webgpu' | 'jspi' | 'wasm' | 'webgl' | 'all';
 export type OrtModule = typeof import('onnxruntime-web/webgpu');
 
 let ortModule: OrtModule | null = null;
@@ -9,9 +9,18 @@ let loadedBundle: Exclude<OrtBundle, 'auto'> | null = null;
 let loadingPromise: Promise<OrtModule> | null = null;
 
 /**
+ * Chrome 137+ / Edge expose JSPI as `WebAssembly.Suspending`.
+ * The JSPI WebGPU build avoids Asyncify, which otherwise blocks the UI during SAM3 encode.
+ */
+export function isWebAssemblyJspiAvailable(): boolean {
+  const wasm = globalThis.WebAssembly as (typeof WebAssembly & { Suspending?: unknown }) | undefined;
+  return Boolean(wasm && 'Suspending' in wasm);
+}
+
+/**
  * Resolve which onnxruntime-web entry to load.
  *
- * - webgpu → `onnxruntime-web/webgpu` (native WebGPU EP, also supports wasm)
+ * - webgpu → `onnxruntime-web/jspi` when JSPI is available, otherwise `onnxruntime-web/webgpu` (Asyncify)
  * - webgl → `onnxruntime-web/webgl`
  * - webnn → `onnxruntime-web/all` (JSEP; required for WebNN)
  * - otherwise → `onnxruntime-web/wasm`
@@ -38,7 +47,7 @@ export function resolveOrtBundle(
   );
 
   if (names.has('webgpu')) {
-    return 'webgpu';
+    return isWebAssemblyJspiAvailable() ? 'jspi' : 'webgpu';
   }
 
   if (names.has('webgl')) {
@@ -61,8 +70,8 @@ export function canReuseOrtBundle(
     return true;
   }
 
-  // Native WebGPU bundle also includes wasm EP.
-  if (loaded === 'webgpu' && requested === 'wasm') {
+  // Native WebGPU / JSPI bundles also include wasm EP.
+  if ((loaded === 'webgpu' || loaded === 'jspi') && requested === 'wasm') {
     return true;
   }
 
@@ -76,6 +85,8 @@ export function canReuseOrtBundle(
 
 async function importOrtBundle(bundle: Exclude<OrtBundle, 'auto'>): Promise<OrtModule> {
   switch (bundle) {
+    case 'jspi':
+      return import('onnxruntime-web/jspi');
     case 'webgpu':
       return import('onnxruntime-web/webgpu');
     case 'webgl':

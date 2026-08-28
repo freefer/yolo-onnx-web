@@ -19,6 +19,7 @@ export default defineConfig({
   resolve: {
     alias: {
       'onnxruntime-web/webgpu': `${ORT_CDN_BASE}/ort.webgpu.bundle.min.mjs`,
+      'onnxruntime-web/jspi': `${ORT_CDN_BASE}/ort.jspi.bundle.min.mjs`,
       'onnxruntime-web/wasm': `${ORT_CDN_BASE}/ort.wasm.bundle.min.mjs`,
       'onnxruntime-web/webgl': `${ORT_CDN_BASE}/ort.webgl.min.mjs`,
       'onnxruntime-web/all': `${ORT_CDN_BASE}/ort.all.bundle.min.mjs`,

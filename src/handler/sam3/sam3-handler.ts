@@ -9,8 +9,6 @@ import {
   logitsToSegmentation,
 } from './postprocess';
 import {
-  SAM3_IMAGE_SIZE,
-  SAM3_MASK_SIZE,
   boxToModelCorners,
   clamp,
   pointToModel,
@@ -21,6 +19,7 @@ import {
   composeTextQuery,
   packPcsGeometricPrompts,
 } from './preprocess';
+import { Sam3WebGpuPreprocessor, waitForWebGpuOutputs } from './webgpu-preprocess';
 import type {
   Sam3InferenceState,
   Sam3MaskPrompt,
@@ -123,6 +122,8 @@ function prepareMaskInput(maskInput: Sam3MaskPrompt | null | undefined, maskSize
 }
 
 export class Sam3Handler {
+  private readonly webGpuPreprocessor: Sam3WebGpuPreprocessor | null;
+
   constructor(
     private readonly visionSession: OrtTypes.InferenceSession,
     private readonly textSession: OrtTypes.InferenceSession,
@@ -134,8 +135,11 @@ export class Sam3Handler {
       pixelConfidence: number;
       imageSize: number;
       maskSize: number;
+      webGpu: boolean;
     },
-  ) {}
+  ) {
+    this.webGpuPreprocessor = options.webGpu ? new Sam3WebGpuPreprocessor() : null;
+  }
 
   setConfidenceThreshold(threshold: number, state?: Sam3InferenceState | null): number {
     this.options.confidenceThreshold = threshold;
@@ -146,16 +150,56 @@ export class Sam3Handler {
     return this.forwardAllTextPrompts(state);
   }
 
+  dispose(): void {
+    this.webGpuPreprocessor?.dispose();
+  }
+
   async setImage(image: YoloImageSource, state?: Sam3InferenceState | null): Promise<Sam3InferenceState> {
     if (state?.vision) {
       this.releaseVision(state.vision);
     }
 
-    const input = preprocessSam3Image(image, this.options.imageSize);
-    const result = await this.visionSession.run(
-      pickFeeds(this.visionSession, {
-        images: tensorFloat(input.data, [1, 3, input.height, input.width]),
-      }),
+    const preprocessStarted = performance.now();
+    const input = await this.prepareImage(image);
+    const preprocessMs = performance.now() - preprocessStarted;
+    if (typeof (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler?.yield === 'function') {
+      await (globalThis as { scheduler?: { yield: () => Promise<void> } }).scheduler!.yield();
+    }
+    let imageTensor = input.tensor ?? tensorFloat(input.data, [1, 3, input.height, input.width]);
+    let result: OrtTypes.InferenceSession.OnnxValueMapType;
+    let runMs = 0;
+    let fenceMs = 0;
+
+    try {
+      try {
+        const runStarted = performance.now();
+        result = await this.visionSession.run(pickFeeds(this.visionSession, { images: imageTensor }));
+        runMs = performance.now() - runStarted;
+      } catch (error) {
+        if (!input.tensor) {
+          throw error;
+        }
+
+        console.warn('[SAM3] GPU image tensor was rejected. Falling back to CPU input.', error);
+        imageTensor.dispose?.();
+        const cpu = preprocessSam3Image(image, this.options.imageSize);
+        imageTensor = tensorFloat(cpu.data, [1, 3, cpu.height, cpu.width]);
+        const runStarted = performance.now();
+        result = await this.visionSession.run(pickFeeds(this.visionSession, { images: imageTensor }));
+        runMs = performance.now() - runStarted;
+      }
+
+      if (this.options.webGpu) {
+        const fenceStarted = performance.now();
+        await waitForWebGpuOutputs(result);
+        fenceMs = performance.now() - fenceStarted;
+      }
+    } finally {
+      imageTensor.dispose?.();
+    }
+
+    console.info(
+      `[SAM3] encode preprocess=${preprocessMs.toFixed(0)}ms run=${runMs.toFixed(0)}ms fence=${fenceMs.toFixed(0)}ms total=${(preprocessMs + runMs + fenceMs).toFixed(0)}ms`,
     );
 
     return {
@@ -544,14 +588,26 @@ export class Sam3Handler {
     return masks;
   }
 
+  private async prepareImage(image: YoloImageSource) {
+    if (this.webGpuPreprocessor) {
+      try {
+        return await this.webGpuPreprocessor.process(image, this.options.imageSize);
+      } catch (error) {
+        console.warn('[SAM3] WebGPU preprocessing failed. Falling back to CPU preprocessing.', error);
+      }
+    }
+
+    return preprocessSam3Image(image, this.options.imageSize);
+  }
+
   private ensureImage(state: Sam3InferenceState): void {
     if (!state?.vision) {
       throw new Error('You must call setImage() before prompting SAM3.');
     }
   }
 
-  private releaseTensors(tensors: Record<string, OrtTypes.Tensor | undefined>): void {
-    for (const tensor of Object.values(tensors)) {
+  private releaseTensors(tensors: object): void {
+    for (const tensor of Object.values(tensors as Record<string, { dispose?: () => void } | undefined>)) {
       tensor?.dispose?.();
     }
   }

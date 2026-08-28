@@ -7,6 +7,15 @@ export const SAM3_TEXT_LENGTH = 32;
 export const SAM3_MEAN = 0.5;
 export const SAM3_STD = 0.5;
 
+const PIXEL_SCALE = 1 / (255 * SAM3_STD);
+const PIXEL_BIAS = -SAM3_MEAN / SAM3_STD;
+
+let cpuCanvas: HTMLCanvasElement | null = null;
+let cpuContext: CanvasRenderingContext2D | null = null;
+let gpuCanvas: HTMLCanvasElement | null = null;
+let gpuContext: CanvasRenderingContext2D | null = null;
+let cpuTensorData: Float32Array | null = null;
+
 export function getImageSize(image: YoloImageSource): { width: number; height: number } {
   if (image instanceof HTMLVideoElement) {
     return { width: image.videoWidth, height: image.videoHeight };
@@ -31,6 +40,51 @@ export function getImageSize(image: YoloImageSource): { width: number; height: n
 function enableHighQualitySmoothing(context: CanvasRenderingContext2D): void {
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = 'high';
+}
+
+function getCachedCanvas(
+  imageSize: number,
+  willReadFrequently: boolean,
+): { canvas: HTMLCanvasElement; context: CanvasRenderingContext2D } {
+  const existingCanvas = willReadFrequently ? cpuCanvas : gpuCanvas;
+  const existingContext = willReadFrequently ? cpuContext : gpuContext;
+
+  if (existingCanvas && existingContext && existingCanvas.width === imageSize && existingCanvas.height === imageSize) {
+    return { canvas: existingCanvas, context: existingContext };
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = imageSize;
+  canvas.height = imageSize;
+  const context = canvas.getContext('2d', { willReadFrequently });
+
+  if (!context) {
+    throw new Error('Failed to create a 2D canvas context for SAM3 preprocessing.');
+  }
+
+  if (willReadFrequently) {
+    cpuCanvas = canvas;
+    cpuContext = context;
+  } else {
+    gpuCanvas = canvas;
+    gpuContext = context;
+  }
+
+  return { canvas, context };
+}
+
+/**
+ * Stretch the source image to the SAM3 square canvas with progressive downsampling.
+ */
+export function renderSam3ImageToCanvas(
+  image: YoloImageSource,
+  imageSize = SAM3_IMAGE_SIZE,
+  willReadFrequently = true,
+): { canvas: HTMLCanvasElement; context: CanvasRenderingContext2D; sourceWidth: number; sourceHeight: number } {
+  const { width: sourceWidth, height: sourceHeight } = getImageSize(image);
+  const { canvas, context } = getCachedCanvas(imageSize, willReadFrequently);
+  drawImageHighQuality(context, image, sourceWidth, sourceHeight, imageSize, imageSize);
+  return { canvas, context, sourceWidth, sourceHeight };
 }
 
 /**
@@ -77,25 +131,17 @@ export function preprocessSam3Image(
   image: YoloImageSource,
   imageSize = SAM3_IMAGE_SIZE,
 ): Sam3ImageTensor {
-  const { width: sourceWidth, height: sourceHeight } = getImageSize(image);
-  const canvas = document.createElement('canvas');
-  canvas.width = imageSize;
-  canvas.height = imageSize;
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-
-  if (!context) {
-    throw new Error('Failed to create a 2D canvas context for SAM3 preprocessing.');
-  }
-
-  drawImageHighQuality(context, image, sourceWidth, sourceHeight, imageSize, imageSize);
+  const { context, sourceWidth, sourceHeight } = renderSam3ImageToCanvas(image, imageSize, true);
   const pixels = context.getImageData(0, 0, imageSize, imageSize).data;
   const plane = imageSize * imageSize;
-  const data = new Float32Array(3 * plane);
+  const dataLength = 3 * plane;
+  const data = cpuTensorData && cpuTensorData.length === dataLength ? cpuTensorData : new Float32Array(dataLength);
+  cpuTensorData = data;
 
   for (let pixel = 0, offset = 0; pixel < plane; pixel += 1, offset += 4) {
-    data[pixel] = (pixels[offset] / 255 - SAM3_MEAN) / SAM3_STD;
-    data[plane + pixel] = (pixels[offset + 1] / 255 - SAM3_MEAN) / SAM3_STD;
-    data[plane * 2 + pixel] = (pixels[offset + 2] / 255 - SAM3_MEAN) / SAM3_STD;
+    data[pixel] = pixels[offset] * PIXEL_SCALE + PIXEL_BIAS;
+    data[plane + pixel] = pixels[offset + 1] * PIXEL_SCALE + PIXEL_BIAS;
+    data[plane * 2 + pixel] = pixels[offset + 2] * PIXEL_SCALE + PIXEL_BIAS;
   }
 
   return { data, width: imageSize, height: imageSize, sourceWidth, sourceHeight };

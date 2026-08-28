@@ -111,6 +111,8 @@ export interface Sam3ImageTensor {
   height: number;
   sourceWidth: number;
   sourceHeight: number;
+  /** WebGPU 预处理得到的 GPU 输入，存在时编码不再走 CPU Float32Array。 */
+  tensor?: ort.Tensor;
 }
 
 export type Sam3ImageInput = YoloImageSource;
