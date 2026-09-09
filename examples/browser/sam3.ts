@@ -4,6 +4,7 @@ import {
   getLoadedOrtBundle,
   resolveOrtBundle,
   Sam3,
+  Sam3HoverPreview,
   splitTextPrompts,
   YoloWebExecutionProviderOptions,
 } from '../../src';
@@ -57,6 +58,8 @@ type TaskMode = 'pcs' | 'pvs';
 type PromptPolarity = 'positive' | 'negative';
 
 let sam3: Sam3 | null = null;
+let hoverPreview: Sam3HoverPreview | null = null;
+let hoverMask: Segmentation | null = null;
 let sourceImage: DemoImage | null = null;
 let currentMasks: Segmentation[] = [];
 let dragStart: Point | null = null;
@@ -184,6 +187,8 @@ async function loadModels(): Promise<void> {
 
     await sam3?.dispose();
     sam3 = next;
+    hoverPreview = null;
+    hoverMask = null;
     sourceImage = null;
     currentMasks = [];
     clearCandidates();
@@ -258,6 +263,8 @@ async function encodeImage(): Promise<void> {
   try {
     await sam3.setImage(sourceImage);
     currentMasks = [];
+    hoverMask = null;
+    hoverPreview?.clear();
     clearCandidates();
     redraw();
     writeOutput(`图像已编码，耗时 ${(performance.now() - startedAt).toFixed(0)} ms。现在可以输入文本或在图上点选。`);
@@ -325,6 +332,8 @@ function resetPrompts(): void {
   }
 
   currentMasks = [];
+  hoverMask = null;
+  hoverPreview?.clear();
   redraw();
   writeOutput(getTaskMode() === 'pvs' ? '已清空 PVS 点/框/掩码。' : '已清空 PCS 文本与范例。');
 }
@@ -340,12 +349,17 @@ function handlePointerDown(event: PointerEvent): void {
 }
 
 function handlePointerMove(event: PointerEvent): void {
-  if (!dragStart) {
+  if (dragStart) {
+    dragCurrent = eventToImagePoint(event);
+    redraw();
     return;
   }
 
-  dragCurrent = eventToImagePoint(event);
-  redraw();
+  if (isBusy || getTaskMode() !== 'pvs' || !sam3?.inferenceState) {
+    return;
+  }
+
+  ensureHoverPreview()?.queuePointer(event, preview);
 }
 
 async function handlePointerUp(event: PointerEvent): Promise<void> {
@@ -503,6 +517,13 @@ function redraw(): void {
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = 'high';
     context.drawImage(sourceImage, 0, 0, width, height);
+  }
+
+  if (sam3 && hoverMask && !dragStart && getTaskMode() === 'pvs') {
+    sam3.drawMask(context, hoverMask, {
+      fill: 'rgba(124, 58, 237, 0.32)',
+      stroke: '#7c3aed',
+    });
   }
 
   drawPromptOverlay(context);
@@ -737,11 +758,29 @@ function downscaleWorkingImage(image: HTMLImageElement, maxSide: number): DemoIm
 }
 
 function eventToImagePoint(event: PointerEvent): Point {
-  const rect = preview.getBoundingClientRect();
-  return {
-    x: ((event.clientX - rect.left) / rect.width) * preview.width,
-    y: ((event.clientY - rect.top) / rect.height) * preview.height,
-  };
+  return Sam3.pointerToImagePoint(event, preview);
+}
+
+function ensureHoverPreview(): Sam3HoverPreview | null {
+  if (!sam3) {
+    return null;
+  }
+
+  if (!hoverPreview) {
+    hoverPreview = sam3.createHoverPreview({
+      minMove: 2,
+      pick: 'smallest',
+      isolateComponent: true,
+      onResult: result => {
+        hoverMask = result?.mask ?? null;
+        if (!dragStart) {
+          redraw();
+        }
+      },
+    });
+  }
+
+  return hoverPreview;
 }
 
 function normalizeRect(start: Point, end: Point): Rect {
@@ -857,7 +896,7 @@ function updateHint(): void {
   hint.textContent =
     getTaskMode() === 'pcs'
       ? 'PCS：类别用逗号分隔，例如 person, car, dog。详细描述可选，用来补充颜色、姿态、场景；查询时会加到每个类别上，标签仍用类别名。'
-      : 'PVS：左键加点，拖拽画框，只分割当前点/框里的那一件；右键或极性选“负例”添加背景点。';
+      : 'PVS：移动鼠标悬停预览，左键加点，拖拽画框，只分割当前点/框里的那一件；右键或极性选“负例”添加背景点。';
 }
 
 function yieldToUi(): Promise<void> {

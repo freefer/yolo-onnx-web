@@ -255,37 +255,134 @@ export class DrawTool {
 
   static extractSegmentationEdgePoints(segmentation: Segmentation): { x: number; y: number }[] {
     const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
+    const destWidth = right - left;
+    const destHeight = bottom - top;
+    const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
 
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
       return [];
     }
 
-    const expectedBytes = Math.ceil((width * height) / 8);
-    if (segmentation.bitPackedPixelMask.byteLength < expectedBytes) {
-      return segmentation.segmentationEdgePoints ?? [];
-    }
-
     const edgeKeys = new Set<number>();
-
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const pixelIndex = y * width + x;
-
-        if (!this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, width, height)) {
+    for (let y = 0; y < maskHeight; y += 1) {
+      for (let x = 0; x < maskWidth; x += 1) {
+        const pixelIndex = y * maskWidth + x;
+        if (!this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, maskWidth, maskHeight)) {
           continue;
         }
-
         edgeKeys.add(pixelIndex);
       }
     }
 
-    return this.traceOrderedEdgePoints(edgeKeys, left, top, width);
+    const local = this.traceOrderedEdgePoints(edgeKeys, 0, 0, maskWidth);
+    const scaleX = destWidth / maskWidth;
+    const scaleY = destHeight / maskHeight;
+    return local.map(point => ({
+      x: left + point.x * scaleX,
+      y: top + point.y * scaleY,
+    }));
   }
 
   static extractSegmentationsEdgePoints(segmentations: readonly Segmentation[]): { x: number; y: number }[][] {
     return segmentations.map(segmentation => this.extractSegmentationEdgePoints(segmentation));
+  }
+
+  static extractSegmentationContours(segmentation: Segmentation): Point[][] {
+    return this.splitEdgeContours(this.extractSegmentationEdgePoints(segmentation));
+  }
+
+  static splitEdgeContours(points: readonly Point[]): Point[][] {
+    if (points.length === 0) {
+      return [];
+    }
+
+    const maxGap = this.estimateEdgeStep(points) * 1.51;
+    const contours: Point[][] = [];
+    let current: Point[] = [];
+    let previous: Point | null = null;
+
+    for (const point of points) {
+      const gap = previous
+        ? Math.max(Math.abs(point.x - previous.x), Math.abs(point.y - previous.y))
+        : Number.POSITIVE_INFINITY;
+      if (!previous || gap > maxGap) {
+        if (current.length >= 3) {
+          contours.push(current);
+        }
+        current = [point];
+      } else {
+        current.push(point);
+      }
+      previous = point;
+    }
+
+    if (current.length >= 3) {
+      contours.push(current);
+    }
+
+    return contours;
+  }
+
+  static estimateEdgeStep(points: readonly Point[]): number {
+    let minStep = Number.POSITIVE_INFINITY;
+    const limit = Math.min(points.length, 256);
+
+    for (let index = 1; index < limit; index += 1) {
+      const step = Math.max(
+        Math.abs((points[index]?.x ?? 0) - (points[index - 1]?.x ?? 0)),
+        Math.abs((points[index]?.y ?? 0) - (points[index - 1]?.y ?? 0)),
+      );
+
+      if (step > 1e-6 && step < minStep) {
+        minStep = step;
+      }
+    }
+
+    return Number.isFinite(minStep) ? minStep : 1;
+  }
+
+  static drawPackedMaskOverlay(
+    context: CanvasRenderingContext2D,
+    segmentation: Segmentation,
+    options: { fill?: string; stroke?: string; dest?: Rect } = {},
+  ): void {
+    const box = options.dest ?? segmentation.boundingBox;
+    const destWidth = box.right - box.left;
+    const destHeight = box.bottom - box.top;
+    const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
+
+    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
+      return;
+    }
+
+    const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
+    const fill = this.parseCanvasColor(options.fill ?? 'rgba(34, 197, 94, 0.35)');
+    const stroke = this.parseCanvasColor(options.stroke ?? options.fill ?? '#22c55e');
+    const pixels = imageData.data;
+    const total = maskWidth * maskHeight;
+    const packed = segmentation.bitPackedPixelMask;
+
+    for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
+      if (!this.isPackedMaskSet(packed, pixelIndex)) {
+        continue;
+      }
+
+      const x = pixelIndex % maskWidth;
+      const y = (pixelIndex / maskWidth) | 0;
+      const edge = this.isSegmentationEdgePixel(packed, pixelIndex, x, y, maskWidth, maskHeight);
+      const color = edge ? stroke : fill;
+      const offset = pixelIndex * 4;
+      pixels[offset] = color.r;
+      pixels[offset + 1] = color.g;
+      pixels[offset + 2] = color.b;
+      pixels[offset + 3] = edge ? Math.max(color.a, 200) : fill.a;
+    }
+
+    maskContext.putImageData(imageData, 0, 0);
+    context.save();
+    context.imageSmoothingEnabled = false;
+    context.drawImage(maskCanvas, 0, 0, maskWidth, maskHeight, box.left, box.top, destWidth, destHeight);
+    context.restore();
   }
 
   private static traceOrderedEdgePoints(edgeKeys: Set<number>, left: number, top: number, width: number): { x: number; y: number }[] {
@@ -645,7 +742,7 @@ export class DrawTool {
 
     for (let index = 0; index < segmentations.length; index += 1) {
       const segmentation = segmentations[index];
-      const points =   segmentation.segmentationEdgePoints ?? this.extractSegmentationEdgePoints(segmentation);
+      const contours = this.extractSegmentationContours(segmentation);
       const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
       const fillColor = this.getDetectionColor(
         segmentation,
@@ -658,7 +755,7 @@ export class DrawTool {
           this.drawSegmentationMask(context, segmentation, fillColor);
         }
 
-        this.drawOrderedEdgePoints(context, points, strokeColor, thickness);
+        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
       }
     }
 
@@ -667,57 +764,55 @@ export class DrawTool {
     }
   }
 
-  private static drawOrderedEdgePoints(
+  private static drawOrderedEdgeContours(
     context: CanvasRenderingContext2D,
-    points: readonly Point[],
+    contours: readonly Point[][],
     strokeColor: string,
     thickness: number,
     fillColor?: string,
   ): void {
-    if (points.length === 0) {
+    if (contours.length === 0) {
       return;
     }
-
-    const step = this.estimateEdgeStep(points);
-    const maxGap = step * 1.51;
 
     context.save();
     context.lineWidth = thickness;
     context.lineJoin = 'round';
     context.lineCap = 'round';
+    context.strokeStyle = strokeColor;
 
-    let previousPoint: Point | null = null;
-    let hasPath = false;
-
-    context.beginPath();
-
-    for (const point of points) {
-      const gap = previousPoint
-        ? Math.max(Math.abs(point.x - previousPoint.x), Math.abs(point.y - previousPoint.y))
-        : Number.POSITIVE_INFINITY;
-
-      if (!previousPoint || gap > maxGap) {
-        context.moveTo(point.x, point.y);
-      } else {
-        context.lineTo(point.x, point.y);
+    for (const contour of contours) {
+      if (contour.length === 0) {
+        continue;
       }
 
-      hasPath = true;
-      previousPoint = point;
-    }
+      context.beginPath();
+      context.moveTo(contour[0].x, contour[0].y);
+      for (let index = 1; index < contour.length; index += 1) {
+        context.lineTo(contour[index].x, contour[index].y);
+      }
 
-    if (hasPath && fillColor) {
-      context.closePath();
-      context.fillStyle = fillColor;
-      context.fill();
-    }
+      if (fillColor && this.isMostlyClosedContour(contour)) {
+        context.closePath();
+        context.fillStyle = fillColor;
+        context.fill();
+      }
 
-    if (hasPath) {
-      context.strokeStyle = strokeColor;
       context.stroke();
     }
 
     context.restore();
+  }
+
+  private static isMostlyClosedContour(points: readonly Point[]): boolean {
+    if (points.length < 3) {
+      return false;
+    }
+
+    const first = points[0];
+    const last = points[points.length - 1];
+    const gap = Math.max(Math.abs(first.x - last.x), Math.abs(first.y - last.y));
+    return gap <= Math.max(this.estimateEdgeStep(points) * 3, 4);
   }
 
   private static resolvePackedMaskSize(segmentation: Segmentation): { width: number; height: number } {
@@ -741,24 +836,6 @@ export class DrawTool {
     const maskHeight = Math.max(1, Math.round(Math.sqrt(packedBits / Math.max(aspect, 1e-6))));
     const maskWidth = Math.max(1, Math.round(maskHeight * aspect));
     return { width: maskWidth, height: maskHeight };
-  }
-
-  private static estimateEdgeStep(points: readonly Point[]): number {
-    let minStep = Number.POSITIVE_INFINITY;
-    const limit = Math.min(points.length, 256);
-
-    for (let index = 1; index < limit; index += 1) {
-      const step = Math.max(
-        Math.abs((points[index]?.x ?? 0) - (points[index - 1]?.x ?? 0)),
-        Math.abs((points[index]?.y ?? 0) - (points[index - 1]?.y ?? 0)),
-      );
-
-      if (step > 1e-6 && step < minStep) {
-        minStep = step;
-      }
-    }
-
-    return Number.isFinite(minStep) ? minStep : 1;
   }
 
   private static isSegmentationEdgePixel(

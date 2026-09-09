@@ -5,15 +5,27 @@ import { ClipBpeTokenizer, loadClipTokenizer } from './handler/sam3/clip-tokeniz
 import { SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH } from './handler/sam3/preprocess';
 import type {
   Sam3BoxPrompt,
+  Sam3HoverBoxOptions,
+  Sam3HoverPointOptions,
+  Sam3HoverPreviewOptions,
+  Sam3HoverResult,
+  Sam3HoverSelectOptions,
   Sam3ImageInput,
   Sam3InferenceState,
+  Sam3MaskOverlayOptions,
+  Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
   Sam3Options,
   Sam3PcsPrompt,
+  Sam3PointerLike,
+  Sam3PointerToImageOptions,
   Sam3PointPrompt,
   Sam3PvsPrompt,
   Sam3PvsResult,
 } from './handler/sam3/types';
+import { Sam3HoverPreview } from './handler/sam3/sam3-hover';
+import { isolateMaskComponent, maskToPolygon, pickBestMask } from './handler/sam3/sam3-mask';
+import { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 import { ensureOnnxRuntimeWebInitialized, ort } from './runtime';
 import type { Point, Rect, Segmentation, SegmentationDrawingOptions, YoloModelSource } from './types';
 
@@ -202,6 +214,195 @@ export class Sam3 {
     return this.ensureHandler().addMask(mask, this.ensureState());
   }
 
+  /**
+   * 悬停/点选预览：默认每次独立单点，不写入 PVS 累积状态。
+   * 填充请用 {@link drawMask}（像素掩码），不要把拼接边点当一个多边形描边。
+   */
+  async hoverPoint(point: Point, options: Sam3HoverPointOptions = {}): Promise<Sam3HoverResult> {
+    const label = options.label ?? 1;
+    if (options.mode === 'accumulate') {
+      const result = await this.addPoint(point, label);
+      return this.selectHoverMask(result, {
+        ...options,
+        promptPoint: point,
+      });
+    }
+
+    return this.hoverVisual(
+      {
+        points: [{ point, label }],
+        box: null,
+        maskInput: options.refinePrevious ? undefined : null,
+        multimaskOutput: options.multimaskOutput ?? true,
+        persist: false,
+      },
+      { ...options, promptPoint: point },
+    );
+  }
+
+  async hoverBox(box: Rect, options: Sam3HoverBoxOptions = {}): Promise<Sam3HoverResult> {
+    return this.hoverVisual(
+      {
+        points: [],
+        box,
+        maskInput: options.refinePrevious ? undefined : null,
+        multimaskOutput: options.multimaskOutput ?? false,
+        persist: false,
+      },
+      {
+        ...options,
+        promptPoint: options.promptPoint ?? {
+          x: (box.left + box.right) / 2,
+          y: (box.top + box.bottom) / 2,
+        },
+      },
+      box,
+    );
+  }
+
+  async hoverPoints(
+    points: readonly Sam3PointPrompt[],
+    options: Sam3HoverSelectOptions & { refinePrevious?: boolean; multimaskOutput?: boolean } = {},
+  ): Promise<Sam3HoverResult> {
+    const promptPoint = options.promptPoint ?? points.find(item => item.label === 1)?.point ?? points[0]?.point;
+    return this.hoverVisual(
+      {
+        points,
+        box: null,
+        maskInput: options.refinePrevious ? undefined : null,
+        multimaskOutput: options.multimaskOutput ?? points.length <= 1,
+        persist: false,
+      },
+      { ...options, promptPoint },
+    );
+  }
+
+  async hoverVisual(
+    prompt: Sam3PvsPrompt,
+    options: Sam3HoverSelectOptions = {},
+    promptBox?: Rect | null,
+  ): Promise<Sam3HoverResult> {
+    const result = await this.predictVisual({
+      ...prompt,
+      persist: prompt.persist ?? false,
+    });
+    return this.selectHoverMask(result, options, promptBox ?? prompt.box);
+  }
+
+  /** PointerEvent / MouseEvent → 编码图坐标后悬停 */
+  async hoverFromPointer(
+    event: Sam3PointerLike,
+    target: HTMLElement | DOMRect,
+    options: Sam3HoverPointOptions & Sam3PointerToImageOptions = {},
+  ): Promise<Sam3HoverResult> {
+    const size = this.pointerImageSize(target, options);
+    const local = pointerToImagePoint(event, target, {
+      ...options,
+      imageWidth: size.width,
+      imageHeight: size.height,
+    });
+    return this.hoverFromDisplayPoint(local, size.width, size.height, options);
+  }
+
+  /** 显示画布坐标 → 编码图坐标后悬停 */
+  async hoverFromDisplayPoint(
+    point: Point,
+    displayWidth: number,
+    displayHeight: number,
+    options: Sam3HoverPointOptions = {},
+  ): Promise<Sam3HoverResult> {
+    return this.hoverPoint(this.toEncodedPoint(point, displayWidth, displayHeight), options);
+  }
+
+  /** offsetX / offsetY（CSS 像素）→ 编码图坐标后悬停 */
+  async hoverFromOffset(
+    offsetX: number,
+    offsetY: number,
+    target: HTMLElement,
+    options: Sam3HoverPointOptions & Sam3PointerToImageOptions = {},
+  ): Promise<Sam3HoverResult> {
+    return this.hoverFromPointer({ clientX: 0, clientY: 0, offsetX, offsetY }, target, {
+      ...options,
+      origin: 'offset',
+    });
+  }
+
+  createHoverPreview(options: Sam3HoverPreviewOptions = {}): Sam3HoverPreview {
+    return new Sam3HoverPreview(this, options);
+  }
+
+  toEncodedPoint(point: Point, displayWidth: number, displayHeight: number): Point {
+    const encoded = this.encodedSize();
+    return mapImagePoint(point, { width: displayWidth, height: displayHeight }, encoded);
+  }
+
+  toEncodedBox(box: Rect, displayWidth: number, displayHeight: number): Rect {
+    const encoded = this.encodedSize();
+    return mapImageBox(box, { width: displayWidth, height: displayHeight }, encoded);
+  }
+
+  toDisplayPoint(point: Point, displayWidth: number, displayHeight: number): Point {
+    const encoded = this.encodedSize();
+    return mapImagePoint(point, encoded, { width: displayWidth, height: displayHeight });
+  }
+
+  static pointerToImagePoint(
+    event: Sam3PointerLike,
+    target: HTMLElement | DOMRect,
+    options: Sam3PointerToImageOptions = {},
+  ): Point {
+    return pointerToImagePoint(event, target, options);
+  }
+
+  static mapPoint(
+    point: Point,
+    from: { width: number; height: number },
+    to: { width: number; height: number },
+  ): Point {
+    return mapImagePoint(point, from, to);
+  }
+
+  /**
+   * 在已有 canvas 上下文上绘制像素掩码。边界用掩码边缘像素着色，
+   * 不要把 `segmentationEdgePoints` 当单个闭合折线 fill/stroke。
+   */
+  drawMask(
+    context: CanvasRenderingContext2D,
+    mask: Segmentation,
+    options: Sam3MaskOverlayOptions = {},
+  ): void {
+    const encoded = this.state
+      ? { width: this.state.sourceWidth, height: this.state.sourceHeight }
+      : {
+          width: options.sourceWidth ?? mask.boundingBox.right,
+          height: options.sourceHeight ?? mask.boundingBox.bottom,
+        };
+    const sourceWidth = options.sourceWidth ?? encoded.width;
+    const sourceHeight = options.sourceHeight ?? encoded.height;
+    const displayWidth = options.displayWidth ?? sourceWidth;
+    const displayHeight = options.displayHeight ?? sourceHeight;
+    const box = mask.boundingBox;
+    const dest = options.dest ?? {
+      left: (box.left * displayWidth) / Math.max(sourceWidth, 1e-6),
+      top: (box.top * displayHeight) / Math.max(sourceHeight, 1e-6),
+      right: (box.right * displayWidth) / Math.max(sourceWidth, 1e-6),
+      bottom: (box.bottom * displayHeight) / Math.max(sourceHeight, 1e-6),
+    };
+    DrawTool.drawPackedMaskOverlay(context, mask, {
+      fill: options.fill,
+      stroke: options.stroke,
+      dest,
+    });
+  }
+
+  maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][] {
+    return maskToPolygon(mask, {
+      ...options,
+      sourceWidth: options.sourceWidth ?? this.state?.sourceWidth,
+      sourceHeight: options.sourceHeight ?? this.state?.sourceHeight,
+    });
+  }
+
   selectVisualCandidate(index: number): Sam3PvsResult {
     return this.ensureHandler().selectPvsCandidate(index, this.ensureState());
   }
@@ -339,6 +540,57 @@ export class Sam3 {
     return ort.InferenceSession.create(model, options);
   }
 
+  private encodedSize(): { width: number; height: number } {
+    const state = this.ensureState();
+    return { width: state.sourceWidth, height: state.sourceHeight };
+  }
+
+  private pointerImageSize(
+    target: HTMLElement | DOMRect,
+    options: Sam3PointerToImageOptions,
+  ): { width: number; height: number } {
+    if (options.imageWidth && options.imageHeight) {
+      return { width: options.imageWidth, height: options.imageHeight };
+    }
+
+    if (target instanceof HTMLCanvasElement) {
+      return { width: target.width, height: target.height };
+    }
+
+    const rect = typeof DOMRect !== 'undefined' && target instanceof DOMRect ? target : (target as HTMLElement).getBoundingClientRect();
+    return { width: options.imageWidth ?? rect.width, height: options.imageHeight ?? rect.height };
+  }
+
+  private selectHoverMask(
+    result: Sam3PvsResult,
+    options: Sam3HoverSelectOptions,
+    promptBox?: Rect | null,
+  ): Sam3HoverResult {
+    const promptPoint = options.promptPoint;
+    let mask = pickBestMask(result.masks, result.ious, {
+      pick: options.pick ?? (promptPoint ? 'smallest' : 'iou'),
+      point: promptPoint,
+    });
+    const isolateAt =
+      promptPoint ??
+      (promptBox
+        ? {
+            x: (promptBox.left + promptBox.right) / 2,
+            y: (promptBox.top + promptBox.bottom) / 2,
+          }
+        : undefined);
+    if (mask && options.isolateComponent !== false && isolateAt) {
+      mask = isolateMaskComponent(mask, isolateAt);
+    }
+
+    return {
+      ...result,
+      mask,
+      promptPoint,
+      promptBox: promptBox ?? undefined,
+    };
+  }
+
   private ensureHandler(): Sam3Handler {
     if (!this.handler) {
       throw new Error('SAM3 is not loaded. Call Sam3.create() / load() first.');
@@ -358,15 +610,29 @@ export class Sam3 {
 
 export type {
   Sam3BoxPrompt,
+  Sam3HoverBoxOptions,
+  Sam3HoverMode,
+  Sam3HoverPick,
+  Sam3HoverPointOptions,
+  Sam3HoverPreviewOptions,
+  Sam3HoverResult,
+  Sam3HoverSelectOptions,
   Sam3ImageInput,
   Sam3InferenceState,
+  Sam3MaskOverlayOptions,
+  Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PcsRawOutput,
+  Sam3PointerLike,
+  Sam3PointerToImageOptions,
   Sam3PointPrompt,
   Sam3PvsPrompt,
   Sam3PvsResult,
   Sam3TokenizerTables,
 } from './handler/sam3/types';
+export { Sam3HoverPreview } from './handler/sam3/sam3-hover';
+export { isolateMaskComponent, maskToPolygon, pickBestMask } from './handler/sam3/sam3-mask';
+export { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 export { SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH };

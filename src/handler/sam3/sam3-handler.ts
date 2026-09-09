@@ -523,15 +523,17 @@ export class Sam3Handler {
       maskWidth: width,
       maskHeight: height,
     };
-    state.pvsPoints = points;
-    state.pvsBox = box;
-    state.lastPvs = pvsResult;
-    const bestIndex = argmax(selectedIous);
-    state.pvsMaskInput = {
-      logits: lowResMasks[bestIndex] ?? lowResMasks[0],
-      width,
-      height,
-    };
+    if (prompt.persist !== false) {
+      state.pvsPoints = points;
+      state.pvsBox = box;
+      state.lastPvs = pvsResult;
+      const bestIndex = argmax(selectedIous);
+      state.pvsMaskInput = {
+        logits: lowResMasks[bestIndex] ?? lowResMasks[0],
+        width,
+        height,
+      };
+    }
     return pvsResult;
   }
 

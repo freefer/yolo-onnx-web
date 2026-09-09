@@ -4,6 +4,10 @@
 var ortModule = null;
 var loadedBundle = null;
 var loadingPromise = null;
+function isWebAssemblyJspiAvailable() {
+  const wasm = globalThis.WebAssembly;
+  return Boolean(wasm && "Suspending" in wasm);
+}
 function resolveOrtBundle(executionProviders = ["wasm"], ortBundle = "auto") {
   if (ortBundle !== "auto") {
     return ortBundle;
@@ -18,7 +22,7 @@ function resolveOrtBundle(executionProviders = ["wasm"], ortBundle = "auto") {
     })
   );
   if (names.has("webgpu")) {
-    return "webgpu";
+    return isWebAssemblyJspiAvailable() ? "jspi" : "webgpu";
   }
   if (names.has("webgl")) {
     return "webgl";
@@ -32,7 +36,7 @@ function canReuseOrtBundle(loaded, requested) {
   if (loaded === requested) {
     return true;
   }
-  if (loaded === "webgpu" && requested === "wasm") {
+  if ((loaded === "webgpu" || loaded === "jspi") && requested === "wasm") {
     return true;
   }
   if (loaded === "all" && (requested === "wasm" || requested === "webgl")) {
@@ -42,6 +46,8 @@ function canReuseOrtBundle(loaded, requested) {
 }
 async function importOrtBundle(bundle) {
   switch (bundle) {
+    case "jspi":
+      return import('onnxruntime-web/jspi');
     case "webgpu":
       return import('onnxruntime-web/webgpu');
     case "webgl":
@@ -176,6 +182,8 @@ var Segmentation = class extends ObjectDetection {
     super(options);
     this.bitPackedPixelMask = options.bitPackedPixelMask;
     this.segmentationEdgePoints = (_a = options.segmentationEdgePoints) != null ? _a : [];
+    this.pixelMaskWidth = options.pixelMaskWidth;
+    this.pixelMaskHeight = options.pixelMaskHeight;
   }
 };
 var PoseEstimation = class extends ObjectDetection {
@@ -231,6 +239,29 @@ var EDGE_NEIGHBOR_OFFSETS = [
   { x: 1, y: -1 }
 ];
 var DEFAULT_EDGE_FILL_OPACITY = 64;
+var pooledMaskCanvas = null;
+var pooledMaskContext = null;
+var pooledMaskImageData = null;
+function getPooledMaskTarget(width, height) {
+  if (!pooledMaskCanvas || !pooledMaskContext) {
+    pooledMaskCanvas = document.createElement("canvas");
+    pooledMaskContext = pooledMaskCanvas.getContext("2d");
+    if (!pooledMaskContext) {
+      throw new Error("Canvas 2D context is not available.");
+    }
+  }
+  if (pooledMaskCanvas.width < width || pooledMaskCanvas.height < height) {
+    pooledMaskCanvas.width = Math.max(width, pooledMaskCanvas.width);
+    pooledMaskCanvas.height = Math.max(height, pooledMaskCanvas.height);
+    pooledMaskImageData = null;
+  }
+  if (!pooledMaskImageData || pooledMaskImageData.width !== width || pooledMaskImageData.height !== height) {
+    pooledMaskImageData = pooledMaskContext.createImageData(width, height);
+  } else {
+    pooledMaskImageData.data.fill(0);
+  }
+  return { canvas: pooledMaskCanvas, context: pooledMaskContext, imageData: pooledMaskImageData };
+}
 var DrawTool = class {
   static drawObjectDetections(source, detections, canvas, options = {}) {
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
@@ -352,25 +383,110 @@ var DrawTool = class {
   }
   static extractSegmentationEdgePoints(segmentation) {
     const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    const destWidth = right - left;
+    const destHeight = bottom - top;
+    const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
+    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
       return [];
     }
     const edgeKeys = /* @__PURE__ */ new Set();
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const pixelIndex = y * width + x;
-        if (!this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, width, height)) {
+    for (let y = 0; y < maskHeight; y += 1) {
+      for (let x = 0; x < maskWidth; x += 1) {
+        const pixelIndex = y * maskWidth + x;
+        if (!this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, maskWidth, maskHeight)) {
           continue;
         }
         edgeKeys.add(pixelIndex);
       }
     }
-    return this.traceOrderedEdgePoints(edgeKeys, left, top, width);
+    const local = this.traceOrderedEdgePoints(edgeKeys, 0, 0, maskWidth);
+    const scaleX = destWidth / maskWidth;
+    const scaleY = destHeight / maskHeight;
+    return local.map((point) => ({
+      x: left + point.x * scaleX,
+      y: top + point.y * scaleY
+    }));
   }
   static extractSegmentationsEdgePoints(segmentations) {
     return segmentations.map((segmentation) => this.extractSegmentationEdgePoints(segmentation));
+  }
+  static extractSegmentationContours(segmentation) {
+    return this.splitEdgeContours(this.extractSegmentationEdgePoints(segmentation));
+  }
+  static splitEdgeContours(points) {
+    if (points.length === 0) {
+      return [];
+    }
+    const maxGap = this.estimateEdgeStep(points) * 1.51;
+    const contours = [];
+    let current = [];
+    let previous = null;
+    for (const point of points) {
+      const gap = previous ? Math.max(Math.abs(point.x - previous.x), Math.abs(point.y - previous.y)) : Number.POSITIVE_INFINITY;
+      if (!previous || gap > maxGap) {
+        if (current.length >= 3) {
+          contours.push(current);
+        }
+        current = [point];
+      } else {
+        current.push(point);
+      }
+      previous = point;
+    }
+    if (current.length >= 3) {
+      contours.push(current);
+    }
+    return contours;
+  }
+  static estimateEdgeStep(points) {
+    var _a, _b, _c, _d, _e, _f, _g, _h;
+    let minStep = Number.POSITIVE_INFINITY;
+    const limit = Math.min(points.length, 256);
+    for (let index = 1; index < limit; index += 1) {
+      const step = Math.max(
+        Math.abs(((_b = (_a = points[index]) == null ? void 0 : _a.x) != null ? _b : 0) - ((_d = (_c = points[index - 1]) == null ? void 0 : _c.x) != null ? _d : 0)),
+        Math.abs(((_f = (_e = points[index]) == null ? void 0 : _e.y) != null ? _f : 0) - ((_h = (_g = points[index - 1]) == null ? void 0 : _g.y) != null ? _h : 0))
+      );
+      if (step > 1e-6 && step < minStep) {
+        minStep = step;
+      }
+    }
+    return Number.isFinite(minStep) ? minStep : 1;
+  }
+  static drawPackedMaskOverlay(context, segmentation, options = {}) {
+    var _a, _b, _c, _d;
+    const box = (_a = options.dest) != null ? _a : segmentation.boundingBox;
+    const destWidth = box.right - box.left;
+    const destHeight = box.bottom - box.top;
+    const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
+    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
+      return;
+    }
+    const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
+    const fill = this.parseCanvasColor((_b = options.fill) != null ? _b : "rgba(34, 197, 94, 0.35)");
+    const stroke = this.parseCanvasColor((_d = (_c = options.stroke) != null ? _c : options.fill) != null ? _d : "#22c55e");
+    const pixels = imageData.data;
+    const total = maskWidth * maskHeight;
+    const packed = segmentation.bitPackedPixelMask;
+    for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
+      if (!this.isPackedMaskSet(packed, pixelIndex)) {
+        continue;
+      }
+      const x = pixelIndex % maskWidth;
+      const y = pixelIndex / maskWidth | 0;
+      const edge = this.isSegmentationEdgePixel(packed, pixelIndex, x, y, maskWidth, maskHeight);
+      const color = edge ? stroke : fill;
+      const offset = pixelIndex * 4;
+      pixels[offset] = color.r;
+      pixels[offset + 1] = color.g;
+      pixels[offset + 2] = color.b;
+      pixels[offset + 3] = edge ? Math.max(color.a, 200) : fill.a;
+    }
+    maskContext.putImageData(imageData, 0, 0);
+    context.save();
+    context.imageSmoothingEnabled = false;
+    context.drawImage(maskCanvas, 0, 0, maskWidth, maskHeight, box.left, box.top, destWidth, destHeight);
+    context.restore();
   }
   static traceOrderedEdgePoints(edgeKeys, left, top, width) {
     const remaining = new Set(edgeKeys);
@@ -496,6 +612,8 @@ var DrawTool = class {
     }
     context.clearRect(0, 0, width, height);
     if (drawSource) {
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
       context.drawImage(source, 0, 0, width, height);
     }
     return { context, width, height };
@@ -567,32 +685,28 @@ var DrawTool = class {
   }
   static drawSegmentationMask(context, segmentation, color) {
     const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    const destWidth = right - left;
+    const destHeight = bottom - top;
+    const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
+    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
       return;
     }
-    const imageData = context.createImageData(width, height);
+    const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
     const rgba = this.parseCanvasColor(color);
-    const maskCanvas = document.createElement("canvas");
-    const maskContext = maskCanvas.getContext("2d");
-    if (!maskContext) {
-      throw new Error("Canvas 2D context is not available.");
-    }
-    maskCanvas.width = width;
-    maskCanvas.height = height;
-    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+    const total = maskWidth * maskHeight;
+    const pixels = imageData.data;
+    for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
       if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
         continue;
       }
       const offset = pixelIndex * 4;
-      imageData.data[offset] = rgba.r;
-      imageData.data[offset + 1] = rgba.g;
-      imageData.data[offset + 2] = rgba.b;
-      imageData.data[offset + 3] = rgba.a;
+      pixels[offset] = rgba.r;
+      pixels[offset + 1] = rgba.g;
+      pixels[offset + 2] = rgba.b;
+      pixels[offset + 3] = rgba.a;
     }
     maskContext.putImageData(imageData, 0, 0);
-    context.drawImage(maskCanvas, left, top);
+    context.drawImage(maskCanvas, 0, 0, maskWidth, maskHeight, left, top, destWidth, destHeight);
   }
   static drawSegmentationContour(context, segmentation, color, thickness) {
     const { left, top, right, bottom } = segmentation.boundingBox;
@@ -615,7 +729,7 @@ var DrawTool = class {
     }
   }
   static drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d;
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
     const thickness = (_b = options.contourThickness) != null ? _b : 2;
@@ -625,7 +739,7 @@ var DrawTool = class {
     const fillOpacity = options.resultOpacity !== void 0 ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1)) : fillBaseOpacity;
     for (let index = 0; index < segmentations.length; index += 1) {
       const segmentation = segmentations[index];
-      const points = (_e = segmentation.segmentationEdgePoints) != null ? _e : this.extractSegmentationEdgePoints(segmentation);
+      const contours = this.extractSegmentationContours(segmentation);
       const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
       const fillColor = this.getDetectionColor(
         segmentation,
@@ -634,49 +748,70 @@ var DrawTool = class {
         fillOpacity
       );
       if (options.drawSegmentationPixelMask === true) {
-        this.drawOrderedEdgePoints(
-          context,
-          points,
-          strokeColor,
-          thickness,
-          options.fillSegmentationEdgePoints === true ? fillColor : void 0
-        );
+        if (options.fillSegmentationEdgePoints === true) {
+          this.drawSegmentationMask(context, segmentation, fillColor);
+        }
+        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
       }
     }
     if (drawBoundingBoxes || options.drawLabel !== false) {
       this.drawBoundingBoxes(context, segmentations, width, height, options);
     }
   }
-  static drawOrderedEdgePoints(context, points, strokeColor, thickness, fillColor) {
-    if (points.length === 0) {
+  static drawOrderedEdgeContours(context, contours, strokeColor, thickness, fillColor) {
+    if (contours.length === 0) {
       return;
     }
     context.save();
     context.lineWidth = thickness;
     context.lineJoin = "round";
     context.lineCap = "round";
-    let previousPoint = null;
-    let hasPath = false;
-    context.beginPath();
-    for (const point of points) {
-      if (!previousPoint || Math.abs(point.x - previousPoint.x) > 1 || Math.abs(point.y - previousPoint.y) > 1) {
-        context.moveTo(point.x, point.y);
-      } else {
-        context.lineTo(point.x, point.y);
+    context.strokeStyle = strokeColor;
+    for (const contour of contours) {
+      if (contour.length === 0) {
+        continue;
       }
-      hasPath = true;
-      previousPoint = point;
-    }
-    if (hasPath && fillColor) {
-      context.closePath();
-      context.fillStyle = fillColor;
-      context.fill();
-    }
-    if (hasPath) {
-      context.strokeStyle = strokeColor;
+      context.beginPath();
+      context.moveTo(contour[0].x, contour[0].y);
+      for (let index = 1; index < contour.length; index += 1) {
+        context.lineTo(contour[index].x, contour[index].y);
+      }
+      if (fillColor && this.isMostlyClosedContour(contour)) {
+        context.closePath();
+        context.fillStyle = fillColor;
+        context.fill();
+      }
       context.stroke();
     }
     context.restore();
+  }
+  static isMostlyClosedContour(points) {
+    if (points.length < 3) {
+      return false;
+    }
+    const first = points[0];
+    const last = points[points.length - 1];
+    const gap = Math.max(Math.abs(first.x - last.x), Math.abs(first.y - last.y));
+    return gap <= Math.max(this.estimateEdgeStep(points) * 3, 4);
+  }
+  static resolvePackedMaskSize(segmentation) {
+    const destWidth = Math.max(1, segmentation.boundingBox.right - segmentation.boundingBox.left);
+    const destHeight = Math.max(1, segmentation.boundingBox.bottom - segmentation.boundingBox.top);
+    if (segmentation.pixelMaskWidth && segmentation.pixelMaskHeight) {
+      return {
+        width: Math.max(1, Math.round(segmentation.pixelMaskWidth)),
+        height: Math.max(1, Math.round(segmentation.pixelMaskHeight))
+      };
+    }
+    const expectedBytes = Math.ceil(destWidth * destHeight / 8);
+    if (segmentation.bitPackedPixelMask.byteLength >= expectedBytes) {
+      return { width: destWidth, height: destHeight };
+    }
+    const packedBits = segmentation.bitPackedPixelMask.byteLength * 8;
+    const aspect = destWidth / destHeight;
+    const maskHeight = Math.max(1, Math.round(Math.sqrt(packedBits / Math.max(aspect, 1e-6))));
+    const maskWidth = Math.max(1, Math.round(maskHeight * aspect));
+    return { width: maskWidth, height: maskHeight };
   }
   static isSegmentationEdgePixel(mask, pixelIndex, x, y, width, height) {
     if (!this.isPackedMaskSet(mask, pixelIndex)) {
@@ -2915,11 +3050,2299 @@ var Yolo = class _Yolo {
   }
 };
 
+// src/handler/sam3/preprocess.ts
+var SAM3_IMAGE_SIZE = 1008;
+var SAM3_MASK_SIZE = 288;
+var SAM3_TEXT_LENGTH = 32;
+var SAM3_STD = 0.5;
+var PIXEL_SCALE = 1 / (255 * SAM3_STD);
+var PIXEL_BIAS = -0.5 / SAM3_STD;
+var cpuCanvas = null;
+var cpuContext = null;
+var gpuCanvas = null;
+var gpuContext = null;
+var cpuTensorData = null;
+function getImageSize(image) {
+  if (image instanceof HTMLVideoElement) {
+    return { width: image.videoWidth, height: image.videoHeight };
+  }
+  if (image instanceof HTMLImageElement) {
+    return { width: image.naturalWidth || image.width, height: image.naturalHeight || image.height };
+  }
+  if (image instanceof HTMLCanvasElement || image instanceof OffscreenCanvas) {
+    return { width: image.width, height: image.height };
+  }
+  if ("displayWidth" in image && "displayHeight" in image) {
+    return { width: Number(image.displayWidth), height: Number(image.displayHeight) };
+  }
+  const sized = image;
+  return { width: sized.width, height: sized.height };
+}
+function enableHighQualitySmoothing(context) {
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+}
+function getCachedCanvas(imageSize, willReadFrequently) {
+  const existingCanvas = willReadFrequently ? cpuCanvas : gpuCanvas;
+  const existingContext = willReadFrequently ? cpuContext : gpuContext;
+  if (existingCanvas && existingContext && existingCanvas.width === imageSize && existingCanvas.height === imageSize) {
+    return { canvas: existingCanvas, context: existingContext };
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = imageSize;
+  canvas.height = imageSize;
+  const context = canvas.getContext("2d", { willReadFrequently });
+  if (!context) {
+    throw new Error("Failed to create a 2D canvas context for SAM3 preprocessing.");
+  }
+  if (willReadFrequently) {
+    cpuCanvas = canvas;
+    cpuContext = context;
+  } else {
+    gpuCanvas = canvas;
+    gpuContext = context;
+  }
+  return { canvas, context };
+}
+function renderSam3ImageToCanvas(image, imageSize = SAM3_IMAGE_SIZE, willReadFrequently = true) {
+  const { width: sourceWidth, height: sourceHeight } = getImageSize(image);
+  const { canvas, context } = getCachedCanvas(imageSize, willReadFrequently);
+  drawImageHighQuality(context, image, sourceWidth, sourceHeight, imageSize, imageSize);
+  return { canvas, context, sourceWidth, sourceHeight };
+}
+function drawImageHighQuality(context, image, sourceWidth, sourceHeight, destWidth, destHeight) {
+  enableHighQualitySmoothing(context);
+  let src = image;
+  let width = sourceWidth;
+  let height = sourceHeight;
+  while (width > destWidth * 2 || height > destHeight * 2) {
+    const nextWidth = Math.max(destWidth, Math.floor(width / 2));
+    const nextHeight = Math.max(destHeight, Math.floor(height / 2));
+    const tmp = document.createElement("canvas");
+    tmp.width = nextWidth;
+    tmp.height = nextHeight;
+    const tmpContext = tmp.getContext("2d");
+    if (!tmpContext) {
+      break;
+    }
+    enableHighQualitySmoothing(tmpContext);
+    tmpContext.drawImage(src, 0, 0, width, height, 0, 0, nextWidth, nextHeight);
+    src = tmp;
+    width = nextWidth;
+    height = nextHeight;
+  }
+  context.drawImage(src, 0, 0, width, height, 0, 0, destWidth, destHeight);
+}
+function preprocessSam3Image(image, imageSize = SAM3_IMAGE_SIZE) {
+  const { context, sourceWidth, sourceHeight } = renderSam3ImageToCanvas(image, imageSize, true);
+  const pixels = context.getImageData(0, 0, imageSize, imageSize).data;
+  const plane = imageSize * imageSize;
+  const dataLength = 3 * plane;
+  const data = cpuTensorData && cpuTensorData.length === dataLength ? cpuTensorData : new Float32Array(dataLength);
+  cpuTensorData = data;
+  for (let pixel = 0, offset = 0; pixel < plane; pixel += 1, offset += 4) {
+    data[pixel] = pixels[offset] * PIXEL_SCALE + PIXEL_BIAS;
+    data[plane + pixel] = pixels[offset + 1] * PIXEL_SCALE + PIXEL_BIAS;
+    data[plane * 2 + pixel] = pixels[offset + 2] * PIXEL_SCALE + PIXEL_BIAS;
+  }
+  return { data, width: imageSize, height: imageSize, sourceWidth, sourceHeight };
+}
+function clamp2(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+function sigmoid2(value) {
+  return 1 / (1 + Math.exp(-value));
+}
+function splitTextPrompts(prompt) {
+  const trimmed = prompt.trim();
+  if (!trimmed) {
+    return [];
+  }
+  const parts = trimmed.split(/[,，]+/).map((part) => part.trim()).filter(Boolean);
+  return parts.length > 0 ? parts : [trimmed];
+}
+function composeTextQuery(className, description) {
+  const extra = description == null ? void 0 : description.trim();
+  return extra ? `${className}, ${extra}` : className;
+}
+function rectCenter(box) {
+  return { x: (box.left + box.right) / 2, y: (box.top + box.bottom) / 2 };
+}
+function packPcsGeometricPrompts(boxes, points) {
+  const lastBox = boxes[boxes.length - 1];
+  const packedBox = lastBox ? { box: lastBox.box, label: lastBox.label, pad: false } : { box: { left: 0, top: 0, right: 1, bottom: 1 }, label: true, pad: true };
+  const lastPoint = points[points.length - 1];
+  let packedPoint;
+  if (lastPoint) {
+    packedPoint = { point: lastPoint.point, label: lastPoint.label > 0 ? 1 : 0, pad: false };
+  } else {
+    const extraBox = boxes.length >= 2 ? boxes[boxes.length - 2] : void 0;
+    packedPoint = extraBox ? { point: rectCenter(extraBox.box), label: extraBox.label ? 1 : 0, pad: false } : { point: { x: 0, y: 0 }, label: 1, pad: true };
+  }
+  return { boxes: [packedBox], points: [packedPoint] };
+}
+function rectToCxcywh(box, sourceWidth, sourceHeight) {
+  const width = Math.max(box.right - box.left, 1);
+  const height = Math.max(box.bottom - box.top, 1);
+  return [
+    clamp2((box.left + box.right) / 2 / sourceWidth, 0, 1),
+    clamp2((box.top + box.bottom) / 2 / sourceHeight, 0, 1),
+    clamp2(width / sourceWidth, 0, 1),
+    clamp2(height / sourceHeight, 0, 1)
+  ];
+}
+function cxcywhToRect(cx, cy, width, height, sourceWidth, sourceHeight) {
+  const left = (cx - width / 2) * sourceWidth;
+  const top = (cy - height / 2) * sourceHeight;
+  const right = (cx + width / 2) * sourceWidth;
+  const bottom = (cy + height / 2) * sourceHeight;
+  return {
+    left: clamp2(left, 0, sourceWidth),
+    top: clamp2(top, 0, sourceHeight),
+    right: clamp2(right, 0, sourceWidth),
+    bottom: clamp2(bottom, 0, sourceHeight)
+  };
+}
+function pointToNormalized(point, sourceWidth, sourceHeight) {
+  return [clamp2(point.x / sourceWidth, 0, 1), clamp2(point.y / sourceHeight, 0, 1)];
+}
+function pointToModel(point, sourceWidth, sourceHeight, imageSize = SAM3_IMAGE_SIZE) {
+  return [
+    point.x / sourceWidth * imageSize,
+    point.y / sourceHeight * imageSize
+  ];
+}
+function boxToModelCorners(box, sourceWidth, sourceHeight, imageSize = SAM3_IMAGE_SIZE) {
+  return [
+    pointToModel({ x: box.left, y: box.top }, sourceWidth, sourceHeight, imageSize),
+    pointToModel({ x: box.right, y: box.bottom }, sourceWidth, sourceHeight, imageSize)
+  ];
+}
+
+// src/handler/sam3/postprocess.ts
+var SAM3_MAX_OUTPUT_MASK_SIDE = 576;
+function packBinaryMask(mask, width, height, threshold = 0.5) {
+  var _a;
+  const total = width * height;
+  const packed = new Uint8Array(Math.ceil(total / 8));
+  for (let index = 0; index < total; index += 1) {
+    if (((_a = mask[index]) != null ? _a : 0) > threshold) {
+      packed[index >> 3] |= 1 << (index & 7);
+    }
+  }
+  return packed;
+}
+function bilinearResizeRegion(source, sourceWidth, sourceHeight, srcLeft, srcTop, srcRight, srcBottom, targetWidth, targetHeight) {
+  var _a, _b, _c, _d;
+  const target = new Float32Array(targetWidth * targetHeight);
+  const regionWidth = Math.max(srcRight - srcLeft, 1e-6);
+  const regionHeight = Math.max(srcBottom - srcTop, 1e-6);
+  for (let y = 0; y < targetHeight; y += 1) {
+    const sourceY = srcTop + (y + 0.5) / targetHeight * regionHeight - 0.5;
+    const y0 = clamp2(Math.floor(sourceY), 0, sourceHeight - 1);
+    const y1 = y0 < sourceHeight - 1 ? y0 + 1 : y0;
+    const wy = sourceY - y0;
+    for (let x = 0; x < targetWidth; x += 1) {
+      const sourceX = srcLeft + (x + 0.5) / targetWidth * regionWidth - 0.5;
+      const x0 = clamp2(Math.floor(sourceX), 0, sourceWidth - 1);
+      const x1 = x0 < sourceWidth - 1 ? x0 + 1 : x0;
+      const wx = sourceX - x0;
+      const v00 = (_a = source[y0 * sourceWidth + x0]) != null ? _a : 0;
+      const v01 = (_b = source[y0 * sourceWidth + x1]) != null ? _b : 0;
+      const v10 = (_c = source[y1 * sourceWidth + x0]) != null ? _c : 0;
+      const v11 = (_d = source[y1 * sourceWidth + x1]) != null ? _d : 0;
+      target[y * targetWidth + x] = v00 * (1 - wx) * (1 - wy) + v01 * wx * (1 - wy) + v10 * (1 - wx) * wy + v11 * wx * wy;
+    }
+  }
+  return target;
+}
+function bilinearResize(source, sourceWidth, sourceHeight, targetWidth, targetHeight) {
+  return bilinearResizeRegion(source, sourceWidth, sourceHeight, 0, 0, sourceWidth, sourceHeight, targetWidth, targetHeight);
+}
+function maskBounds(mask, width, height, threshold = 0.5) {
+  var _a;
+  let left = width;
+  let top = height;
+  let right = 0;
+  let bottom = 0;
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width;
+    for (let x = 0; x < width; x += 1) {
+      if (((_a = mask[row + x]) != null ? _a : 0) > threshold) {
+        if (x < left) left = x;
+        if (y < top) top = y;
+        if (x + 1 > right) right = x + 1;
+        if (y + 1 > bottom) bottom = y + 1;
+      }
+    }
+  }
+  if (right <= left || bottom <= top) {
+    return { left: 0, top: 0, right: width, bottom: height };
+  }
+  return { left, top, right, bottom };
+}
+function integerRect(rect, sourceWidth, sourceHeight) {
+  const left = clamp2(Math.floor(rect.left), 0, sourceWidth);
+  const top = clamp2(Math.floor(rect.top), 0, sourceHeight);
+  const right = clamp2(Math.ceil(rect.right), left, sourceWidth);
+  const bottom = clamp2(Math.ceil(rect.bottom), top, sourceHeight);
+  return {
+    left,
+    top,
+    right: right > left ? right : Math.min(sourceWidth, left + 1),
+    bottom: bottom > top ? bottom : Math.min(sourceHeight, top + 1)
+  };
+}
+function logitThreshold(pixelThreshold, applySigmoid) {
+  if (!applySigmoid) {
+    return pixelThreshold;
+  }
+  const probability = clamp2(pixelThreshold, 1e-6, 1 - 1e-6);
+  return Math.log(probability / (1 - probability));
+}
+function sourceRectToMaskRect(box, sourceWidth, sourceHeight, maskWidth, maskHeight) {
+  return {
+    left: box.left / sourceWidth * maskWidth,
+    top: box.top / sourceHeight * maskHeight,
+    right: box.right / sourceWidth * maskWidth,
+    bottom: box.bottom / sourceHeight * maskHeight
+  };
+}
+function maskRectToSourceRect(box, maskWidth, maskHeight, sourceWidth, sourceHeight) {
+  return {
+    left: box.left / maskWidth * sourceWidth,
+    top: box.top / maskHeight * sourceHeight,
+    right: box.right / maskWidth * sourceWidth,
+    bottom: box.bottom / maskHeight * sourceHeight
+  };
+}
+function outputMaskSize(boxWidth, boxHeight) {
+  const scale = Math.min(1, SAM3_MAX_OUTPUT_MASK_SIDE / Math.max(boxWidth, boxHeight, 1));
+  return {
+    width: Math.max(1, Math.round(boxWidth * scale)),
+    height: Math.max(1, Math.round(boxHeight * scale))
+  };
+}
+function applySigmoidInPlace(values) {
+  var _a;
+  for (let index = 0; index < values.length; index += 1) {
+    values[index] = sigmoid2((_a = values[index]) != null ? _a : 0);
+  }
+  return values;
+}
+function probabilitiesToSegmentation(probabilities, maskWidth, maskHeight, box, label, confidence, pixelThreshold) {
+  const packed = packBinaryMask(probabilities, maskWidth, maskHeight, pixelThreshold);
+  const local = new Segmentation({
+    label: { index: 0, name: label },
+    confidence,
+    boundingBox: { left: 0, top: 0, right: maskWidth, bottom: maskHeight },
+    bitPackedPixelMask: packed
+  });
+  const localEdges = DrawTool.extractSegmentationEdgePoints(local);
+  const scaleX = (box.right - box.left) / maskWidth;
+  const scaleY = (box.bottom - box.top) / maskHeight;
+  const edges = localEdges.map((point) => ({
+    x: box.left + point.x * scaleX,
+    y: box.top + point.y * scaleY
+  }));
+  return new Segmentation({
+    label: { index: 0, name: label },
+    confidence,
+    boundingBox: box,
+    bitPackedPixelMask: packed,
+    segmentationEdgePoints: edges,
+    pixelMaskWidth: maskWidth,
+    pixelMaskHeight: maskHeight
+  });
+}
+function logitsToSegmentation(logits, maskWidth, maskHeight, sourceWidth, sourceHeight, label, confidence, pixelThreshold = 0.5, applySigmoid = true, boundingBox) {
+  const sourceBox = integerRect(
+    boundingBox != null ? boundingBox : maskRectToSourceRect(
+      maskBounds(logits, maskWidth, maskHeight, logitThreshold(pixelThreshold, applySigmoid)),
+      maskWidth,
+      maskHeight,
+      sourceWidth,
+      sourceHeight
+    ),
+    sourceWidth,
+    sourceHeight
+  );
+  const boxWidth = sourceBox.right - sourceBox.left;
+  const boxHeight = sourceBox.bottom - sourceBox.top;
+  const output = outputMaskSize(boxWidth, boxHeight);
+  const maskBox = sourceRectToMaskRect(sourceBox, sourceWidth, sourceHeight, maskWidth, maskHeight);
+  const resized = bilinearResizeRegion(
+    logits,
+    maskWidth,
+    maskHeight,
+    maskBox.left,
+    maskBox.top,
+    maskBox.right,
+    maskBox.bottom,
+    output.width,
+    output.height
+  );
+  const probabilities = applySigmoid ? applySigmoidInPlace(resized) : resized;
+  return probabilitiesToSegmentation(
+    probabilities,
+    output.width,
+    output.height,
+    sourceBox,
+    label,
+    confidence,
+    pixelThreshold
+  );
+}
+function decodePcsOutputs(predMasks, predBoxes, predLogits, presenceLogits, maskShape, boxShape, sourceWidth, sourceHeight, text, threshold, pixelThreshold) {
+  var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+  const queryCount = predLogits.length;
+  const maskHeight = (_a = maskShape[maskShape.length - 2]) != null ? _a : SAM3_MASK_SIZE;
+  const maskWidth = (_b = maskShape[maskShape.length - 1]) != null ? _b : SAM3_MASK_SIZE;
+  const boxStride = (_c = boxShape[boxShape.length - 1]) != null ? _c : 4;
+  const presence = sigmoid2((_d = presenceLogits[0]) != null ? _d : 0);
+  const results = [];
+  for (let query = 0; query < queryCount; query += 1) {
+    const score = sigmoid2((_e = predLogits[query]) != null ? _e : 0) * presence;
+    if (score <= threshold) {
+      continue;
+    }
+    const maskOffset = query * maskHeight * maskWidth;
+    const mask = predMasks.subarray(maskOffset, maskOffset + maskHeight * maskWidth);
+    const boxOffset = query * boxStride;
+    const boundingBox = boxStride >= 4 ? cxcywhToRect(
+      (_f = predBoxes[boxOffset]) != null ? _f : 0,
+      (_g = predBoxes[boxOffset + 1]) != null ? _g : 0,
+      (_h = predBoxes[boxOffset + 2]) != null ? _h : 0,
+      (_i = predBoxes[boxOffset + 3]) != null ? _i : 0,
+      sourceWidth,
+      sourceHeight
+    ) : void 0;
+    results.push(
+      logitsToSegmentation(
+        mask,
+        maskWidth,
+        maskHeight,
+        sourceWidth,
+        sourceHeight,
+        text || "object",
+        score,
+        pixelThreshold,
+        true,
+        boundingBox
+      )
+    );
+  }
+  return results;
+}
+function copyLowResMask(data, index, width, height) {
+  const size = width * height;
+  return data.slice(index * size, (index + 1) * size);
+}
+
+// src/handler/sam3/webgpu-preprocess.ts
+var PREPROCESS_SHADER = `
+struct Params {
+  size: vec4<f32>,
+  scale: vec4<f32>,
+  bias: vec4<f32>,
+};
+
+@group(0) @binding(0) var inputTexture: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> outputTensor: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let width = u32(params.size.x);
+  let height = u32(params.size.y);
+
+  if (id.x >= width || id.y >= height) {
+    return;
+  }
+
+  let rgba = textureLoad(inputTexture, vec2<i32>(i32(id.x), i32(id.y)), 0);
+  let pixel = id.y * width + id.x;
+  let planeSize = width * height;
+
+  outputTensor[pixel] = rgba.r * params.scale.x + params.bias.x;
+  outputTensor[planeSize + pixel] = rgba.g * params.scale.y + params.bias.y;
+  outputTensor[planeSize * 2u + pixel] = rgba.b * params.scale.z + params.bias.z;
+}
+`;
+async function getOrtWebGpuDevice() {
+  const webgpu = ort.env.webgpu;
+  const device = await (webgpu == null ? void 0 : webgpu.device);
+  if (!device) {
+    throw new Error("ONNX Runtime WebGPU device is not initialized.");
+  }
+  return device;
+}
+async function waitForWebGpuOutputs(_result) {
+  var _a, _b;
+  const device = await ((_a = ort.env.webgpu) == null ? void 0 : _a.device);
+  if (typeof ((_b = device == null ? void 0 : device.queue) == null ? void 0 : _b.onSubmittedWorkDone) === "function") {
+    await device.queue.onSubmittedWorkDone();
+  }
+}
+var Sam3WebGpuPreprocessor = class {
+  constructor() {
+    this.device = null;
+    this.pipeline = null;
+    this.texture = null;
+    this.outputBuffer = null;
+    this.paramsBuffer = null;
+    this.size = 0;
+  }
+  async process(image, imageSize = SAM3_IMAGE_SIZE) {
+    const { source, sourceWidth, sourceHeight, close } = await rasterizeSam3Square(image, imageSize);
+    const device = await this.ensureResources(imageSize);
+    try {
+      device.queue.copyExternalImageToTexture({ source }, { texture: this.texture }, { width: imageSize, height: imageSize });
+    } finally {
+      close == null ? void 0 : close();
+    }
+    const bindGroup = device.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.texture.createView() },
+        { binding: 1, resource: { buffer: this.outputBuffer } },
+        { binding: 2, resource: { buffer: this.paramsBuffer } }
+      ]
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(imageSize / 16), Math.ceil(imageSize / 16));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    return {
+      data: new Float32Array(0),
+      width: imageSize,
+      height: imageSize,
+      sourceWidth,
+      sourceHeight,
+      tensor: ort.Tensor.fromGpuBuffer(this.outputBuffer, {
+        dataType: "float32",
+        dims: [1, 3, imageSize, imageSize]
+      })
+    };
+  }
+  dispose() {
+    var _a, _b, _c;
+    (_a = this.texture) == null ? void 0 : _a.destroy();
+    (_b = this.outputBuffer) == null ? void 0 : _b.destroy();
+    (_c = this.paramsBuffer) == null ? void 0 : _c.destroy();
+    this.texture = null;
+    this.outputBuffer = null;
+    this.paramsBuffer = null;
+    this.pipeline = null;
+    this.device = null;
+    this.size = 0;
+  }
+  async ensureResources(imageSize) {
+    const device = await getOrtWebGpuDevice();
+    const usage = globalThis.GPUBufferUsage;
+    const textureUsage = globalThis.GPUTextureUsage;
+    if (!usage || !textureUsage) {
+      throw new Error("WebGPU buffer usage flags are not available.");
+    }
+    if (this.device !== device || this.size !== imageSize || !this.pipeline || !this.texture || !this.outputBuffer || !this.paramsBuffer) {
+      this.dispose();
+      this.device = device;
+      this.size = imageSize;
+      this.texture = device.createTexture({
+        size: [imageSize, imageSize, 1],
+        format: "rgba8unorm",
+        usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT
+      });
+      this.outputBuffer = device.createBuffer({
+        size: 3 * imageSize * imageSize * Float32Array.BYTES_PER_ELEMENT,
+        usage: usage.STORAGE | usage.COPY_SRC | usage.COPY_DST
+      });
+      this.paramsBuffer = device.createBuffer({
+        size: 48,
+        usage: usage.UNIFORM | usage.COPY_DST
+      });
+      this.pipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: {
+          module: device.createShaderModule({ code: PREPROCESS_SHADER }),
+          entryPoint: "main"
+        }
+      });
+      const scale = 1 / SAM3_STD;
+      const bias = -0.5 / SAM3_STD;
+      device.queue.writeBuffer(
+        this.paramsBuffer,
+        0,
+        new Float32Array([imageSize, imageSize, 0, 0, scale, scale, scale, 0, bias, bias, bias, 0])
+      );
+    }
+    return device;
+  }
+};
+async function rasterizeSam3Square(image, imageSize) {
+  const { width: sourceWidth, height: sourceHeight } = getImageSize(image);
+  try {
+    const bitmap = await createImageBitmap(image, {
+      resizeWidth: imageSize,
+      resizeHeight: imageSize,
+      resizeQuality: "high"
+    });
+    return { source: bitmap, sourceWidth, sourceHeight, close: () => bitmap.close() };
+  } catch (e) {
+    const { canvas } = renderSam3ImageToCanvas(image, imageSize, false);
+    return { source: canvas, sourceWidth, sourceHeight };
+  }
+}
+
+// src/handler/sam3/sam3-handler.ts
+var TEXT_OUTPUT_NAMES = ["language_mask", "language_features"];
+var TEXT_CACHE_LIMIT = 32;
+function asFloat32(data) {
+  if (data instanceof Float32Array) {
+    return data;
+  }
+  return Float32Array.from(data);
+}
+function copyFloat32(data) {
+  return new Float32Array(data);
+}
+function pickFeeds(session, candidates) {
+  const feeds = {};
+  for (const name of session.inputNames) {
+    const tensor = candidates[name];
+    if (!tensor) {
+      throw new Error(`SAM3 session is missing feed "${name}". Available: ${Object.keys(candidates).join(", ")}`);
+    }
+    feeds[name] = tensor;
+  }
+  return feeds;
+}
+function pickOutput(result, name) {
+  const tensor = result[name];
+  if (!tensor) {
+    throw new Error(`SAM3 output "${name}" is missing. Available: ${Object.keys(result).join(", ")}`);
+  }
+  return tensor;
+}
+function optionalOutput(result, name) {
+  return result[name];
+}
+function tensorFloat(data, dims) {
+  return new ort.Tensor("float32", data, [...dims]);
+}
+function tensorInt64(values, dims) {
+  const data = BigInt64Array.from(Array.from(values, (value) => BigInt(value)));
+  return new ort.Tensor("int64", data, [...dims]);
+}
+function tensorInt32(values, dims) {
+  return new ort.Tensor("int32", values, [...dims]);
+}
+function tensorBool(values, dims) {
+  return new ort.Tensor("bool", values, [...dims]);
+}
+function selectPvsMaskIndices(maskCount, ious, wantMulti) {
+  if (maskCount >= 4) {
+    return wantMulti ? [1, 2, 3] : [0];
+  }
+  if (maskCount <= 1) {
+    return [0];
+  }
+  return wantMulti ? Array.from({ length: maskCount }, (_, index) => index) : [argmax(ious)];
+}
+function ensureFloat32(current, length) {
+  return current && current.length >= length ? current : new Float32Array(length);
+}
+function ensureInt32(current, length) {
+  return current && current.length >= length ? current : new Int32Array(length);
+}
+function fillMaskInput(target, maskInput, maskSize) {
+  const needed = maskSize * maskSize;
+  const maskData = ensureFloat32(target, needed);
+  maskData.fill(0, 0, needed);
+  if (!maskInput) {
+    return maskData;
+  }
+  if (maskInput.width === maskSize && maskInput.height === maskSize) {
+    maskData.set(maskInput.logits.subarray(0, needed));
+    return maskData;
+  }
+  maskData.set(bilinearResize(maskInput.logits, maskInput.width, maskInput.height, maskSize, maskSize));
+  return maskData;
+}
+function cloneCpuTensor(tensor) {
+  const dims = [...tensor.dims];
+  if (tensor.type === "bool") {
+    return new ort.Tensor("bool", Uint8Array.from(tensor.data), dims);
+  }
+  if (tensor.type === "int64") {
+    return new ort.Tensor("int64", BigInt64Array.from(tensor.data), dims);
+  }
+  if (tensor.type === "int32") {
+    return new ort.Tensor("int32", Int32Array.from(tensor.data), dims);
+  }
+  return new ort.Tensor("float32", copyFloat32(asFloat32(tensor.data)), dims);
+}
+function sliceAlongAxis(data, dims, axis, index) {
+  var _a;
+  const inner = dims.slice(axis + 1).reduce((product, dim) => product * dim, 1);
+  const outer = dims.slice(0, axis).reduce((product, dim) => product * dim, 1);
+  const axisSize = (_a = dims[axis]) != null ? _a : 1;
+  const out = data instanceof Uint8Array ? new Uint8Array(outer * inner) : new Float32Array(outer * inner);
+  for (let prefix = 0; prefix < outer; prefix += 1) {
+    const source = (prefix * axisSize + index) * inner;
+    out.set(data.subarray(source, source + inner), prefix * inner);
+  }
+  return {
+    data: out,
+    dims: dims.map((dim, dimIndex) => dimIndex === axis ? 1 : dim)
+  };
+}
+function featureBatchAxis(dims, batch) {
+  if (dims.length >= 3 && dims[1] === batch) {
+    return 1;
+  }
+  if (dims[0] === batch) {
+    return 0;
+  }
+  const axis = dims.indexOf(batch);
+  if (axis < 0) {
+    throw new Error(`Text encoder output shape [${dims.join(", ")}] has no batch=${batch} axis.`);
+  }
+  return axis;
+}
+async function runTextSession(session, feeds) {
+  try {
+    return await session.run(feeds, [...TEXT_OUTPUT_NAMES]);
+  } catch (e) {
+    return session.run(feeds);
+  }
+}
+var Sam3Handler = class {
+  constructor(visionSession, textSession, groundingSession, promptSession, tokenizer, options) {
+    this.visionSession = visionSession;
+    this.textSession = textSession;
+    this.groundingSession = groundingSession;
+    this.promptSession = promptSession;
+    this.tokenizer = tokenizer;
+    this.options = options;
+    this.textEmbeddingCache = /* @__PURE__ */ new Map();
+    this.pvsMaskScratch = null;
+    this.pvsCoordsScratch = null;
+    this.pvsLabelsScratch = null;
+    this.pvsHasMaskScratch = new Float32Array(1);
+    this.webGpuPreprocessor = options.webGpu ? new Sam3WebGpuPreprocessor() : null;
+  }
+  setConfidenceThreshold(threshold, state) {
+    this.options.confidenceThreshold = threshold;
+    return state ? this.options.confidenceThreshold : threshold;
+  }
+  async applyConfidenceThreshold(state) {
+    var _a;
+    if ((_a = state.lastPcsRaw) == null ? void 0 : _a.length) {
+      const merged = [];
+      for (const raw of state.lastPcsRaw) {
+        merged.push(...this.decodePcsRaw(state, raw));
+      }
+      state.lastPcs = merged;
+      return merged;
+    }
+    return this.forwardAllTextPrompts(state);
+  }
+  dispose() {
+    var _a;
+    (_a = this.webGpuPreprocessor) == null ? void 0 : _a.dispose();
+    for (const embeddings of this.textEmbeddingCache.values()) {
+      this.releaseTensors(embeddings);
+    }
+    this.textEmbeddingCache.clear();
+  }
+  async setImage(image, state) {
+    var _a, _b, _c;
+    if (state == null ? void 0 : state.vision) {
+      this.releaseVision(state.vision);
+    }
+    const preprocessStarted = performance.now();
+    const input = await this.prepareImage(image);
+    const preprocessMs = performance.now() - preprocessStarted;
+    let imageTensor = (_a = input.tensor) != null ? _a : tensorFloat(input.data, [1, 3, input.height, input.width]);
+    let result;
+    let runMs = 0;
+    let fenceMs = 0;
+    try {
+      try {
+        const runStarted = performance.now();
+        result = await this.visionSession.run(pickFeeds(this.visionSession, { images: imageTensor }));
+        runMs = performance.now() - runStarted;
+      } catch (error) {
+        if (!input.tensor) {
+          throw error;
+        }
+        console.warn("[SAM3] GPU image tensor was rejected. Falling back to CPU input.", error);
+        (_b = imageTensor.dispose) == null ? void 0 : _b.call(imageTensor);
+        const cpu = preprocessSam3Image(image, this.options.imageSize);
+        imageTensor = tensorFloat(cpu.data, [1, 3, cpu.height, cpu.width]);
+        const runStarted = performance.now();
+        result = await this.visionSession.run(pickFeeds(this.visionSession, { images: imageTensor }));
+        runMs = performance.now() - runStarted;
+      }
+      if (this.options.webGpu) {
+        const fenceStarted = performance.now();
+        await waitForWebGpuOutputs(result);
+        fenceMs = performance.now() - fenceStarted;
+      }
+    } finally {
+      (_c = imageTensor.dispose) == null ? void 0 : _c.call(imageTensor);
+    }
+    console.info(
+      `[SAM3] encode preprocess=${preprocessMs.toFixed(0)}ms run=${runMs.toFixed(0)}ms fence=${fenceMs.toFixed(0)}ms total=${(preprocessMs + runMs + fenceMs).toFixed(0)}ms`
+    );
+    return {
+      sourceWidth: input.sourceWidth,
+      sourceHeight: input.sourceHeight,
+      vision: {
+        detFpn0: pickOutput(result, "det_fpn_0"),
+        detFpn1: pickOutput(result, "det_fpn_1"),
+        detFpn2: pickOutput(result, "det_fpn_2"),
+        detPos0: optionalOutput(result, "det_pos_0"),
+        detPos1: optionalOutput(result, "det_pos_1"),
+        detPos2: optionalOutput(result, "det_pos_2"),
+        pvsHighRes0: pickOutput(result, "pvs_high_res_0"),
+        pvsHighRes1: pickOutput(result, "pvs_high_res_1"),
+        pvsImageEmbed: pickOutput(result, "pvs_image_embed")
+      },
+      boxes: [],
+      points: [],
+      pvsPoints: [],
+      pvsBox: null,
+      pvsMaskInput: null
+    };
+  }
+  resetPrompts(state) {
+    state.text = void 0;
+    state.texts = void 0;
+    state.textDescription = void 0;
+    state.textEmbeddings = void 0;
+    state.boxes = [];
+    state.points = [];
+    state.lastPcs = void 0;
+    state.lastPcsRaw = void 0;
+    return state;
+  }
+  resetVisualPrompts(state) {
+    state.pvsPoints = [];
+    state.pvsBox = null;
+    state.pvsMaskInput = null;
+    state.lastPvs = void 0;
+    return state;
+  }
+  async setTextPrompt(prompt, state, description) {
+    this.ensureImage(state);
+    const original = (prompt || "visual").trim() || "visual";
+    state.text = original;
+    state.textDescription = (description == null ? void 0 : description.trim()) || void 0;
+    state.texts = splitTextPrompts(original);
+    if (state.texts.length === 0) {
+      state.texts = [state.text];
+    }
+    return this.forwardAllTextPrompts(state);
+  }
+  async addGeometricPrompt(box, label, state) {
+    this.ensureImage(state);
+    state.boxes.push({ box, label });
+    try {
+      return await this.forwardAllTextPrompts(state);
+    } catch (error) {
+      state.boxes.pop();
+      throw error;
+    }
+  }
+  async addGeometricPoint(point, label, state) {
+    this.ensureImage(state);
+    state.points.push({ point, label: label ? 1 : 0 });
+    try {
+      return await this.forwardAllTextPrompts(state);
+    } catch (error) {
+      state.points.pop();
+      throw error;
+    }
+  }
+  async removeGeometricPrompt(index, state) {
+    if (index >= 0 && index < state.boxes.length) {
+      state.boxes.splice(index, 1);
+    }
+    return this.forwardAllTextPrompts(state);
+  }
+  async removeGeometricPoint(index, state) {
+    if (index >= 0 && index < state.points.length) {
+      state.points.splice(index, 1);
+    }
+    return this.forwardAllTextPrompts(state);
+  }
+  async predictConcept(prompt, state) {
+    if (prompt.text !== void 0) {
+      const original = (prompt.text || "visual").trim() || "visual";
+      state.text = original;
+      state.texts = splitTextPrompts(original);
+      if (state.texts.length === 0) {
+        state.texts = [state.text];
+      }
+    }
+    if (prompt.description !== void 0) {
+      state.textDescription = prompt.description.trim() || void 0;
+    }
+    if (prompt.boxes) {
+      state.boxes = [...prompt.boxes];
+    }
+    if (prompt.points) {
+      state.points = [...prompt.points];
+    }
+    return this.forwardAllTextPrompts(state);
+  }
+  async predictVisual(prompt, state) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    this.ensureImage(state);
+    if (!this.promptSession) {
+      throw new Error("SAM3 prompt decoder is not loaded. Pass promptDecoder when creating Sam3.");
+    }
+    const points = [...(_a = prompt.points) != null ? _a : state.pvsPoints];
+    const box = prompt.box === void 0 ? state.pvsBox : prompt.box;
+    const maskInput = prompt.maskInput === void 0 ? state.pvsMaskInput : prompt.maskInput;
+    const concatPoints = [];
+    if (box) {
+      const corners = boxToModelCorners(box, state.sourceWidth, state.sourceHeight, this.options.imageSize);
+      concatPoints.push({ x: corners[0][0], y: corners[0][1], label: 2 }, { x: corners[1][0], y: corners[1][1], label: 3 });
+    }
+    for (const item of points) {
+      const [x, y] = pointToModel(item.point, state.sourceWidth, state.sourceHeight, this.options.imageSize);
+      concatPoints.push({ x, y, label: item.label });
+    }
+    if (concatPoints.length === 0) {
+      concatPoints.push({ x: 0, y: 0, label: -1 });
+    }
+    const coordLength = concatPoints.length * 2;
+    this.pvsCoordsScratch = ensureFloat32(this.pvsCoordsScratch, coordLength);
+    this.pvsLabelsScratch = ensureInt32(this.pvsLabelsScratch, concatPoints.length);
+    const coords = this.pvsCoordsScratch.subarray(0, coordLength);
+    const labels = this.pvsLabelsScratch.subarray(0, concatPoints.length);
+    for (let index = 0; index < concatPoints.length; index += 1) {
+      coords[index * 2] = concatPoints[index].x;
+      coords[index * 2 + 1] = concatPoints[index].y;
+      labels[index] = concatPoints[index].label;
+    }
+    const maskSize = this.options.maskSize;
+    this.pvsHasMaskScratch[0] = maskInput ? 1 : 0;
+    this.pvsMaskScratch = fillMaskInput(this.pvsMaskScratch, maskInput, maskSize);
+    const maskData = this.pvsMaskScratch.subarray(0, maskSize * maskSize);
+    const result = await this.promptSession.run(
+      pickFeeds(this.promptSession, {
+        image_embed: state.vision.pvsImageEmbed,
+        high_res_0: state.vision.pvsHighRes0,
+        high_res_1: state.vision.pvsHighRes1,
+        point_coords: tensorFloat(coords, [1, concatPoints.length, 2]),
+        point_labels: tensorInt32(labels, [1, concatPoints.length]),
+        mask_input: tensorFloat(maskData, [1, 1, maskSize, maskSize]),
+        has_mask_input: tensorFloat(this.pvsHasMaskScratch, [1])
+      })
+    );
+    const lowRes = pickOutput(result, "low_res_masks");
+    const ious = asFloat32(pickOutput(result, "iou_predictions").data);
+    const objectScoreLogits = result.object_score_logits ? asFloat32(result.object_score_logits.data) : [];
+    const objectScore = objectScoreLogits.length > 0 ? 1 / (1 + Math.exp(-((_b = objectScoreLogits[0]) != null ? _b : 0))) : 1;
+    const lowResData = asFloat32(lowRes.data);
+    const dims = lowRes.dims;
+    const maskCount = dims.length >= 4 ? dims[1] : 1;
+    const height = (_c = dims[dims.length - 2]) != null ? _c : maskSize;
+    const width = (_d = dims[dims.length - 1]) != null ? _d : maskSize;
+    const clickCount = concatPoints.filter((item) => item.label >= 0 && item.label <= 1).length;
+    const wantMulti = (_e = prompt.multimaskOutput) != null ? _e : clickCount <= 1 && !box && !maskInput;
+    const selected = selectPvsMaskIndices(maskCount, ious, wantMulti);
+    const masks = [];
+    const lowResMasks = [];
+    const selectedIous = [];
+    const selectedScores = [];
+    for (const index of selected) {
+      const slice = copyLowResMask(lowResData, index, width, height);
+      const predictedIou = (_f = ious[index]) != null ? _f : 0;
+      lowResMasks.push(slice);
+      selectedIous.push(predictedIou);
+      selectedScores.push(objectScore);
+      masks.push(
+        logitsToSegmentation(
+          slice,
+          width,
+          height,
+          state.sourceWidth,
+          state.sourceHeight,
+          "object",
+          clamp2(predictedIou, 0, 1),
+          0,
+          false
+        )
+      );
+    }
+    const pvsResult = {
+      masks,
+      lowResMasks,
+      ious: selectedIous,
+      objectScores: selectedScores,
+      maskWidth: width,
+      maskHeight: height
+    };
+    if (prompt.persist !== false) {
+      state.pvsPoints = points;
+      state.pvsBox = box;
+      state.lastPvs = pvsResult;
+      const bestIndex = argmax(selectedIous);
+      state.pvsMaskInput = {
+        logits: (_g = lowResMasks[bestIndex]) != null ? _g : lowResMasks[0],
+        width,
+        height
+      };
+    }
+    return pvsResult;
+  }
+  selectPvsCandidate(index, state) {
+    var _a, _b, _c, _d, _e;
+    const last = state.lastPvs;
+    const mask = last == null ? void 0 : last.masks[index];
+    const logits = last == null ? void 0 : last.lowResMasks[index];
+    if (!last || !mask || !logits) {
+      throw new Error(`PVS candidate ${index} is not available. Run predictVisual() first.`);
+    }
+    const width = (_a = last.maskWidth) != null ? _a : this.options.maskSize;
+    const height = (_b = last.maskHeight) != null ? _b : this.options.maskSize;
+    state.pvsMaskInput = { logits, width, height };
+    return {
+      masks: [mask],
+      lowResMasks: [logits],
+      ious: [(_c = last.ious[index]) != null ? _c : 0],
+      objectScores: [(_e = (_d = last.objectScores[index]) != null ? _d : last.objectScores[0]) != null ? _e : 0],
+      maskWidth: width,
+      maskHeight: height
+    };
+  }
+  async addPoint(point, label, state) {
+    state.pvsPoints.push({ point, label });
+    const promptCount = state.pvsPoints.length + (state.pvsBox ? 1 : 0);
+    return this.predictVisual(
+      {
+        points: state.pvsPoints,
+        box: state.pvsBox,
+        maskInput: promptCount <= 1 ? null : state.pvsMaskInput,
+        multimaskOutput: promptCount <= 1
+      },
+      state
+    );
+  }
+  async addBox(box, state) {
+    state.pvsBox = box;
+    return this.predictVisual(
+      {
+        points: state.pvsPoints,
+        box,
+        maskInput: state.pvsPoints.length === 0 ? null : state.pvsMaskInput,
+        multimaskOutput: false
+      },
+      state
+    );
+  }
+  async addMask(mask, state) {
+    state.pvsMaskInput = mask;
+    return this.predictVisual(
+      {
+        points: state.pvsPoints,
+        box: state.pvsBox,
+        maskInput: mask,
+        multimaskOutput: false
+      },
+      state
+    );
+  }
+  async removePoint(index, state) {
+    if (index >= 0 && index < state.pvsPoints.length) {
+      state.pvsPoints.splice(index, 1);
+    }
+    state.pvsMaskInput = null;
+    return this.predictVisual({ points: state.pvsPoints, box: state.pvsBox, maskInput: null }, state);
+  }
+  cacheTextEmbeddings(query, embeddings) {
+    const previous = this.textEmbeddingCache.get(query);
+    if (previous && previous !== embeddings) {
+      this.releaseTensors(previous);
+    }
+    this.textEmbeddingCache.delete(query);
+    this.textEmbeddingCache.set(query, embeddings);
+    while (this.textEmbeddingCache.size > TEXT_CACHE_LIMIT) {
+      const oldest = this.textEmbeddingCache.keys().next().value;
+      if (oldest === void 0) {
+        break;
+      }
+      const stale = this.textEmbeddingCache.get(oldest);
+      this.textEmbeddingCache.delete(oldest);
+      if (stale) {
+        this.releaseTensors(stale);
+      }
+    }
+  }
+  async encodeTextUncached(query) {
+    const ids = this.tokenizer.tokenize(query);
+    const result = await runTextSession(
+      this.textSession,
+      pickFeeds(this.textSession, {
+        input_ids: tensorInt64(ids, [1, ids.length])
+      })
+    );
+    this.cacheTextEmbeddings(query, {
+      languageMask: cloneCpuTensor(pickOutput(result, "language_mask")),
+      languageFeatures: cloneCpuTensor(pickOutput(result, "language_features"))
+    });
+  }
+  async encodeTextsBatched(queries) {
+    var _a, _b, _c;
+    const batch = queries.length;
+    const length = this.tokenizer.contextLength;
+    const ids = new BigInt64Array(batch * length);
+    for (let index = 0; index < batch; index += 1) {
+      const tokens = this.tokenizer.tokenize((_a = queries[index]) != null ? _a : "");
+      for (let token = 0; token < length; token += 1) {
+        ids[index * length + token] = BigInt((_b = tokens[token]) != null ? _b : 0);
+      }
+    }
+    const result = await runTextSession(
+      this.textSession,
+      pickFeeds(this.textSession, {
+        input_ids: new ort.Tensor("int64", ids, [batch, length])
+      })
+    );
+    const maskTensor = pickOutput(result, "language_mask");
+    const featureTensor = pickOutput(result, "language_features");
+    const maskDims = maskTensor.dims;
+    const featureDims = featureTensor.dims;
+    const maskAxis = maskDims[0] === batch ? 0 : featureBatchAxis(maskDims, batch);
+    const featureAxis = featureBatchAxis(featureDims, batch);
+    const maskData = maskTensor.data instanceof Uint8Array ? maskTensor.data : Uint8Array.from(maskTensor.data);
+    const featureData = asFloat32(featureTensor.data);
+    for (let index = 0; index < batch; index += 1) {
+      const maskSlice = sliceAlongAxis(maskData, maskDims, maskAxis, index);
+      const featureSlice = sliceAlongAxis(featureData, featureDims, featureAxis, index);
+      this.cacheTextEmbeddings((_c = queries[index]) != null ? _c : "", {
+        languageMask: new ort.Tensor("bool", maskSlice.data, maskSlice.dims),
+        languageFeatures: new ort.Tensor("float32", featureSlice.data, featureSlice.dims)
+      });
+    }
+  }
+  async ensureTextEmbeddings(queries) {
+    var _a;
+    const missing = [...new Set(queries)].filter((query) => !this.textEmbeddingCache.has(query));
+    if (missing.length === 0) {
+      return;
+    }
+    if (missing.length === 1) {
+      await this.encodeTextUncached((_a = missing[0]) != null ? _a : "");
+      return;
+    }
+    try {
+      await this.encodeTextsBatched(missing);
+    } catch (error) {
+      console.warn("[SAM3] Batched text encode failed, falling back to sequential.", error);
+      for (const query of missing) {
+        if (!this.textEmbeddingCache.has(query)) {
+          await this.encodeTextUncached(query);
+        }
+      }
+    }
+  }
+  async forwardAllTextPrompts(state) {
+    var _a, _b, _c, _d;
+    this.ensureImage(state);
+    const original = ((_a = state.text) == null ? void 0 : _a.trim()) || "visual";
+    const texts = ((_b = state.texts) == null ? void 0 : _b.length) ? state.texts : splitTextPrompts(original);
+    const queries = texts.map((text) => composeTextQuery(text, state.textDescription));
+    await this.ensureTextEmbeddings(queries);
+    const merged = [];
+    const rawOutputs = [];
+    for (let index = 0; index < texts.length; index += 1) {
+      const embeddings = this.textEmbeddingCache.get((_c = queries[index]) != null ? _c : "");
+      if (!embeddings) {
+        throw new Error(`Text embeddings are missing for "${queries[index]}".`);
+      }
+      state.textEmbeddings = embeddings;
+      const raw = await this.runGrounding(state, (_d = texts[index]) != null ? _d : original);
+      rawOutputs.push(raw);
+      merged.push(...this.decodePcsRaw(state, raw));
+    }
+    state.text = original;
+    state.texts = texts;
+    state.lastPcsRaw = rawOutputs;
+    state.lastPcs = merged;
+    return merged;
+  }
+  decodePcsRaw(state, raw) {
+    return decodePcsOutputs(
+      raw.predMasks,
+      raw.predBoxes,
+      raw.predLogits,
+      raw.presenceLogits,
+      raw.maskShape,
+      raw.boxShape,
+      state.sourceWidth,
+      state.sourceHeight,
+      raw.label,
+      this.options.confidenceThreshold,
+      this.options.pixelConfidence
+    );
+  }
+  async runGrounding(state, label) {
+    var _a, _b, _c;
+    this.ensureImage(state);
+    if (!state.textEmbeddings) {
+      throw new Error("Text embeddings are missing. Call setTextPrompt() first.");
+    }
+    const packed = packPcsGeometricPrompts(state.boxes, state.points);
+    const boxes = packed.boxes;
+    const points = packed.points;
+    const boxCoords = new Float32Array(boxes.length * 4);
+    const boxLabels = new Int32Array(boxes.length);
+    const boxPadMask = new Uint8Array(boxes.length);
+    for (let index = 0; index < boxes.length; index += 1) {
+      const cxcywh = rectToCxcywh(boxes[index].box, state.sourceWidth, state.sourceHeight);
+      boxCoords[index * 4] = cxcywh[0];
+      boxCoords[index * 4 + 1] = cxcywh[1];
+      boxCoords[index * 4 + 2] = cxcywh[2];
+      boxCoords[index * 4 + 3] = cxcywh[3];
+      boxLabels[index] = boxes[index].label ? 1 : 0;
+      boxPadMask[index] = boxes[index].pad ? 1 : 0;
+    }
+    const pointCoords = new Float32Array(points.length * 2);
+    const pointLabels = new Int32Array(points.length);
+    const pointPadMask = new Uint8Array(points.length);
+    for (let index = 0; index < points.length; index += 1) {
+      const xy = pointToNormalized(points[index].point, state.sourceWidth, state.sourceHeight);
+      pointCoords[index * 2] = xy[0];
+      pointCoords[index * 2 + 1] = xy[1];
+      pointLabels[index] = points[index].label > 0 ? 1 : 0;
+      pointPadMask[index] = points[index].pad ? 1 : 0;
+    }
+    let result;
+    try {
+      result = await this.groundingSession.run(
+        pickFeeds(this.groundingSession, {
+          det_fpn_0: state.vision.detFpn0,
+          det_fpn_1: state.vision.detFpn1,
+          det_fpn_2: state.vision.detFpn2,
+          det_pos_0: state.vision.detPos0,
+          det_pos_1: state.vision.detPos1,
+          det_pos_2: state.vision.detPos2,
+          language_features: state.textEmbeddings.languageFeatures,
+          language_mask: state.textEmbeddings.languageMask,
+          box_coords: tensorFloat(boxCoords, [boxes.length, 1, 4]),
+          box_labels: tensorInt64(boxLabels, [boxes.length, 1]),
+          box_pad_mask: tensorBool(boxPadMask, [1, boxes.length]),
+          point_coords: tensorFloat(pointCoords, [points.length, 1, 2]),
+          point_labels: tensorInt64(pointLabels, [points.length, 1]),
+          point_pad_mask: tensorBool(pointPadMask, [1, points.length])
+        })
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `SAM3 grounding decoder failed with ${state.boxes.length} box(es) and ${state.points.length} point(s): ${message}`
+      );
+    }
+    const predMasks = pickOutput(result, "pred_masks");
+    const predBoxes = pickOutput(result, "pred_boxes");
+    return {
+      predMasks: copyFloat32(asFloat32(predMasks.data)),
+      predBoxes: copyFloat32(asFloat32(predBoxes.data)),
+      predLogits: copyFloat32(asFloat32(pickOutput(result, "pred_logits").data)),
+      presenceLogits: copyFloat32(asFloat32(pickOutput(result, "presence_logits").data)),
+      maskShape: [...predMasks.dims],
+      boxShape: [...predBoxes.dims],
+      label: (_c = (_b = label != null ? label : (_a = state.texts) == null ? void 0 : _a[0]) != null ? _b : state.text) != null ? _c : "visual"
+    };
+  }
+  async prepareImage(image) {
+    if (this.webGpuPreprocessor) {
+      try {
+        return await this.webGpuPreprocessor.process(image, this.options.imageSize);
+      } catch (error) {
+        console.warn("[SAM3] WebGPU preprocessing failed. Falling back to CPU preprocessing.", error);
+      }
+    }
+    return preprocessSam3Image(image, this.options.imageSize);
+  }
+  ensureImage(state) {
+    if (!(state == null ? void 0 : state.vision)) {
+      throw new Error("You must call setImage() before prompting SAM3.");
+    }
+  }
+  releaseTensors(tensors) {
+    var _a;
+    for (const tensor of Object.values(tensors)) {
+      (_a = tensor == null ? void 0 : tensor.dispose) == null ? void 0 : _a.call(tensor);
+    }
+  }
+  releaseVision(vision) {
+    this.releaseTensors(vision);
+  }
+};
+function argmax(values) {
+  var _a, _b;
+  let bestIndex = 0;
+  let bestValue = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < values.length; index += 1) {
+    if (((_a = values[index]) != null ? _a : Number.NEGATIVE_INFINITY) > bestValue) {
+      bestValue = (_b = values[index]) != null ? _b : Number.NEGATIVE_INFINITY;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+// src/handler/sam3/clip-tokenizer.ts
+var TOKEN_PATTERN = /'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]+|[^\s\p{L}\p{N}]+/gu;
+function unescapeHtml(text) {
+  return text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code))).replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCodePoint(parseInt(code, 16)));
+}
+function whitespaceClean(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function getPairs(word) {
+  const pairs = /* @__PURE__ */ new Set();
+  for (let index = 0; index < word.length - 1; index += 1) {
+    pairs.add(`${word[index]} ${word[index + 1]}`);
+  }
+  return pairs;
+}
+function applyBpe(token, tables, cache) {
+  var _a;
+  const cached = cache.get(token);
+  if (cached !== void 0) {
+    return cached;
+  }
+  if (token.length === 0) {
+    return token;
+  }
+  let word = token.slice(0, -1).split("").concat(`${token.slice(-1)}</w>`);
+  let pairs = getPairs(word);
+  if (pairs.size === 0) {
+    const result2 = `${token}</w>`;
+    cache.set(token, result2);
+    return result2;
+  }
+  while (true) {
+    let minRank = Number.POSITIVE_INFINITY;
+    let bigram = null;
+    for (const pair of pairs) {
+      const rank = tables.bpe_ranks[pair];
+      if (rank !== void 0 && rank < minRank) {
+        minRank = rank;
+        bigram = pair;
+      }
+    }
+    if (bigram === null) {
+      break;
+    }
+    const [first, second] = bigram.split(" ");
+    const nextWord = [];
+    let index = 0;
+    while (index < word.length) {
+      const found = word.indexOf(first, index);
+      if (found < 0) {
+        nextWord.push(...word.slice(index));
+        break;
+      }
+      nextWord.push(...word.slice(index, found));
+      index = found;
+      if (word[index] === first && index < word.length - 1 && word[index + 1] === second) {
+        nextWord.push(`${first}${second}`);
+        index += 2;
+      } else {
+        nextWord.push((_a = word[index]) != null ? _a : "");
+        index += 1;
+      }
+    }
+    word = nextWord;
+    if (word.length === 1) {
+      break;
+    }
+    pairs = getPairs(word);
+  }
+  const result = word.join(" ");
+  cache.set(token, result);
+  return result;
+}
+var ClipBpeTokenizer = class {
+  constructor(tables) {
+    this.cache = /* @__PURE__ */ new Map();
+    this.utf8 = new TextEncoder();
+    this.tables = tables;
+    this.cache.set("<start_of_text>", "<start_of_text>");
+    this.cache.set("<end_of_text>", "<end_of_text>");
+  }
+  get contextLength() {
+    return this.tables.context_length;
+  }
+  encode(text) {
+    var _a;
+    const cleaned = whitespaceClean(unescapeHtml(unescapeHtml(text))).toLowerCase();
+    const tokens = [];
+    for (const match of cleaned.matchAll(TOKEN_PATTERN)) {
+      const mapped = Array.from(this.utf8.encode((_a = match[0]) != null ? _a : ""), (byte) => {
+        var _a2;
+        return (_a2 = this.tables.byte_encoder[String(byte)]) != null ? _a2 : "";
+      }).join("");
+      for (const bpeToken of applyBpe(mapped, this.tables, this.cache).split(" ")) {
+        const id = this.tables.encoder[bpeToken];
+        if (id !== void 0) {
+          tokens.push(id);
+        }
+      }
+    }
+    return tokens;
+  }
+  tokenize(text) {
+    const contextLength = this.tables.context_length;
+    const ids = new Int32Array(contextLength);
+    const tokens = [this.tables.sot_token_id, ...this.encode(text), this.tables.eot_token_id];
+    if (tokens.length > contextLength) {
+      tokens.length = contextLength;
+      tokens[contextLength - 1] = this.tables.eot_token_id;
+    }
+    ids.set(tokens);
+    return ids;
+  }
+};
+async function loadClipTokenizer(source) {
+  if (typeof source !== "string") {
+    return new ClipBpeTokenizer(source);
+  }
+  const response = await fetch(source);
+  if (!response.ok) {
+    throw new Error(`Failed to load SAM3 tokenizer tables from ${source}`);
+  }
+  return new ClipBpeTokenizer(await response.json());
+}
+
+// src/handler/sam3/sam3-pointer.ts
+function pointerToImagePoint(event, target, options = {}) {
+  var _a, _b, _c, _d, _e;
+  const rect = isDomRect(target) ? target : target.getBoundingClientRect();
+  const imageWidth = (_b = (_a = options.imageWidth) != null ? _a : target instanceof HTMLCanvasElement ? target.width : rect.width) != null ? _b : rect.width;
+  const imageHeight = (_d = (_c = options.imageHeight) != null ? _c : target instanceof HTMLCanvasElement ? target.height : rect.height) != null ? _d : rect.height;
+  const fit = (_e = options.objectFit) != null ? _e : "fill";
+  if (fit === "contain" || fit === "cover") {
+    const scale = fit === "contain" ? Math.min(rect.width / Math.max(imageWidth, 1e-6), rect.height / Math.max(imageHeight, 1e-6)) : Math.max(rect.width / Math.max(imageWidth, 1e-6), rect.height / Math.max(imageHeight, 1e-6));
+    const drawWidth = imageWidth * scale;
+    const drawHeight = imageHeight * scale;
+    const offsetX = (rect.width - drawWidth) / 2;
+    const offsetY = (rect.height - drawHeight) / 2;
+    return {
+      x: clamp3((event.clientX - rect.left - offsetX) / Math.max(scale, 1e-6), 0, imageWidth),
+      y: clamp3((event.clientY - rect.top - offsetY) / Math.max(scale, 1e-6), 0, imageHeight)
+    };
+  }
+  if (options.origin === "offset" && event.offsetX != null && event.offsetY != null) {
+    const element = target instanceof HTMLElement ? target : null;
+    const cssWidth = (element == null ? void 0 : element.clientWidth) || rect.width || 1;
+    const cssHeight = (element == null ? void 0 : element.clientHeight) || rect.height || 1;
+    return {
+      x: clamp3(event.offsetX / cssWidth * imageWidth, 0, imageWidth),
+      y: clamp3(event.offsetY / cssHeight * imageHeight, 0, imageHeight)
+    };
+  }
+  return {
+    x: clamp3(rect.width ? (event.clientX - rect.left) / rect.width * imageWidth : 0, 0, imageWidth),
+    y: clamp3(rect.height ? (event.clientY - rect.top) / rect.height * imageHeight : 0, 0, imageHeight)
+  };
+}
+function mapImagePoint(point, from, to) {
+  return {
+    x: clamp3(from.width ? point.x * to.width / from.width : point.x, 0, to.width),
+    y: clamp3(from.height ? point.y * to.height / from.height : point.y, 0, to.height)
+  };
+}
+function mapImageBox(box, from, to) {
+  const topLeft = mapImagePoint({ x: box.left, y: box.top }, from, to);
+  const bottomRight = mapImagePoint({ x: box.right, y: box.bottom }, from, to);
+  return {
+    left: Math.min(topLeft.x, bottomRight.x),
+    top: Math.min(topLeft.y, bottomRight.y),
+    right: Math.max(topLeft.x, bottomRight.x),
+    bottom: Math.max(topLeft.y, bottomRight.y)
+  };
+}
+function isDomRect(value) {
+  return typeof DOMRect !== "undefined" && value instanceof DOMRect;
+}
+function clamp3(value, min, max) {
+  if (!Number.isFinite(max) || max <= min) {
+    return Math.max(min, value);
+  }
+  return Math.min(Math.max(value, min), max);
+}
+
+// src/handler/sam3/sam3-hover.ts
+var Sam3HoverPreview = class {
+  constructor(host, options = {}) {
+    this.host = host;
+    this.options = options;
+    this.queued = null;
+    this.queuedKind = "encoded";
+    this.queuedDisplay = null;
+    this.running = false;
+    this.lastPoint = null;
+    this.lastResult = null;
+    var _a;
+    this.onResult = (_a = options.onResult) != null ? _a : null;
+  }
+  get result() {
+    return this.lastResult;
+  }
+  get mask() {
+    var _a, _b;
+    return (_b = (_a = this.lastResult) == null ? void 0 : _a.mask) != null ? _b : null;
+  }
+  get busy() {
+    return this.running;
+  }
+  /** 已编码图像坐标系中的点 */
+  queuePoint(point) {
+    this.queued = point;
+    this.queuedKind = "encoded";
+    this.queuedDisplay = null;
+    this.kick();
+  }
+  /** 显示坐标系中的点（例如标注画布上的图像像素） */
+  queueDisplayPoint(point, displayWidth, displayHeight) {
+    this.queued = point;
+    this.queuedKind = "display";
+    this.queuedDisplay = { width: displayWidth, height: displayHeight };
+    this.kick();
+  }
+  /** Pointer / Mouse 事件，自动映射到图像像素再编码 */
+  queuePointer(event, target, pointer) {
+    const size = pointerImageSize(target, pointer);
+    const local = pointerToImagePoint(event, target, {
+      ...pointer,
+      imageWidth: size.width,
+      imageHeight: size.height
+    });
+    this.queueDisplayPoint(local, size.width, size.height);
+  }
+  /** offsetX / offsetY（元素 CSS 像素） */
+  queueOffset(offsetX, offsetY, target, pointer) {
+    this.queuePointer({ clientX: 0, clientY: 0, offsetX, offsetY }, target, {
+      ...pointer,
+      origin: "offset"
+    });
+  }
+  clear() {
+    var _a;
+    this.queued = null;
+    this.lastPoint = null;
+    this.lastResult = null;
+    (_a = this.onResult) == null ? void 0 : _a.call(this, null);
+  }
+  kick() {
+    if (!this.running) {
+      void this.flush();
+    }
+  }
+  async flush() {
+    var _a, _b;
+    if (this.running) {
+      return;
+    }
+    this.running = true;
+    try {
+      while (this.queued) {
+        const kind = this.queuedKind;
+        const point = this.queued;
+        const display = this.queuedDisplay;
+        this.queued = null;
+        if (point && this.lastPoint) {
+          const minMove = (_a = this.options.minMove) != null ? _a : 2;
+          if (Math.hypot(point.x - this.lastPoint.x, point.y - this.lastPoint.y) < minMove) {
+            continue;
+          }
+        }
+        const result = kind === "display" && point && display ? await this.host.hoverFromDisplayPoint(point, display.width, display.height, this.options) : await this.host.hoverPoint(point, this.options);
+        this.lastPoint = point;
+        this.lastResult = result;
+        (_b = this.onResult) == null ? void 0 : _b.call(this, result);
+      }
+    } finally {
+      this.running = false;
+      if (this.queued) {
+        void this.flush();
+      }
+    }
+  }
+};
+function pointerImageSize(target, options) {
+  var _a, _b;
+  if ((options == null ? void 0 : options.imageWidth) && options.imageHeight) {
+    return { width: options.imageWidth, height: options.imageHeight };
+  }
+  if (target instanceof HTMLCanvasElement) {
+    return { width: target.width, height: target.height };
+  }
+  const rect = typeof DOMRect !== "undefined" && target instanceof DOMRect ? target : target.getBoundingClientRect();
+  return {
+    width: (_a = options == null ? void 0 : options.imageWidth) != null ? _a : rect.width,
+    height: (_b = options == null ? void 0 : options.imageHeight) != null ? _b : rect.height
+  };
+}
+
+// src/handler/sam3/sam3-mask.ts
+function packedMaskSize(mask) {
+  if (mask.pixelMaskWidth && mask.pixelMaskHeight) {
+    return {
+      width: Math.max(1, Math.round(mask.pixelMaskWidth)),
+      height: Math.max(1, Math.round(mask.pixelMaskHeight))
+    };
+  }
+  const width = Math.max(1, Math.round(mask.boundingBox.right - mask.boundingBox.left));
+  const height = Math.max(1, Math.round(mask.boundingBox.bottom - mask.boundingBox.top));
+  return { width, height };
+}
+function pickBestMask(masks, ious = [], options = {}) {
+  var _a, _b, _c, _d, _e, _f;
+  if (masks.length === 0) {
+    return null;
+  }
+  const pick = (_a = options.pick) != null ? _a : options.point ? "smallest" : "iou";
+  if (pick === "first") {
+    return (_b = masks[0]) != null ? _b : null;
+  }
+  if (pick === "smallest") {
+    const containing = options.point ? masks.filter((mask) => pointInBox(options.point, mask.boundingBox)) : [];
+    const pool = containing.length > 0 ? containing : [...masks];
+    pool.sort((left, right) => maskArea(left) - maskArea(right));
+    return (_c = pool[0]) != null ? _c : null;
+  }
+  let bestIndex = 0;
+  let bestValue = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < Math.max(ious.length, masks.length); index += 1) {
+    const value = (_d = ious[index]) != null ? _d : Number.NEGATIVE_INFINITY;
+    if (value > bestValue) {
+      bestValue = value;
+      bestIndex = index;
+    }
+  }
+  return (_f = (_e = masks[bestIndex]) != null ? _e : masks[0]) != null ? _f : null;
+}
+function isolateMaskComponent(mask, point) {
+  const size = packedMaskSize(mask);
+  const width = size.width;
+  const height = size.height;
+  const box = mask.boundingBox;
+  const boxWidth = Math.max(box.right - box.left, 1e-6);
+  const boxHeight = Math.max(box.bottom - box.top, 1e-6);
+  let startX = Math.round((point.x - box.left) / boxWidth * (width - 1));
+  let startY = Math.round((point.y - box.top) / boxHeight * (height - 1));
+  startX = Math.min(Math.max(0, startX), width - 1);
+  startY = Math.min(Math.max(0, startY), height - 1);
+  if (!isPackedMaskSet(mask.bitPackedPixelMask, startY * width + startX)) {
+    const nearest = findNearestSetPixel(mask.bitPackedPixelMask, width, height, startX, startY, 64);
+    if (!nearest) {
+      return mask;
+    }
+    startX = nearest.x;
+    startY = nearest.y;
+  }
+  const component = floodFillMask(mask.bitPackedPixelMask, width, height, startX, startY);
+  if (component.count < 12) {
+    return mask;
+  }
+  const cropWidth = component.maxX - component.minX + 1;
+  const cropHeight = component.maxY - component.minY + 1;
+  const cropped = new Uint8Array(Math.ceil(cropWidth * cropHeight / 8));
+  for (let y = component.minY; y <= component.maxY; y += 1) {
+    for (let x = component.minX; x <= component.maxX; x += 1) {
+      if (!component.visited[y * width + x]) {
+        continue;
+      }
+      const local = (y - component.minY) * cropWidth + (x - component.minX);
+      cropped[local >> 3] |= 1 << (local & 7);
+    }
+  }
+  return new Segmentation({
+    label: mask.label,
+    confidence: mask.confidence,
+    boundingBox: {
+      left: box.left + component.minX / width * boxWidth,
+      top: box.top + component.minY / height * boxHeight,
+      right: box.left + (component.maxX + 1) / width * boxWidth,
+      bottom: box.top + (component.maxY + 1) / height * boxHeight
+    },
+    bitPackedPixelMask: cropped,
+    pixelMaskWidth: cropWidth,
+    pixelMaskHeight: cropHeight
+  });
+}
+function maskToPolygon(mask, options) {
+  var _a;
+  const size = packedMaskSize(mask);
+  const local = new Segmentation({
+    label: mask.label,
+    confidence: mask.confidence,
+    boundingBox: { left: 0, top: 0, right: size.width, bottom: size.height },
+    bitPackedPixelMask: mask.bitPackedPixelMask,
+    pixelMaskWidth: size.width,
+    pixelMaskHeight: size.height
+  });
+  const sourceWidth = options.sourceWidth || options.imageWidth || 1;
+  const sourceHeight = options.sourceHeight || options.imageHeight || 1;
+  const scaleX = options.imageWidth / sourceWidth;
+  const scaleY = options.imageHeight / sourceHeight;
+  const box = mask.boundingBox;
+  const boxWidth = Math.max(box.right - box.left, 1e-6);
+  const boxHeight = Math.max(box.bottom - box.top, 1e-6);
+  const contours = DrawTool.splitEdgeContours(DrawTool.extractSegmentationEdgePoints(local)).map(
+    (contour) => contour.map((point) => ({
+      x: (box.left + point.x * boxWidth / size.width) * scaleX,
+      y: (box.top + point.y * boxHeight / size.height) * scaleY
+    }))
+  );
+  const prompt = options.prompt ? {
+    x: options.prompt.x * scaleX,
+    y: options.prompt.y * scaleY
+  } : void 0;
+  const best = pickBestContour(contours, prompt);
+  const raw = best.map((point) => [
+    clamp4(point.x, 0, options.imageWidth),
+    clamp4(point.y, 0, options.imageHeight)
+  ]);
+  const simplified = simplifyRdp(raw, (_a = options.epsilon) != null ? _a : 1.25);
+  return simplified.length >= 3 ? simplified : raw;
+}
+function floodFillMask(packed, width, height, startX, startY) {
+  const visited = new Uint8Array(width * height);
+  const queue = [startY * width + startX];
+  visited[startY * width + startX] = 1;
+  let head = 0;
+  let minX = startX;
+  let maxX = startX;
+  let minY = startY;
+  let maxY = startY;
+  let count = 0;
+  while (head < queue.length) {
+    const index = queue[head];
+    head += 1;
+    count += 1;
+    const x = index % width;
+    const y = index / width | 0;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+    const neighbors = [index - 1, index + 1, index - width, index + width];
+    const valid = [x > 0, x + 1 < width, y > 0, y + 1 < height];
+    for (let offset = 0; offset < neighbors.length; offset += 1) {
+      if (!valid[offset]) {
+        continue;
+      }
+      const next = neighbors[offset];
+      if (visited[next] || !isPackedMaskSet(packed, next)) {
+        continue;
+      }
+      visited[next] = 1;
+      queue.push(next);
+    }
+  }
+  return { visited, minX, maxX, minY, maxY, count };
+}
+function findNearestSetPixel(packed, width, height, startX, startY, maxRadius) {
+  let best = null;
+  let bestDistance = maxRadius * maxRadius;
+  const minX = Math.max(0, startX - maxRadius);
+  const maxX = Math.min(width - 1, startX + maxRadius);
+  const minY = Math.max(0, startY - maxRadius);
+  const maxY = Math.min(height - 1, startY + maxRadius);
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      if (!isPackedMaskSet(packed, y * width + x)) {
+        continue;
+      }
+      const distance = (x - startX) * (x - startX) + (y - startY) * (y - startY);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = { x, y };
+      }
+    }
+  }
+  return best;
+}
+function pickBestContour(contours, prompt) {
+  var _a, _b, _c;
+  if (contours.length === 0) {
+    return [];
+  }
+  const ranked = [...contours].sort((left, right) => polygonArea(right) - polygonArea(left));
+  const closed = ranked.filter(isMostlyClosedContour);
+  const pool = closed.length > 0 ? closed : ranked;
+  if (!prompt) {
+    return (_a = pool[0]) != null ? _a : [];
+  }
+  const containing = pool.filter((contour) => pointInPolygon(prompt, contour));
+  return (_c = (_b = containing[0]) != null ? _b : pool[0]) != null ? _c : [];
+}
+function isMostlyClosedContour(points) {
+  if (points.length < 3) {
+    return false;
+  }
+  const first = points[0];
+  const last = points[points.length - 1];
+  const gap = Math.max(Math.abs(first.x - last.x), Math.abs(first.y - last.y));
+  return gap <= Math.max(estimateEdgeStep(points) * 3, 4);
+}
+function estimateEdgeStep(points) {
+  return DrawTool.estimateEdgeStep(points);
+}
+function polygonArea(points) {
+  let area = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += current.x * next.y - next.x * current.y;
+  }
+  return Math.abs(area) / 2;
+}
+function pointInPolygon(point, polygon) {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const current = polygon[index];
+    const last = polygon[previous];
+    const intersects = current.y > point.y !== last.y > point.y && point.x < (last.x - current.x) * (point.y - current.y) / (last.y - current.y || 1e-6) + current.x;
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+function pointInBox(point, box) {
+  return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
+}
+function maskArea(mask) {
+  return Math.max(0, mask.boundingBox.right - mask.boundingBox.left) * Math.max(0, mask.boundingBox.bottom - mask.boundingBox.top);
+}
+function isPackedMaskSet(packed, pixelIndex) {
+  if (pixelIndex < 0) {
+    return false;
+  }
+  const byteIndex = pixelIndex >> 3;
+  if (byteIndex >= packed.byteLength) {
+    return false;
+  }
+  return (packed[byteIndex] & 1 << (pixelIndex & 7)) !== 0;
+}
+function simplifyRdp(points, epsilon) {
+  if (points.length <= 4) {
+    return points;
+  }
+  const first = points[0];
+  const last = points[points.length - 1];
+  let maxDistance = 0;
+  let maxIndex = 0;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const distance = perpendicularDistance(points[index], first, last);
+    if (distance > maxDistance) {
+      maxDistance = distance;
+      maxIndex = index;
+    }
+  }
+  if (maxDistance <= epsilon) {
+    return [first, last];
+  }
+  const left = simplifyRdp(points.slice(0, maxIndex + 1), epsilon);
+  const right = simplifyRdp(points.slice(maxIndex), epsilon);
+  return [...left.slice(0, -1), ...right];
+}
+function perpendicularDistance(point, start, end) {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const length = Math.hypot(dx, dy) || 1;
+  return Math.abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / length;
+}
+function clamp4(value, min, max) {
+  if (!Number.isFinite(max) || max <= min) {
+    return Math.max(min, value);
+  }
+  return Math.min(Math.max(value, min), max);
+}
+
+// src/sam3.ts
+var DEFAULT_EXECUTION_PROVIDERS2 = ["wasm"];
+function usesWebGpu(options) {
+  var _a, _b, _c;
+  const providers = (_c = (_b = (_a = options.sessionOptions) == null ? void 0 : _a.executionProviders) != null ? _b : options.executionProviders) != null ? _c : DEFAULT_EXECUTION_PROVIDERS2;
+  return providers.some((provider) => {
+    if (typeof provider === "string") {
+      return provider === "webgpu";
+    }
+    return provider.name === "webgpu";
+  });
+}
+var Sam3 = class _Sam3 {
+  constructor(options) {
+    this.options = options;
+    this.visionSession = null;
+    this.textSession = null;
+    this.groundingSession = null;
+    this.promptSession = null;
+    this.handler = null;
+    this.tokenizer = null;
+    this.state = null;
+    this.webGpu = usesWebGpu(options);
+  }
+  static async create(options) {
+    const sam3 = new _Sam3(options);
+    await sam3.load();
+    return sam3;
+  }
+  get isLoaded() {
+    return this.handler !== null;
+  }
+  get inferenceState() {
+    return this.state;
+  }
+  async load() {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const defaultNumThreads = this.webGpu ? 0 : 1;
+    await ensureOnnxRuntimeWebInitialized({
+      ...this.options,
+      numThreads: (_a = this.options.numThreads) != null ? _a : defaultNumThreads
+    });
+    if (ort.env.wasm) {
+      ort.env.wasm.numThreads = (_b = this.options.numThreads) != null ? _b : defaultNumThreads;
+      ort.env.wasm.proxy = (_c = this.options.proxy) != null ? _c : false;
+      ort.env.wasm.simd = true;
+    }
+    if (this.webGpu) {
+      const webgpu = ort.env.webgpu;
+      if (webgpu && webgpu.powerPreference === void 0) {
+        webgpu.powerPreference = "high-performance";
+      }
+    }
+    await this.dispose();
+    try {
+      const progress = this.options.onLoadProgress;
+      progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D\u89C6\u89C9\u7F16\u7801\u5668...");
+      this.visionSession = await this.createSession("vision", this.options.visionEncoder);
+      progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D\u6587\u672C / Grounding / Prompt / tokenizer...");
+      const promptSource = this.options.promptDecoder;
+      const textPromise = this.createSession("text", this.options.textEncoder);
+      const groundingPromise = this.createSession("grounding", this.options.groundingDecoder);
+      const promptPromise = promptSource ? this.createSession("prompt", promptSource) : Promise.resolve(null);
+      const tokenizerPromise = this.options.tokenizer ? loadClipTokenizer(this.options.tokenizer) : Promise.resolve(null);
+      try {
+        const [textSession, groundingSession, promptSession, tokenizer] = await Promise.all([
+          textPromise,
+          groundingPromise,
+          promptPromise,
+          tokenizerPromise
+        ]);
+        this.textSession = textSession;
+        this.groundingSession = groundingSession;
+        this.promptSession = promptSession;
+        this.tokenizer = tokenizer;
+      } catch (error) {
+        const settled = await Promise.allSettled([textPromise, groundingPromise, promptPromise]);
+        await Promise.all(
+          settled.map(
+            (item) => item.status === "fulfilled" && item.value ? item.value.release() : Promise.resolve()
+          )
+        );
+        throw error;
+      }
+      if (!this.tokenizer) {
+        throw new Error("SAM3 tokenizer tables are required. Pass tokenizer: clip_bpe.json or parsed tables.");
+      }
+      this.handler = new Sam3Handler(
+        this.visionSession,
+        this.textSession,
+        this.groundingSession,
+        this.promptSession,
+        this.tokenizer,
+        {
+          confidenceThreshold: (_d = this.options.confidenceThreshold) != null ? _d : 0.5,
+          pixelConfidence: (_e = this.options.pixelConfidence) != null ? _e : 0.5,
+          imageSize: (_f = this.options.imageSize) != null ? _f : SAM3_IMAGE_SIZE,
+          maskSize: (_g = this.options.maskSize) != null ? _g : SAM3_MASK_SIZE,
+          webGpu: this.webGpu
+        }
+      );
+      return this;
+    } catch (error) {
+      await this.dispose();
+      throw error;
+    }
+  }
+  async setImage(image) {
+    this.state = await this.ensureHandler().setImage(image, this.state);
+    return this.state;
+  }
+  async setTextPrompt(prompt, description) {
+    return this.ensureHandler().setTextPrompt(prompt, this.ensureState(), description);
+  }
+  async addGeometricPrompt(box, label = true) {
+    return this.ensureHandler().addGeometricPrompt(box, label, this.ensureState());
+  }
+  async addGeometricPoint(point, label = true) {
+    return this.ensureHandler().addGeometricPoint(point, label, this.ensureState());
+  }
+  async removeGeometricPrompt(index) {
+    return this.ensureHandler().removeGeometricPrompt(index, this.ensureState());
+  }
+  async removeGeometricPoint(index) {
+    return this.ensureHandler().removeGeometricPoint(index, this.ensureState());
+  }
+  resetPrompts() {
+    return this.ensureHandler().resetPrompts(this.ensureState());
+  }
+  resetVisualPrompts() {
+    return this.ensureHandler().resetVisualPrompts(this.ensureState());
+  }
+  async setConfidenceThreshold(threshold) {
+    var _a;
+    this.ensureHandler().setConfidenceThreshold(threshold);
+    const state = this.ensureState();
+    if (((_a = state.lastPcsRaw) == null ? void 0 : _a.length) || state.textEmbeddings) {
+      return this.ensureHandler().applyConfidenceThreshold(state);
+    }
+    return state;
+  }
+  async predictConcept(prompt) {
+    return this.ensureHandler().predictConcept(prompt, this.ensureState());
+  }
+  async predictVisual(prompt = {}) {
+    return this.ensureHandler().predictVisual(prompt, this.ensureState());
+  }
+  async addPoint(point, label = 1) {
+    return this.ensureHandler().addPoint(point, label, this.ensureState());
+  }
+  async addBox(box) {
+    return this.ensureHandler().addBox(box, this.ensureState());
+  }
+  async addMask(mask) {
+    return this.ensureHandler().addMask(mask, this.ensureState());
+  }
+  /**
+   * 悬停/点选预览：默认每次独立单点，不写入 PVS 累积状态。
+   * 填充请用 {@link drawMask}（像素掩码），不要把拼接边点当一个多边形描边。
+   */
+  async hoverPoint(point, options = {}) {
+    var _a, _b;
+    const label = (_a = options.label) != null ? _a : 1;
+    if (options.mode === "accumulate") {
+      const result = await this.addPoint(point, label);
+      return this.selectHoverMask(result, {
+        ...options,
+        promptPoint: point
+      });
+    }
+    return this.hoverVisual(
+      {
+        points: [{ point, label }],
+        box: null,
+        maskInput: options.refinePrevious ? void 0 : null,
+        multimaskOutput: (_b = options.multimaskOutput) != null ? _b : true,
+        persist: false
+      },
+      { ...options, promptPoint: point }
+    );
+  }
+  async hoverBox(box, options = {}) {
+    var _a, _b;
+    return this.hoverVisual(
+      {
+        points: [],
+        box,
+        maskInput: options.refinePrevious ? void 0 : null,
+        multimaskOutput: (_a = options.multimaskOutput) != null ? _a : false,
+        persist: false
+      },
+      {
+        ...options,
+        promptPoint: (_b = options.promptPoint) != null ? _b : {
+          x: (box.left + box.right) / 2,
+          y: (box.top + box.bottom) / 2
+        }
+      },
+      box
+    );
+  }
+  async hoverPoints(points, options = {}) {
+    var _a, _b, _c, _d, _e;
+    const promptPoint = (_d = (_b = options.promptPoint) != null ? _b : (_a = points.find((item) => item.label === 1)) == null ? void 0 : _a.point) != null ? _d : (_c = points[0]) == null ? void 0 : _c.point;
+    return this.hoverVisual(
+      {
+        points,
+        box: null,
+        maskInput: options.refinePrevious ? void 0 : null,
+        multimaskOutput: (_e = options.multimaskOutput) != null ? _e : points.length <= 1,
+        persist: false
+      },
+      { ...options, promptPoint }
+    );
+  }
+  async hoverVisual(prompt, options = {}, promptBox) {
+    var _a;
+    const result = await this.predictVisual({
+      ...prompt,
+      persist: (_a = prompt.persist) != null ? _a : false
+    });
+    return this.selectHoverMask(result, options, promptBox != null ? promptBox : prompt.box);
+  }
+  /** PointerEvent / MouseEvent → 编码图坐标后悬停 */
+  async hoverFromPointer(event, target, options = {}) {
+    const size = this.pointerImageSize(target, options);
+    const local = pointerToImagePoint(event, target, {
+      ...options,
+      imageWidth: size.width,
+      imageHeight: size.height
+    });
+    return this.hoverFromDisplayPoint(local, size.width, size.height, options);
+  }
+  /** 显示画布坐标 → 编码图坐标后悬停 */
+  async hoverFromDisplayPoint(point, displayWidth, displayHeight, options = {}) {
+    return this.hoverPoint(this.toEncodedPoint(point, displayWidth, displayHeight), options);
+  }
+  /** offsetX / offsetY（CSS 像素）→ 编码图坐标后悬停 */
+  async hoverFromOffset(offsetX, offsetY, target, options = {}) {
+    return this.hoverFromPointer({ clientX: 0, clientY: 0, offsetX, offsetY }, target, {
+      ...options,
+      origin: "offset"
+    });
+  }
+  createHoverPreview(options = {}) {
+    return new Sam3HoverPreview(this, options);
+  }
+  toEncodedPoint(point, displayWidth, displayHeight) {
+    const encoded = this.encodedSize();
+    return mapImagePoint(point, { width: displayWidth, height: displayHeight }, encoded);
+  }
+  toEncodedBox(box, displayWidth, displayHeight) {
+    const encoded = this.encodedSize();
+    return mapImageBox(box, { width: displayWidth, height: displayHeight }, encoded);
+  }
+  toDisplayPoint(point, displayWidth, displayHeight) {
+    const encoded = this.encodedSize();
+    return mapImagePoint(point, encoded, { width: displayWidth, height: displayHeight });
+  }
+  static pointerToImagePoint(event, target, options = {}) {
+    return pointerToImagePoint(event, target, options);
+  }
+  static mapPoint(point, from, to) {
+    return mapImagePoint(point, from, to);
+  }
+  /**
+   * 在已有 canvas 上下文上绘制像素掩码。边界用掩码边缘像素着色，
+   * 不要把 `segmentationEdgePoints` 当单个闭合折线 fill/stroke。
+   */
+  drawMask(context, mask, options = {}) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const encoded = this.state ? { width: this.state.sourceWidth, height: this.state.sourceHeight } : {
+      width: (_a = options.sourceWidth) != null ? _a : mask.boundingBox.right,
+      height: (_b = options.sourceHeight) != null ? _b : mask.boundingBox.bottom
+    };
+    const sourceWidth = (_c = options.sourceWidth) != null ? _c : encoded.width;
+    const sourceHeight = (_d = options.sourceHeight) != null ? _d : encoded.height;
+    const displayWidth = (_e = options.displayWidth) != null ? _e : sourceWidth;
+    const displayHeight = (_f = options.displayHeight) != null ? _f : sourceHeight;
+    const box = mask.boundingBox;
+    const dest = (_g = options.dest) != null ? _g : {
+      left: box.left * displayWidth / Math.max(sourceWidth, 1e-6),
+      top: box.top * displayHeight / Math.max(sourceHeight, 1e-6),
+      right: box.right * displayWidth / Math.max(sourceWidth, 1e-6),
+      bottom: box.bottom * displayHeight / Math.max(sourceHeight, 1e-6)
+    };
+    DrawTool.drawPackedMaskOverlay(context, mask, {
+      fill: options.fill,
+      stroke: options.stroke,
+      dest
+    });
+  }
+  maskToPolygon(mask, options) {
+    var _a, _b, _c, _d;
+    return maskToPolygon(mask, {
+      ...options,
+      sourceWidth: (_b = options.sourceWidth) != null ? _b : (_a = this.state) == null ? void 0 : _a.sourceWidth,
+      sourceHeight: (_d = options.sourceHeight) != null ? _d : (_c = this.state) == null ? void 0 : _c.sourceHeight
+    });
+  }
+  selectVisualCandidate(index) {
+    return this.ensureHandler().selectPvsCandidate(index, this.ensureState());
+  }
+  async removePoint(index) {
+    return this.ensureHandler().removePoint(index, this.ensureState());
+  }
+  drawSegmentations(source, segmentations, canvas, options = {}) {
+    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, {
+      drawBoundingBoxes: true,
+      drawLabel: true,
+      drawSegmentationPixelMask: true,
+      fillSegmentationEdgePoints: true,
+      ...options
+    });
+  }
+  drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
+    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, options);
+  }
+  async dispose() {
+    var _a;
+    (_a = this.handler) == null ? void 0 : _a.dispose();
+    const sessions = [this.visionSession, this.textSession, this.groundingSession, this.promptSession];
+    this.visionSession = null;
+    this.textSession = null;
+    this.groundingSession = null;
+    this.promptSession = null;
+    this.handler = null;
+    this.tokenizer = null;
+    this.state = null;
+    await Promise.all(sessions.filter(Boolean).map((session) => session == null ? void 0 : session.release()));
+  }
+  createSessionOptions(kind) {
+    var _a, _b, _c, _d, _e;
+    const userOptions = (_a = this.options.sessionOptions) != null ? _a : {};
+    const userExtra = (_b = userOptions.extra) != null ? _b : {};
+    const userSession = (_c = userExtra.session) != null ? _c : {};
+    const keepVisionOnGpu = this.webGpu && kind === "vision";
+    const disableGraphOpt = kind === "vision" || kind === "text";
+    const options = {
+      enableCpuMemArena: true,
+      enableMemPattern: true,
+      ...userOptions,
+      graphOptimizationLevel: (_d = userOptions.graphOptimizationLevel) != null ? _d : disableGraphOpt ? "disabled" : "all",
+      extra: {
+        ...userExtra,
+        session: {
+          strict_shape_type_inference: "0",
+          ...keepVisionOnGpu ? { use_device_allocator_for_initializers: "1" } : {},
+          ...userSession
+        }
+      },
+      executionProviders: (_e = userOptions.executionProviders) != null ? _e : this.createExecutionProviders()
+    };
+    if (keepVisionOnGpu && options.preferredOutputLocation == null) {
+      options.preferredOutputLocation = "gpu-buffer";
+    }
+    return options;
+  }
+  createExecutionProviders() {
+    var _a;
+    const providers = [...(_a = this.options.executionProviders) != null ? _a : DEFAULT_EXECUTION_PROVIDERS2];
+    if (!this.webGpu) {
+      return providers;
+    }
+    return providers.map((provider) => {
+      if (provider === "webgpu") {
+        return { name: "webgpu", preferredLayout: "NCHW", validationMode: "wgpuOnly" };
+      }
+      return provider;
+    });
+  }
+  async createSession(kind, model) {
+    const label = `${kind}-encoder`;
+    const options = this.createSessionOptions(kind);
+    try {
+      return await this.createSessionWithOptions(model, options);
+    } catch (error) {
+      if (kind === "vision" && this.webGpu && options.preferredOutputLocation === "gpu-buffer") {
+        try {
+          return await this.createSessionWithOptions(model, { ...options, preferredOutputLocation: void 0 });
+        } catch (e) {
+        }
+      }
+      if (options.graphOptimizationLevel === "all") {
+        try {
+          return await this.createSessionWithOptions(model, { ...options, graphOptimizationLevel: "disabled" });
+        } catch (e) {
+        }
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (/bad_alloc/i.test(message)) {
+        throw new Error(
+          `Failed to create SAM3 session "${label}": \u6D4F\u89C8\u5668 WASM \u5185\u5B58\u4E0D\u8DB3\u3002\u8BF7\u52A0\u8F7D fp16 \u6A21\u578B\uFF08vision-encoder.fp16.onnx / text-encoder.fp16.onnx\uFF09\uFF0C\u5E76\u4F18\u5148\u4F7F\u7528 WebGPU\u3002\u539F\u59CB\u9519\u8BEF: ${message}`
+        );
+      }
+      throw new Error(`Failed to create SAM3 session "${label}": ${message}`);
+    }
+  }
+  async createSessionWithOptions(model, options) {
+    if (typeof model === "string") {
+      return ort.InferenceSession.create(model, options);
+    }
+    if (model instanceof Uint8Array) {
+      return ort.InferenceSession.create(model, options);
+    }
+    return ort.InferenceSession.create(model, options);
+  }
+  encodedSize() {
+    const state = this.ensureState();
+    return { width: state.sourceWidth, height: state.sourceHeight };
+  }
+  pointerImageSize(target, options) {
+    var _a, _b;
+    if (options.imageWidth && options.imageHeight) {
+      return { width: options.imageWidth, height: options.imageHeight };
+    }
+    if (target instanceof HTMLCanvasElement) {
+      return { width: target.width, height: target.height };
+    }
+    const rect = typeof DOMRect !== "undefined" && target instanceof DOMRect ? target : target.getBoundingClientRect();
+    return { width: (_a = options.imageWidth) != null ? _a : rect.width, height: (_b = options.imageHeight) != null ? _b : rect.height };
+  }
+  selectHoverMask(result, options, promptBox) {
+    var _a;
+    const promptPoint = options.promptPoint;
+    let mask = pickBestMask(result.masks, result.ious, {
+      pick: (_a = options.pick) != null ? _a : promptPoint ? "smallest" : "iou",
+      point: promptPoint
+    });
+    const isolateAt = promptPoint != null ? promptPoint : promptBox ? {
+      x: (promptBox.left + promptBox.right) / 2,
+      y: (promptBox.top + promptBox.bottom) / 2
+    } : void 0;
+    if (mask && options.isolateComponent !== false && isolateAt) {
+      mask = isolateMaskComponent(mask, isolateAt);
+    }
+    return {
+      ...result,
+      mask,
+      promptPoint,
+      promptBox: promptBox != null ? promptBox : void 0
+    };
+  }
+  ensureHandler() {
+    if (!this.handler) {
+      throw new Error("SAM3 is not loaded. Call Sam3.create() / load() first.");
+    }
+    return this.handler;
+  }
+  ensureState() {
+    if (!this.state) {
+      throw new Error("You must call setImage() before prompting SAM3.");
+    }
+    return this.state;
+  }
+};
+
 exports.Classification = Classification;
 exports.DrawTool = DrawTool;
 exports.OBBDetection = OBBDetection;
 exports.ObjectDetection = ObjectDetection;
 exports.PoseEstimation = PoseEstimation;
+exports.SAM3_IMAGE_SIZE = SAM3_IMAGE_SIZE;
+exports.SAM3_MASK_SIZE = SAM3_MASK_SIZE;
+exports.SAM3_TEXT_LENGTH = SAM3_TEXT_LENGTH;
+exports.Sam3 = Sam3;
+exports.Sam3HoverPreview = Sam3HoverPreview;
 exports.Segmentation = Segmentation;
 exports.TrackingInfo = TrackingInfo;
 exports.Yolo = Yolo;
@@ -2931,7 +5354,15 @@ exports.ensureOnnxRuntimeWebInitialized = ensureOnnxRuntimeWebInitialized;
 exports.getLoadedOrtBundle = getLoadedOrtBundle;
 exports.getOrt = getOrt;
 exports.initializeOnnxRuntimeWeb = initializeOnnxRuntimeWeb;
+exports.isWebAssemblyJspiAvailable = isWebAssemblyJspiAvailable;
+exports.isolateMaskComponent = isolateMaskComponent;
+exports.mapImageBox = mapImageBox;
+exports.mapImagePoint = mapImagePoint;
+exports.maskToPolygon = maskToPolygon;
 exports.ort = ort;
+exports.pickBestMask = pickBestMask;
+exports.pointerToImagePoint = pointerToImagePoint;
 exports.resolveOrtBundle = resolveOrtBundle;
+exports.splitTextPrompts = splitTextPrompts;
 //# sourceMappingURL=index.cjs.map
 //# sourceMappingURL=index.cjs.map

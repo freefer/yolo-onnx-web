@@ -8,14 +8,28 @@ export {
 } from './preprocess';
 export type {
   Sam3BoxPrompt,
+  Sam3HoverBoxOptions,
+  Sam3HoverMode,
+  Sam3HoverPick,
+  Sam3HoverPointOptions,
+  Sam3HoverPreviewOptions,
+  Sam3HoverResult,
+  Sam3HoverSelectOptions,
   Sam3ImageInput,
   Sam3InferenceState,
+  Sam3MaskOverlayOptions,
+  Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PcsRawOutput,
+  Sam3PointerLike,
+  Sam3PointerToImageOptions,
   Sam3PointPrompt,
   Sam3PvsPrompt,
   Sam3PvsResult,
   Sam3TokenizerTables,
 } from './types';
+export { Sam3HoverPreview } from './sam3-hover';
+export { isolateMaskComponent, maskToPolygon, pickBestMask } from './sam3-mask';
+export { mapImageBox, mapImagePoint, pointerToImagePoint } from './sam3-pointer';

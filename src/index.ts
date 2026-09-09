@@ -21,7 +21,9 @@ export {
   YoloWebExecutionProviderOptions,
 } from './types';
 export { Yolo } from './yolo';
-export { Sam3 } from './sam3';
+export { Sam3, Sam3HoverPreview } from './sam3';
+export { isolateMaskComponent, maskToPolygon, pickBestMask } from './handler/sam3/sam3-mask';
+export { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 export { DrawTool } from './draw-tool';
 export type {
   OnnxRuntimeWebOptions,
@@ -55,12 +57,23 @@ export type {
 } from './types';
 export type {
   Sam3BoxPrompt,
+  Sam3HoverBoxOptions,
+  Sam3HoverMode,
+  Sam3HoverPick,
+  Sam3HoverPointOptions,
+  Sam3HoverPreviewOptions,
+  Sam3HoverResult,
+  Sam3HoverSelectOptions,
   Sam3ImageInput,
   Sam3InferenceState,
+  Sam3MaskOverlayOptions,
+  Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PcsRawOutput,
+  Sam3PointerLike,
+  Sam3PointerToImageOptions,
   Sam3PointPrompt,
   Sam3PvsPrompt,
   Sam3PvsResult,

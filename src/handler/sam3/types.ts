@@ -36,7 +36,92 @@ export interface Sam3PvsPrompt {
   box?: Rect | null;
   maskInput?: Sam3MaskPrompt | null;
   multimaskOutput?: boolean;
+  /**
+   * 是否把本次提示写入 inferenceState（点/框/mask_input/lastPvs）。
+   * 悬停预览应设为 false，避免冲掉已累积的 PVS 会话。
+   */
+  persist?: boolean;
 }
+
+export interface Sam3PvsResult {
+  masks: Segmentation[];
+  lowResMasks: Float32Array[];
+  ious: number[];
+  objectScores: number[];
+  maskWidth?: number;
+  maskHeight?: number;
+}
+
+export type Sam3HoverMode = 'replace' | 'accumulate';
+export type Sam3HoverPick = 'smallest' | 'iou' | 'first';
+
+export interface Sam3HoverSelectOptions {
+  /** 多候选选择：含提示点时默认 smallest，否则 iou */
+  pick?: Sam3HoverPick;
+  /** 只保留提示点附近的连通域，默认 true */
+  isolateComponent?: boolean;
+  promptPoint?: Point;
+}
+
+export interface Sam3HoverPointOptions extends Sam3HoverSelectOptions {
+  label?: 0 | 1;
+  /** replace：每次独立单点（默认，适合 mousemove）；accumulate：等同 addPoint */
+  mode?: Sam3HoverMode;
+  multimaskOutput?: boolean;
+  /** 使用上一轮 low-res mask 作为 mask_input 做精细化，replace 默认 false */
+  refinePrevious?: boolean;
+}
+
+export interface Sam3HoverBoxOptions extends Sam3HoverSelectOptions {
+  multimaskOutput?: boolean;
+  refinePrevious?: boolean;
+}
+
+export interface Sam3HoverResult extends Sam3PvsResult {
+  mask: Segmentation | null;
+  promptPoint?: Point;
+  promptBox?: Rect;
+}
+
+export interface Sam3MaskOverlayOptions {
+  fill?: string;
+  stroke?: string;
+  dest?: Rect;
+  displayWidth?: number;
+  displayHeight?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+}
+
+export interface Sam3MaskPolygonOptions {
+  imageWidth: number;
+  imageHeight: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  prompt?: Point;
+  epsilon?: number;
+}
+
+export interface Sam3PointerToImageOptions {
+  imageWidth?: number;
+  imageHeight?: number;
+  /** client：用 getBoundingClientRect 映射（默认）；offset：用 offsetX/offsetY */
+  origin?: 'client' | 'offset';
+  objectFit?: 'fill' | 'contain' | 'cover' | 'none';
+}
+
+export interface Sam3HoverPreviewOptions extends Sam3HoverPointOptions {
+  /** 与上一次推理点的最小移动距离，默认 2 */
+  minMove?: number;
+  onResult?: (result: Sam3HoverResult | null) => void;
+}
+
+export type Sam3PointerLike = {
+  clientX: number;
+  clientY: number;
+  offsetX?: number;
+  offsetY?: number;
+};
 
 export interface Sam3VisionEmbeddings {
   detFpn0: ort.Tensor;
@@ -82,15 +167,6 @@ export interface Sam3InferenceState {
   lastPcs?: Segmentation[];
   lastPcsRaw?: Sam3PcsRawOutput[];
   lastPvs?: Sam3PvsResult;
-}
-
-export interface Sam3PvsResult {
-  masks: Segmentation[];
-  lowResMasks: Float32Array[];
-  ious: number[];
-  objectScores: number[];
-  maskWidth?: number;
-  maskHeight?: number;
 }
 
 export interface Sam3Options extends OnnxRuntimeWebOptions {
