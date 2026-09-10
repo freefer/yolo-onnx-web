@@ -11,10 +11,12 @@ import type {
   Sam3HoverResult,
   Sam3HoverSelectOptions,
   Sam3ImageInput,
+  Sam3ImagePixelMask,
   Sam3InferenceState,
   Sam3MaskOverlayOptions,
   Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
+  Sam3MaskRasterOptions,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PointerLike,
@@ -24,7 +26,12 @@ import type {
   Sam3PvsResult,
 } from './handler/sam3/types';
 import { Sam3HoverPreview } from './handler/sam3/sam3-hover';
-import { isolateMaskComponent, maskToPolygon, pickBestMask } from './handler/sam3/sam3-mask';
+import {
+  maskToImagePixels,
+  maskToPolygon,
+  maskToPolygons,
+  selectVisualMask,
+} from './handler/sam3/sam3-mask';
 import { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 import { ensureOnnxRuntimeWebInitialized, ort } from './runtime';
 import type { Point, Rect, Segmentation, SegmentationDrawingOptions, YoloModelSource } from './types';
@@ -396,11 +403,63 @@ export class Sam3 {
   }
 
   maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][] {
-    return maskToPolygon(mask, {
-      ...options,
+    return maskToPolygon(mask, this.withSourceSize(options));
+  }
+
+  maskToPolygons(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][][] {
+    return maskToPolygons(mask, this.withSourceSize(options));
+  }
+
+  toImagePixelMask(
+    mask: Segmentation,
+    imageWidth: number,
+    imageHeight: number,
+    options: Omit<Sam3MaskRasterOptions, 'imageWidth' | 'imageHeight'> = {},
+  ): Sam3ImagePixelMask | null {
+    return maskToImagePixels(mask, {
+      imageWidth,
+      imageHeight,
       sourceWidth: options.sourceWidth ?? this.state?.sourceWidth,
       sourceHeight: options.sourceHeight ?? this.state?.sourceHeight,
     });
+  }
+
+  selectVisualMask(
+    result: Sam3PvsResult,
+    options: Sam3HoverSelectOptions = {},
+    promptBox?: Rect | null,
+  ): Sam3HoverResult {
+    return selectVisualMask(result, options, promptBox);
+  }
+
+  /** 把 hover / confirm 选中的候选写入 PVS 状态，不再次推理。 */
+  acceptVisualResult(result: Sam3HoverResult): Sam3HoverResult {
+    const state = this.ensureState();
+    if (result.promptBox) {
+      state.pvsBox = result.promptBox;
+      state.pvsPoints = [];
+    } else if (result.promptPoint) {
+      state.pvsPoints = [{ point: result.promptPoint, label: 1 }];
+      state.pvsBox = null;
+    }
+    state.lastPvs = {
+      masks: result.masks,
+      lowResMasks: result.lowResMasks,
+      ious: result.ious,
+      objectScores: result.objectScores,
+      maskWidth: result.maskWidth,
+      maskHeight: result.maskHeight,
+    };
+    const index = result.maskIndex >= 0 ? result.maskIndex : 0;
+    const logits = result.lowResMasks[index];
+    if (logits) {
+      state.pvsMaskInput = {
+        logits,
+        width: result.maskWidth ?? SAM3_MASK_SIZE,
+        height: result.maskHeight ?? SAM3_MASK_SIZE,
+      };
+    }
+    return result;
   }
 
   selectVisualCandidate(index: number): Sam3PvsResult {
@@ -566,28 +625,14 @@ export class Sam3 {
     options: Sam3HoverSelectOptions,
     promptBox?: Rect | null,
   ): Sam3HoverResult {
-    const promptPoint = options.promptPoint;
-    let mask = pickBestMask(result.masks, result.ious, {
-      pick: options.pick ?? (promptPoint ? 'smallest' : 'iou'),
-      point: promptPoint,
-    });
-    const isolateAt =
-      promptPoint ??
-      (promptBox
-        ? {
-            x: (promptBox.left + promptBox.right) / 2,
-            y: (promptBox.top + promptBox.bottom) / 2,
-          }
-        : undefined);
-    if (mask && options.isolateComponent !== false && isolateAt) {
-      mask = isolateMaskComponent(mask, isolateAt);
-    }
+    return selectVisualMask(result, options, promptBox);
+  }
 
+  private withSourceSize<T extends { sourceWidth?: number; sourceHeight?: number }>(options: T): T {
     return {
-      ...result,
-      mask,
-      promptPoint,
-      promptBox: promptBox ?? undefined,
+      ...options,
+      sourceWidth: options.sourceWidth ?? this.state?.sourceWidth,
+      sourceHeight: options.sourceHeight ?? this.state?.sourceHeight,
     };
   }
 
@@ -618,10 +663,12 @@ export type {
   Sam3HoverResult,
   Sam3HoverSelectOptions,
   Sam3ImageInput,
+  Sam3ImagePixelMask,
   Sam3InferenceState,
   Sam3MaskOverlayOptions,
   Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
+  Sam3MaskRasterOptions,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PcsRawOutput,
@@ -633,6 +680,13 @@ export type {
   Sam3TokenizerTables,
 } from './handler/sam3/types';
 export { Sam3HoverPreview } from './handler/sam3/sam3-hover';
-export { isolateMaskComponent, maskToPolygon, pickBestMask } from './handler/sam3/sam3-mask';
+export {
+  isolateMaskComponent,
+  maskToImagePixels,
+  maskToPolygon,
+  maskToPolygons,
+  pickBestMask,
+  selectVisualMask,
+} from './handler/sam3/sam3-mask';
 export { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 export { SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH };

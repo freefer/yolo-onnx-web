@@ -54,6 +54,14 @@ export class Sam3HoverPreview {
     return this.running;
   }
 
+  async idle(): Promise<void> {
+    while (this.running || this.queued) {
+      await new Promise<void>(resolve => {
+        requestAnimationFrame(() => resolve());
+      });
+    }
+  }
+
   /** 已编码图像坐标系中的点 */
   queuePoint(point: Point): void {
     this.queued = point;
@@ -98,6 +106,33 @@ export class Sam3HoverPreview {
     this.lastPoint = null;
     this.lastResult = null;
     this.onResult?.(null);
+  }
+
+  /** 编码图坐标是否足够接近最近一次悬停结果，可直接作为点击确认。 */
+  canReusePoint(point: Point, maxDistance?: number): boolean {
+    const limit = maxDistance ?? this.options.confirmMaxDistance ?? 8;
+    const previous = this.lastResult?.promptPoint;
+    return Boolean(
+      this.lastResult?.mask &&
+        previous &&
+        Math.hypot(point.x - previous.x, point.y - previous.y) <= limit,
+    );
+  }
+
+  /**
+   * 点击确认：距离最近悬停点足够近时直接返回预览掩码，否则按同一套 hover 后处理再推理。
+   */
+  async confirmPoint(point: Point, maxDistance?: number): Promise<Sam3HoverResult> {
+    await this.idle();
+    if (this.canReusePoint(point, maxDistance) && this.lastResult) {
+      return this.lastResult;
+    }
+
+    const result = await this.host.hoverPoint(point, this.options);
+    this.lastPoint = point;
+    this.lastResult = result;
+    this.onResult?.(result);
+    return result;
   }
 
   private kick(): void {

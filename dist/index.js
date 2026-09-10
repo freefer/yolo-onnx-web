@@ -4507,6 +4507,13 @@ var Sam3HoverPreview = class {
   get busy() {
     return this.running;
   }
+  async idle() {
+    while (this.running || this.queued) {
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+    }
+  }
   /** 已编码图像坐标系中的点 */
   queuePoint(point) {
     this.queued = point;
@@ -4544,6 +4551,30 @@ var Sam3HoverPreview = class {
     this.lastPoint = null;
     this.lastResult = null;
     (_a = this.onResult) == null ? void 0 : _a.call(this, null);
+  }
+  /** 编码图坐标是否足够接近最近一次悬停结果，可直接作为点击确认。 */
+  canReusePoint(point, maxDistance) {
+    var _a, _b, _c;
+    const limit = (_a = maxDistance != null ? maxDistance : this.options.confirmMaxDistance) != null ? _a : 8;
+    const previous = (_b = this.lastResult) == null ? void 0 : _b.promptPoint;
+    return Boolean(
+      ((_c = this.lastResult) == null ? void 0 : _c.mask) && previous && Math.hypot(point.x - previous.x, point.y - previous.y) <= limit
+    );
+  }
+  /**
+   * 点击确认：距离最近悬停点足够近时直接返回预览掩码，否则按同一套 hover 后处理再推理。
+   */
+  async confirmPoint(point, maxDistance) {
+    var _a;
+    await this.idle();
+    if (this.canReusePoint(point, maxDistance) && this.lastResult) {
+      return this.lastResult;
+    }
+    const result = await this.host.hoverPoint(point, this.options);
+    this.lastPoint = point;
+    this.lastResult = result;
+    (_a = this.onResult) == null ? void 0 : _a.call(this, result);
+    return result;
   }
   kick() {
     if (!this.running) {
@@ -4596,8 +4627,288 @@ function pointerImageSize(target, options) {
   };
 }
 
-// src/handler/sam3/sam3-mask.ts
+// src/handler/sam3/sam3-contours.ts
 function packedMaskSize(mask) {
+  if (mask.pixelMaskWidth && mask.pixelMaskHeight) {
+    return {
+      width: Math.max(1, Math.round(mask.pixelMaskWidth)),
+      height: Math.max(1, Math.round(mask.pixelMaskHeight))
+    };
+  }
+  return {
+    width: Math.max(1, Math.round(mask.boundingBox.right - mask.boundingBox.left)),
+    height: Math.max(1, Math.round(mask.boundingBox.bottom - mask.boundingBox.top))
+  };
+}
+var DEFAULT_MAX_POLYGON_POINTS = 96;
+var MAX_MASK_POLYGONS = 16;
+var MIN_MASK_POLYGON_AREA_RATIO = 0.01;
+function maskToPolygons(mask, options) {
+  var _a, _b;
+  const imageWidth = options.imageWidth;
+  const imageHeight = options.imageHeight;
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return [];
+  }
+  const contours = tracePackedMaskContours(mask);
+  if (contours.length === 0) {
+    return [];
+  }
+  const sourceWidth = options.sourceWidth || imageWidth || 1;
+  const sourceHeight = options.sourceHeight || imageHeight || 1;
+  const size = packedMaskSize(mask);
+  const box = mask.boundingBox;
+  const boxWidth = box.right - box.left;
+  const boxHeight = box.bottom - box.top;
+  const maxPoints = (_a = options.maxPoints) != null ? _a : DEFAULT_MAX_POLYGON_POINTS;
+  const mapped = contours.map((contour) => {
+    const points = contour.map((point) => [
+      clamp4((box.left + point[0] * boxWidth / size.width) * (imageWidth / sourceWidth), 0, imageWidth),
+      clamp4((box.top + point[1] * boxHeight / size.height) * (imageHeight / sourceHeight), 0, imageHeight)
+    ]);
+    return { points, area: Math.abs(signedContourArea(points)) };
+  }).filter((item) => item.points.length >= 3 && item.area > 0).sort((left, right) => right.area - left.area);
+  if (mapped.length === 0) {
+    return [];
+  }
+  if (options.prompt) {
+    const mappedPrompt = {
+      x: options.prompt.x * imageWidth / sourceWidth,
+      y: options.prompt.y * imageHeight / sourceHeight
+    };
+    const selected = (_b = mapped.find((item) => pointInNumberContour(mappedPrompt, item.points))) != null ? _b : mapped[0];
+    return [finalizePolygon(selected.points, imageWidth, imageHeight, maxPoints, options.epsilon)];
+  }
+  const minArea = mapped[0].area * MIN_MASK_POLYGON_AREA_RATIO;
+  const outerContours = [];
+  for (const candidate of mapped) {
+    if (candidate.area < minArea || outerContours.length >= MAX_MASK_POLYGONS) {
+      break;
+    }
+    const probe = { x: candidate.points[0][0], y: candidate.points[0][1] };
+    if (outerContours.some((outer) => pointInNumberContour(probe, outer))) {
+      continue;
+    }
+    outerContours.push(finalizePolygon(candidate.points, imageWidth, imageHeight, maxPoints, options.epsilon));
+  }
+  return outerContours.filter((polygon) => polygon.length >= 3);
+}
+function maskToPolygon(mask, options) {
+  var _a;
+  return (_a = maskToPolygons(mask, options)[0]) != null ? _a : [];
+}
+function tracePackedMaskContours(mask) {
+  const packed = mask.bitPackedPixelMask;
+  const { width, height } = packedMaskSize(mask);
+  if (!(packed == null ? void 0 : packed.byteLength) || width * height > packed.byteLength * 8) {
+    return [];
+  }
+  const vertexWidth = width + 1;
+  const edges = [];
+  const outgoing = /* @__PURE__ */ new Map();
+  const isSet = (x, y) => {
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+      return false;
+    }
+    const index = y * width + x;
+    return (packed[index >> 3] & 1 << (index & 7)) !== 0;
+  };
+  const addEdge = (fromX, fromY, toX, toY, direction) => {
+    const edge = { fromX, fromY, toX, toY, direction, used: false };
+    edges.push(edge);
+    const key = fromY * vertexWidth + fromX;
+    const next = outgoing.get(key);
+    if (next) {
+      next.push(edge);
+    } else {
+      outgoing.set(key, [edge]);
+    }
+  };
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!isSet(x, y)) {
+        continue;
+      }
+      if (!isSet(x, y - 1)) {
+        addEdge(x, y, x + 1, y, 0);
+      }
+      if (!isSet(x + 1, y)) {
+        addEdge(x + 1, y, x + 1, y + 1, 1);
+      }
+      if (!isSet(x, y + 1)) {
+        addEdge(x + 1, y + 1, x, y + 1, 2);
+      }
+      if (!isSet(x - 1, y)) {
+        addEdge(x, y + 1, x, y, 3);
+      }
+    }
+  }
+  const contours = [];
+  for (const first of edges) {
+    if (first.used) {
+      continue;
+    }
+    const startKey = first.fromY * vertexWidth + first.fromX;
+    const points = [[first.fromX, first.fromY]];
+    let current = first;
+    let closed = false;
+    for (let guard = 0; current && guard <= edges.length; guard += 1) {
+      current.used = true;
+      points.push([current.toX, current.toY]);
+      const endKey = current.toY * vertexWidth + current.toX;
+      if (endKey === startKey) {
+        closed = true;
+        break;
+      }
+      current = chooseNextBoundaryEdge(outgoing.get(endKey), current.direction);
+    }
+    if (!closed || points.length < 4) {
+      continue;
+    }
+    points.pop();
+    if (signedContourArea(points) > 0) {
+      contours.push(points);
+    }
+  }
+  return contours;
+}
+function chooseNextBoundaryEdge(candidates, incomingDirection) {
+  let selected;
+  let selectedRank = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates != null ? candidates : []) {
+    if (candidate.used) {
+      continue;
+    }
+    const turn = (candidate.direction - incomingDirection + 4) % 4;
+    const rank = turn === 1 ? 0 : turn === 0 ? 1 : turn === 3 ? 2 : 3;
+    if (rank < selectedRank) {
+      selected = candidate;
+      selectedRank = rank;
+    }
+  }
+  return selected;
+}
+function finalizePolygon(points, imageWidth, imageHeight, maxPoints, epsilon) {
+  const pointLimit = Math.min(512, Math.max(3, Math.round(maxPoints)));
+  const dense = simplifyClosedPolygon(points, 0);
+  if (dense.length <= pointLimit) {
+    return dense.length >= 3 ? dense : samplePolygon(points, pointLimit);
+  }
+  let lowerEpsilon = 0;
+  let upperEpsilon = epsilon != null ? epsilon : polygonEpsilon(imageWidth, imageHeight);
+  let aboveLimit = dense;
+  let belowLimit = simplifyClosedPolygon(points, upperEpsilon);
+  while (belowLimit.length > pointLimit && upperEpsilon < 128) {
+    lowerEpsilon = upperEpsilon;
+    aboveLimit = belowLimit;
+    upperEpsilon *= 2;
+    belowLimit = simplifyClosedPolygon(points, upperEpsilon);
+  }
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    const mid = (lowerEpsilon + upperEpsilon) / 2;
+    const candidate = simplifyClosedPolygon(points, mid);
+    if (candidate.length > pointLimit) {
+      lowerEpsilon = mid;
+      aboveLimit = candidate;
+    } else {
+      upperEpsilon = mid;
+      belowLimit = candidate;
+    }
+  }
+  if (aboveLimit.length > pointLimit) {
+    return samplePolygon(aboveLimit, pointLimit);
+  }
+  return belowLimit.length >= 3 ? belowLimit : samplePolygon(dense, pointLimit);
+}
+function polygonEpsilon(width, height) {
+  return Math.max(1.25, Math.max(width, height) / 2048);
+}
+function signedContourArea(points) {
+  let area = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += current[0] * next[1] - next[0] * current[1];
+  }
+  return area / 2;
+}
+function pointInNumberContour(point, contour) {
+  let inside = false;
+  for (let index = 0, previous = contour.length - 1; index < contour.length; previous = index, index += 1) {
+    const current = contour[index];
+    const last = contour[previous];
+    if (current[1] > point.y !== last[1] > point.y && point.x < (last[0] - current[0]) * (point.y - current[1]) / (last[1] - current[1] || 1e-6) + current[0]) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+function samplePolygon(points, limit) {
+  if (points.length <= limit) {
+    return points;
+  }
+  const sampled = [];
+  const step = points.length / limit;
+  for (let index = 0; index < limit; index += 1) {
+    sampled.push(points[Math.floor(index * step)]);
+  }
+  return sampled;
+}
+function simplifyClosedPolygon(points, epsilon) {
+  if (points.length <= 4) {
+    return points;
+  }
+  const closed = [...points, points[0]];
+  const simplified = simplifyRdp(closed, epsilon);
+  if (simplified.length > 1 && simplified[0][0] === simplified[simplified.length - 1][0] && simplified[0][1] === simplified[simplified.length - 1][1]) {
+    simplified.pop();
+  }
+  return simplified;
+}
+function simplifyRdp(points, epsilon) {
+  if (points.length <= 4) {
+    return points;
+  }
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1;
+  keep[points.length - 1] = 1;
+  const stack = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [startIndex, endIndex] = stack.pop();
+    let maxDistance = 0;
+    let maxIndex = -1;
+    for (let index = startIndex + 1; index < endIndex; index += 1) {
+      const distance = perpendicularDistance(points[index], points[startIndex], points[endIndex]);
+      if (distance > maxDistance) {
+        maxDistance = distance;
+        maxIndex = index;
+      }
+    }
+    if (maxIndex >= 0 && maxDistance > epsilon) {
+      keep[maxIndex] = 1;
+      stack.push([startIndex, maxIndex], [maxIndex, endIndex]);
+    }
+  }
+  return points.filter((_, index) => keep[index] === 1);
+}
+function perpendicularDistance(point, start, end) {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const length = Math.hypot(dx, dy);
+  if (length <= 1e-6) {
+    return Math.hypot(point[0] - start[0], point[1] - start[1]);
+  }
+  return Math.abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / length;
+}
+function clamp4(value, min, max) {
+  if (!Number.isFinite(max) || max <= min) {
+    return Math.max(min, value);
+  }
+  return Math.min(Math.max(value, min), max);
+}
+
+// src/handler/sam3/sam3-mask.ts
+function packedMaskSize2(mask) {
   if (mask.pixelMaskWidth && mask.pixelMaskHeight) {
     return {
       width: Math.max(1, Math.round(mask.pixelMaskWidth)),
@@ -4634,8 +4945,32 @@ function pickBestMask(masks, ious = [], options = {}) {
   }
   return (_f = (_e = masks[bestIndex]) != null ? _e : masks[0]) != null ? _f : null;
 }
+function selectVisualMask(result, options = {}, promptBox) {
+  var _a;
+  const promptPoint = options.promptPoint;
+  const picked = pickBestMask(result.masks, result.ious, {
+    pick: (_a = options.pick) != null ? _a : promptPoint ? "smallest" : "iou",
+    point: promptPoint
+  });
+  const maskIndex = picked ? Math.max(0, result.masks.indexOf(picked)) : 0;
+  let mask = picked;
+  const isolateAt = promptPoint != null ? promptPoint : promptBox ? {
+    x: (promptBox.left + promptBox.right) / 2,
+    y: (promptBox.top + promptBox.bottom) / 2
+  } : void 0;
+  if (mask && options.isolateComponent !== false && isolateAt) {
+    mask = isolateMaskComponent(mask, isolateAt);
+  }
+  return {
+    ...result,
+    mask,
+    maskIndex,
+    promptPoint,
+    promptBox: promptBox != null ? promptBox : void 0
+  };
+}
 function isolateMaskComponent(mask, point) {
-  const size = packedMaskSize(mask);
+  const size = packedMaskSize2(mask);
   const width = size.width;
   const height = size.height;
   const box = mask.boundingBox;
@@ -4669,7 +5004,7 @@ function isolateMaskComponent(mask, point) {
       cropped[local >> 3] |= 1 << (local & 7);
     }
   }
-  return new Segmentation({
+  const isolated = new Segmentation({
     label: mask.label,
     confidence: mask.confidence,
     boundingBox: {
@@ -4682,42 +5017,112 @@ function isolateMaskComponent(mask, point) {
     pixelMaskWidth: cropWidth,
     pixelMaskHeight: cropHeight
   });
+  isolated.segmentationEdgePoints = DrawTool.extractSegmentationEdgePoints(isolated);
+  return isolated;
 }
-function maskToPolygon(mask, options) {
-  var _a;
-  const size = packedMaskSize(mask);
-  const local = new Segmentation({
-    label: mask.label,
-    confidence: mask.confidence,
-    boundingBox: { left: 0, top: 0, right: size.width, bottom: size.height },
-    bitPackedPixelMask: mask.bitPackedPixelMask,
-    pixelMaskWidth: size.width,
-    pixelMaskHeight: size.height
-  });
-  const sourceWidth = options.sourceWidth || options.imageWidth || 1;
-  const sourceHeight = options.sourceHeight || options.imageHeight || 1;
-  const scaleX = options.imageWidth / sourceWidth;
-  const scaleY = options.imageHeight / sourceHeight;
-  const box = mask.boundingBox;
-  const boxWidth = Math.max(box.right - box.left, 1e-6);
-  const boxHeight = Math.max(box.bottom - box.top, 1e-6);
-  const contours = DrawTool.splitEdgeContours(DrawTool.extractSegmentationEdgePoints(local)).map(
-    (contour) => contour.map((point) => ({
-      x: (box.left + point.x * boxWidth / size.width) * scaleX,
-      y: (box.top + point.y * boxHeight / size.height) * scaleY
-    }))
-  );
-  const prompt = options.prompt ? {
-    x: options.prompt.x * scaleX,
-    y: options.prompt.y * scaleY
-  } : void 0;
-  const best = pickBestContour(contours, prompt);
-  const raw = best.map((point) => [
-    clamp4(point.x, 0, options.imageWidth),
-    clamp4(point.y, 0, options.imageHeight)
-  ]);
-  const simplified = simplifyRdp(raw, (_a = options.epsilon) != null ? _a : 1.25);
-  return simplified.length >= 3 ? simplified : raw;
+function maskToImagePixels(mask, options) {
+  const imageWidth = options.imageWidth;
+  const imageHeight = options.imageHeight;
+  const sourceWidth = options.sourceWidth || imageWidth;
+  const sourceHeight = options.sourceHeight || imageHeight;
+  const size = packedMaskSize2(mask);
+  const packed = mask.bitPackedPixelMask;
+  if (imageWidth <= 0 || imageHeight <= 0 || packed.byteLength * 8 < size.width * size.height) {
+    return null;
+  }
+  const displayBox = {
+    left: mask.boundingBox.left * imageWidth / sourceWidth,
+    top: mask.boundingBox.top * imageHeight / sourceHeight,
+    right: mask.boundingBox.right * imageWidth / sourceWidth,
+    bottom: mask.boundingBox.bottom * imageHeight / sourceHeight
+  };
+  const left = Math.max(0, Math.floor(displayBox.left));
+  const top = Math.max(0, Math.floor(displayBox.top));
+  const right = Math.min(imageWidth, Math.ceil(displayBox.right));
+  const bottom = Math.min(imageHeight, Math.ceil(displayBox.bottom));
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+  const sampled = new Uint8Array(width * height);
+  let area = 0;
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = Math.min(
+      size.height - 1,
+      Math.max(
+        0,
+        Math.floor(
+          (top + y + 0.5 - displayBox.top) / Math.max(displayBox.bottom - displayBox.top, 1e-6) * size.height
+        )
+      )
+    );
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = Math.min(
+        size.width - 1,
+        Math.max(
+          0,
+          Math.floor(
+            (left + x + 0.5 - displayBox.left) / Math.max(displayBox.right - displayBox.left, 1e-6) * size.width
+          )
+        )
+      );
+      if (!isPackedMaskSet(packed, sourceY * size.width + sourceX)) {
+        continue;
+      }
+      sampled[y * width + x] = 1;
+      area += 1;
+    }
+  }
+  return cropBinaryPixels(left, top, width, height, sampled, area);
+}
+function cropBinaryPixels(originX, originY, width, height, pixels, area) {
+  if (area <= 0) {
+    return null;
+  }
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!pixels[y * width + x]) {
+        continue;
+      }
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+  const cropWidth = maxX - minX + 1;
+  const cropHeight = maxY - minY + 1;
+  const cropped = new Uint8Array(cropWidth * cropHeight);
+  const packed = new Uint8Array(Math.ceil(cropWidth * cropHeight / 8));
+  let cropArea = 0;
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      if (!pixels[y * width + x]) {
+        continue;
+      }
+      const local = (y - minY) * cropWidth + (x - minX);
+      cropped[local] = 1;
+      packed[local >> 3] |= 1 << (local & 7);
+      cropArea += 1;
+    }
+  }
+  return {
+    x: originX + minX,
+    y: originY + minY,
+    width: cropWidth,
+    height: cropHeight,
+    area: cropArea,
+    pixels: cropped,
+    packed
+  };
 }
 function floodFillMask(packed, width, height, startX, startY) {
   const visited = new Uint8Array(width * height);
@@ -4776,53 +5181,6 @@ function findNearestSetPixel(packed, width, height, startX, startY, maxRadius) {
   }
   return best;
 }
-function pickBestContour(contours, prompt) {
-  var _a, _b, _c;
-  if (contours.length === 0) {
-    return [];
-  }
-  const ranked = [...contours].sort((left, right) => polygonArea(right) - polygonArea(left));
-  const closed = ranked.filter(isMostlyClosedContour);
-  const pool = closed.length > 0 ? closed : ranked;
-  if (!prompt) {
-    return (_a = pool[0]) != null ? _a : [];
-  }
-  const containing = pool.filter((contour) => pointInPolygon(prompt, contour));
-  return (_c = (_b = containing[0]) != null ? _b : pool[0]) != null ? _c : [];
-}
-function isMostlyClosedContour(points) {
-  if (points.length < 3) {
-    return false;
-  }
-  const first = points[0];
-  const last = points[points.length - 1];
-  const gap = Math.max(Math.abs(first.x - last.x), Math.abs(first.y - last.y));
-  return gap <= Math.max(estimateEdgeStep(points) * 3, 4);
-}
-function estimateEdgeStep(points) {
-  return DrawTool.estimateEdgeStep(points);
-}
-function polygonArea(points) {
-  let area = 0;
-  for (let index = 0; index < points.length; index += 1) {
-    const current = points[index];
-    const next = points[(index + 1) % points.length];
-    area += current.x * next.y - next.x * current.y;
-  }
-  return Math.abs(area) / 2;
-}
-function pointInPolygon(point, polygon) {
-  let inside = false;
-  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
-    const current = polygon[index];
-    const last = polygon[previous];
-    const intersects = current.y > point.y !== last.y > point.y && point.x < (last.x - current.x) * (point.y - current.y) / (last.y - current.y || 1e-6) + current.x;
-    if (intersects) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
 function pointInBox(point, box) {
   return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
 }
@@ -4838,40 +5196,6 @@ function isPackedMaskSet(packed, pixelIndex) {
     return false;
   }
   return (packed[byteIndex] & 1 << (pixelIndex & 7)) !== 0;
-}
-function simplifyRdp(points, epsilon) {
-  if (points.length <= 4) {
-    return points;
-  }
-  const first = points[0];
-  const last = points[points.length - 1];
-  let maxDistance = 0;
-  let maxIndex = 0;
-  for (let index = 1; index < points.length - 1; index += 1) {
-    const distance = perpendicularDistance(points[index], first, last);
-    if (distance > maxDistance) {
-      maxDistance = distance;
-      maxIndex = index;
-    }
-  }
-  if (maxDistance <= epsilon) {
-    return [first, last];
-  }
-  const left = simplifyRdp(points.slice(0, maxIndex + 1), epsilon);
-  const right = simplifyRdp(points.slice(maxIndex), epsilon);
-  return [...left.slice(0, -1), ...right];
-}
-function perpendicularDistance(point, start, end) {
-  const dx = end[0] - start[0];
-  const dy = end[1] - start[1];
-  const length = Math.hypot(dx, dy) || 1;
-  return Math.abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / length;
-}
-function clamp4(value, min, max) {
-  if (!Number.isFinite(max) || max <= min) {
-    return Math.max(min, value);
-  }
-  return Math.min(Math.max(value, min), max);
 }
 
 // src/sam3.ts
@@ -5167,12 +5491,52 @@ var Sam3 = class _Sam3 {
     });
   }
   maskToPolygon(mask, options) {
+    return maskToPolygon(mask, this.withSourceSize(options));
+  }
+  maskToPolygons(mask, options) {
+    return maskToPolygons(mask, this.withSourceSize(options));
+  }
+  toImagePixelMask(mask, imageWidth, imageHeight, options = {}) {
     var _a, _b, _c, _d;
-    return maskToPolygon(mask, {
-      ...options,
+    return maskToImagePixels(mask, {
+      imageWidth,
+      imageHeight,
       sourceWidth: (_b = options.sourceWidth) != null ? _b : (_a = this.state) == null ? void 0 : _a.sourceWidth,
       sourceHeight: (_d = options.sourceHeight) != null ? _d : (_c = this.state) == null ? void 0 : _c.sourceHeight
     });
+  }
+  selectVisualMask(result, options = {}, promptBox) {
+    return selectVisualMask(result, options, promptBox);
+  }
+  /** 把 hover / confirm 选中的候选写入 PVS 状态，不再次推理。 */
+  acceptVisualResult(result) {
+    var _a, _b;
+    const state = this.ensureState();
+    if (result.promptBox) {
+      state.pvsBox = result.promptBox;
+      state.pvsPoints = [];
+    } else if (result.promptPoint) {
+      state.pvsPoints = [{ point: result.promptPoint, label: 1 }];
+      state.pvsBox = null;
+    }
+    state.lastPvs = {
+      masks: result.masks,
+      lowResMasks: result.lowResMasks,
+      ious: result.ious,
+      objectScores: result.objectScores,
+      maskWidth: result.maskWidth,
+      maskHeight: result.maskHeight
+    };
+    const index = result.maskIndex >= 0 ? result.maskIndex : 0;
+    const logits = result.lowResMasks[index];
+    if (logits) {
+      state.pvsMaskInput = {
+        logits,
+        width: (_a = result.maskWidth) != null ? _a : SAM3_MASK_SIZE,
+        height: (_b = result.maskHeight) != null ? _b : SAM3_MASK_SIZE
+      };
+    }
+    return result;
   }
   selectVisualCandidate(index) {
     return this.ensureHandler().selectPvsCandidate(index, this.ensureState());
@@ -5297,24 +5661,14 @@ var Sam3 = class _Sam3 {
     return { width: (_a = options.imageWidth) != null ? _a : rect.width, height: (_b = options.imageHeight) != null ? _b : rect.height };
   }
   selectHoverMask(result, options, promptBox) {
-    var _a;
-    const promptPoint = options.promptPoint;
-    let mask = pickBestMask(result.masks, result.ious, {
-      pick: (_a = options.pick) != null ? _a : promptPoint ? "smallest" : "iou",
-      point: promptPoint
-    });
-    const isolateAt = promptPoint != null ? promptPoint : promptBox ? {
-      x: (promptBox.left + promptBox.right) / 2,
-      y: (promptBox.top + promptBox.bottom) / 2
-    } : void 0;
-    if (mask && options.isolateComponent !== false && isolateAt) {
-      mask = isolateMaskComponent(mask, isolateAt);
-    }
+    return selectVisualMask(result, options, promptBox);
+  }
+  withSourceSize(options) {
+    var _a, _b, _c, _d;
     return {
-      ...result,
-      mask,
-      promptPoint,
-      promptBox: promptBox != null ? promptBox : void 0
+      ...options,
+      sourceWidth: (_b = options.sourceWidth) != null ? _b : (_a = this.state) == null ? void 0 : _a.sourceWidth,
+      sourceHeight: (_d = options.sourceHeight) != null ? _d : (_c = this.state) == null ? void 0 : _c.sourceHeight
     };
   }
   ensureHandler() {
@@ -5331,6 +5685,6 @@ var Sam3 = class _Sam3 {
   }
 };
 
-export { Classification, DrawTool, OBBDetection, ObjectDetection, PoseEstimation, SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, Sam3, Sam3HoverPreview, Segmentation, TrackingInfo, Yolo, YoloExecutionProviderNames, YoloExecutionProviderOptions, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, isWebAssemblyJspiAvailable, isolateMaskComponent, mapImageBox, mapImagePoint, maskToPolygon, ort, pickBestMask, pointerToImagePoint, resolveOrtBundle, splitTextPrompts };
+export { Classification, DrawTool, OBBDetection, ObjectDetection, PoseEstimation, SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, Sam3, Sam3HoverPreview, Segmentation, TrackingInfo, Yolo, YoloExecutionProviderNames, YoloExecutionProviderOptions, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, isWebAssemblyJspiAvailable, isolateMaskComponent, mapImageBox, mapImagePoint, maskToImagePixels, maskToPolygon, maskToPolygons, ort, pickBestMask, pointerToImagePoint, resolveOrtBundle, selectVisualMask, splitTextPrompts };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

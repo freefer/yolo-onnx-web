@@ -433,30 +433,80 @@ async function runPvsInteraction(start: Point, end: Point, isBox: boolean, negat
     return;
   }
 
+  const encodedEnd = toEncodedPoint(end);
   const busyTitle = isBox ? '正在按框分割实例' : `正在加入${negative ? '背景' : '前景'}点`;
-  writeOutput(`${busyTitle}...`);
-  await setBusy(true, busyTitle);
   const startedAt = performance.now();
 
   try {
-    const result = isBox
-      ? await sam3.addBox(normalizeRect(start, end))
-      : await sam3.addPoint(start, negative ? 0 : 1);
+    if (isBox) {
+      writeOutput(`${busyTitle}...`);
+      await setBusy(true, busyTitle);
+      const result = await sam3.hoverBox(toEncodedBox(normalizeRect(start, end)), {
+        pick: 'iou',
+        isolateComponent: true,
+      });
+      applyPvsHoverResult(result, startedAt, 'PVS 框分割');
+      return;
+    }
 
-    const bestIndex = argmax(result.ious);
-    currentMasks = [result.masks[bestIndex] ?? result.masks[0]].filter(Boolean);
-    renderCandidates(result.ious, bestIndex);
-    redraw();
-    writeOutput(
-      [
-        formatMaskResult('PVS 实例分割', currentMasks, performance.now() - startedAt),
-        `iou=${result.ious.map(value => value.toFixed(3)).join(', ')}`,
-        `objectScore=${result.objectScores.map(value => value.toFixed(3)).join(', ')}`,
-      ].join('\n'),
-    );
+    if (negative) {
+      writeOutput(`${busyTitle}...`);
+      await setBusy(true, busyTitle);
+      const raw = await sam3.addPoint(encodedEnd, 0);
+      const result = sam3.selectVisualMask(raw, {
+        pick: 'smallest',
+        isolateComponent: true,
+        promptPoint: encodedEnd,
+      });
+      applyPvsHoverResult(result, startedAt, 'PVS 背景点');
+      return;
+    }
+
+    const preview = ensureHoverPreview();
+    if (preview) {
+      await preview.idle();
+    }
+    const reused = preview?.canReusePoint(encodedEnd) ?? false;
+    if (!reused) {
+      writeOutput(`${busyTitle}...`);
+      await setBusy(true, busyTitle);
+    }
+
+    const result = preview
+      ? await preview.confirmPoint(encodedEnd)
+      : await sam3.hoverPoint(encodedEnd, { pick: 'smallest', isolateComponent: true });
+    applyPvsHoverResult(result, startedAt, 'PVS 实例分割');
   } finally {
     await setBusy(false);
   }
+}
+
+function applyPvsHoverResult(
+  result: Awaited<ReturnType<Sam3['hoverPoint']>>,
+  startedAt: number,
+  title: string,
+): void {
+  if (!sam3 || !result.mask) {
+    currentMasks = [];
+    clearCandidates();
+    redraw();
+    writeOutput(`${title}：未得到有效掩码。`);
+    return;
+  }
+
+  sam3.acceptVisualResult(result);
+  currentMasks = [result.mask];
+  hoverMask = null;
+  hoverPreview?.clear();
+  renderCandidates(result.ious, result.maskIndex);
+  redraw();
+  writeOutput(
+    [
+      formatMaskResult(title, currentMasks, performance.now() - startedAt),
+      `iou=${result.ious.map(value => value.toFixed(3)).join(', ')}`,
+      `objectScore=${result.objectScores.map(value => value.toFixed(3)).join(', ')}`,
+    ].join('\n'),
+  );
 }
 
 async function usePvsCandidate(index: number): Promise<void> {
@@ -464,8 +514,20 @@ async function usePvsCandidate(index: number): Promise<void> {
     return;
   }
 
-  const result = sam3.selectVisualCandidate(index);
-  currentMasks = result.masks;
+  const raw = sam3.selectVisualCandidate(index);
+  const points = sam3.inferenceState?.pvsPoints ?? [];
+  const point = points[points.length - 1]?.point;
+  const result = sam3.selectVisualMask(
+    raw,
+    {
+      pick: 'first',
+      isolateComponent: true,
+      promptPoint: point,
+    },
+    sam3.inferenceState?.pvsBox,
+  );
+  currentMasks = result.mask ? [result.mask] : raw.masks;
+  hoverMask = null;
   renderCandidates(sam3.inferenceState?.lastPvs?.ious ?? result.ious, index);
   redraw();
   writeOutput(`已选择候选 ${index + 1}。继续点击可在此掩码上精细化。`);
@@ -505,18 +567,29 @@ function redraw(): void {
     return;
   }
 
-  if (sam3 && currentMasks.length > 0) {
+  const { width, height } = getImageSize(sourceImage);
+  const opacity = getThresholdValue(resultOpacityInput, 1);
+
+  if (sam3 && currentMasks.length > 0 && getTaskMode() === 'pcs') {
     sam3.drawSegmentationEdgePoints(sourceImage, currentMasks, preview, {
       ...getSegmentationDrawOptions(),
       fillSegmentationEdgePoints: !dragStart,
     });
   } else {
-    const { width, height } = getImageSize(sourceImage);
     preview.width = width;
     preview.height = height;
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = 'high';
     context.drawImage(sourceImage, 0, 0, width, height);
+
+    if (sam3 && getTaskMode() === 'pvs') {
+      for (const mask of currentMasks) {
+        sam3.drawMask(context, mask, {
+          fill: `rgba(34, 197, 94, ${0.32 * opacity})`,
+          stroke: '#22c55e',
+        });
+      }
+    }
   }
 
   if (sam3 && hoverMask && !dragStart && getTaskMode() === 'pvs') {
@@ -761,6 +834,14 @@ function eventToImagePoint(event: PointerEvent): Point {
   return Sam3.pointerToImagePoint(event, preview);
 }
 
+function toEncodedPoint(point: Point): Point {
+  return sam3 ? sam3.toEncodedPoint(point, preview.width, preview.height) : point;
+}
+
+function toEncodedBox(box: Rect): Rect {
+  return sam3 ? sam3.toEncodedBox(box, preview.width, preview.height) : box;
+}
+
 function ensureHoverPreview(): Sam3HoverPreview | null {
   if (!sam3) {
     return null;
@@ -771,6 +852,7 @@ function ensureHoverPreview(): Sam3HoverPreview | null {
       minMove: 2,
       pick: 'smallest',
       isolateComponent: true,
+      confirmMaxDistance: 8,
       onResult: result => {
         hoverMask = result?.mask ?? null;
         if (!dragStart) {
@@ -851,8 +933,8 @@ function applyDemoModeUi(): void {
   demoModeBadge.textContent = isPages ? '线上 CDN' : '本地 npm';
   demoTitle.textContent = isPages ? 'SAM3 在线 Demo' : 'SAM3 交互分割示例';
   demoDescription.textContent = isPages
-    ? 'GitHub Pages 不托管 SAM3 权重。请选择本地导出目录（优先 *.fp16.onnx），或分别选择视觉/文本/Grounding/Prompt 与 clip_bpe.json。类别用逗号分隔。'
-    : '请选择 SAM3 模型目录，或分别选择各个 ONNX 与 tokenizer。浏览器请优先 fp16 视觉/文本编码器与 WebGPU。类别用逗号分隔。';
+    ? 'GitHub Pages 不托管 SAM3 权重。请选择本地导出目录（优先 *.fp16.onnx），或分别选择视觉/文本/Grounding/Prompt 与 clip_bpe.json。PVS 点击会确认当前悬停预览。'
+    : '请选择 SAM3 模型目录，或分别选择各个 ONNX 与 tokenizer。浏览器请优先 fp16 视觉/文本编码器与 WebGPU。PVS 点击会确认当前悬停预览。';
   document.title = isPages ? 'SAM3 Online Demo' : 'SAM3 browser example';
 }
 
@@ -896,7 +978,7 @@ function updateHint(): void {
   hint.textContent =
     getTaskMode() === 'pcs'
       ? 'PCS：类别用逗号分隔，例如 person, car, dog。详细描述可选，用来补充颜色、姿态、场景；查询时会加到每个类别上，标签仍用类别名。'
-      : 'PVS：移动鼠标悬停预览，左键加点，拖拽画框，只分割当前点/框里的那一件；右键或极性选“负例”添加背景点。';
+      : 'PVS：移动鼠标悬停预览，左键确认当前预览结果，拖拽画框；右键或极性选“负例”添加背景点。';
 }
 
 function yieldToUi(): Promise<void> {
@@ -974,20 +1056,6 @@ function isOrtBundleReloadError(error: unknown): boolean {
       'code' in error &&
       (error as { code?: string }).code === 'ORT_BUNDLE_RELOAD_REQUIRED',
   );
-}
-
-function argmax(values: readonly number[]): number {
-  let bestIndex = 0;
-  let bestValue = Number.NEGATIVE_INFINITY;
-
-  for (let index = 0; index < values.length; index += 1) {
-    if ((values[index] ?? Number.NEGATIVE_INFINITY) > bestValue) {
-      bestValue = values[index] ?? Number.NEGATIVE_INFINITY;
-      bestIndex = index;
-    }
-  }
-
-  return bestIndex;
 }
 
 function getElement<T extends Element>(selector: string): T {

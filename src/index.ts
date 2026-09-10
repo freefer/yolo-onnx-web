@@ -22,7 +22,14 @@ export {
 } from './types';
 export { Yolo } from './yolo';
 export { Sam3, Sam3HoverPreview } from './sam3';
-export { isolateMaskComponent, maskToPolygon, pickBestMask } from './handler/sam3/sam3-mask';
+export {
+  isolateMaskComponent,
+  maskToImagePixels,
+  maskToPolygon,
+  maskToPolygons,
+  pickBestMask,
+  selectVisualMask,
+} from './handler/sam3/sam3-mask';
 export { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 export { DrawTool } from './draw-tool';
 export type {
@@ -65,10 +72,12 @@ export type {
   Sam3HoverResult,
   Sam3HoverSelectOptions,
   Sam3ImageInput,
+  Sam3ImagePixelMask,
   Sam3InferenceState,
   Sam3MaskOverlayOptions,
   Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
+  Sam3MaskRasterOptions,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PcsRawOutput,

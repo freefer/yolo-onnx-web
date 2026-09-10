@@ -79,8 +79,29 @@ export interface Sam3HoverBoxOptions extends Sam3HoverSelectOptions {
 
 export interface Sam3HoverResult extends Sam3PvsResult {
   mask: Segmentation | null;
+  /** `mask` 对应的原始候选下标，便于把 low-res logits 写回 PVS 状态 */
+  maskIndex: number;
   promptPoint?: Point;
   promptBox?: Rect;
+}
+
+export interface Sam3ImagePixelMask {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  area: number;
+  /** 图像坐标系下 0/1 像素 */
+  pixels: Uint8Array;
+  /** 与 pixels 对应的 bit-packed 掩码 */
+  packed: Uint8Array;
+}
+
+export interface Sam3MaskRasterOptions {
+  imageWidth: number;
+  imageHeight: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
 }
 
 export interface Sam3MaskOverlayOptions {
@@ -100,6 +121,8 @@ export interface Sam3MaskPolygonOptions {
   sourceHeight?: number;
   prompt?: Point;
   epsilon?: number;
+  /** 单条轮廓最多保留的点数，默认 96 */
+  maxPoints?: number;
 }
 
 export interface Sam3PointerToImageOptions {
@@ -113,6 +136,8 @@ export interface Sam3PointerToImageOptions {
 export interface Sam3HoverPreviewOptions extends Sam3HoverPointOptions {
   /** 与上一次推理点的最小移动距离，默认 2 */
   minMove?: number;
+  /** 点击确认时，与最近一次悬停点的复用距离（编码图像像素），默认 8 */
+  confirmMaxDistance?: number;
   onResult?: (result: Sam3HoverResult | null) => void;
 }
 

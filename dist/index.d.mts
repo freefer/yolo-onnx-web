@@ -410,8 +410,27 @@ interface Sam3HoverBoxOptions extends Sam3HoverSelectOptions {
 }
 interface Sam3HoverResult extends Sam3PvsResult {
     mask: Segmentation | null;
+    /** `mask` 对应的原始候选下标，便于把 low-res logits 写回 PVS 状态 */
+    maskIndex: number;
     promptPoint?: Point;
     promptBox?: Rect;
+}
+interface Sam3ImagePixelMask {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    area: number;
+    /** 图像坐标系下 0/1 像素 */
+    pixels: Uint8Array;
+    /** 与 pixels 对应的 bit-packed 掩码 */
+    packed: Uint8Array;
+}
+interface Sam3MaskRasterOptions {
+    imageWidth: number;
+    imageHeight: number;
+    sourceWidth?: number;
+    sourceHeight?: number;
 }
 interface Sam3MaskOverlayOptions {
     fill?: string;
@@ -429,6 +448,8 @@ interface Sam3MaskPolygonOptions {
     sourceHeight?: number;
     prompt?: Point;
     epsilon?: number;
+    /** 单条轮廓最多保留的点数，默认 96 */
+    maxPoints?: number;
 }
 interface Sam3PointerToImageOptions {
     imageWidth?: number;
@@ -440,6 +461,8 @@ interface Sam3PointerToImageOptions {
 interface Sam3HoverPreviewOptions extends Sam3HoverPointOptions {
     /** 与上一次推理点的最小移动距离，默认 2 */
     minMove?: number;
+    /** 点击确认时，与最近一次悬停点的复用距离（编码图像像素），默认 8 */
+    confirmMaxDistance?: number;
     onResult?: (result: Sam3HoverResult | null) => void;
 }
 type Sam3PointerLike = {
@@ -542,6 +565,7 @@ declare class Sam3HoverPreview {
     get result(): Sam3HoverResult | null;
     get mask(): Segmentation | null;
     get busy(): boolean;
+    idle(): Promise<void>;
     /** 已编码图像坐标系中的点 */
     queuePoint(point: Point): void;
     /** 显示坐标系中的点（例如标注画布上的图像像素） */
@@ -551,16 +575,30 @@ declare class Sam3HoverPreview {
     /** offsetX / offsetY（元素 CSS 像素） */
     queueOffset(offsetX: number, offsetY: number, target: HTMLElement, pointer?: Sam3PointerToImageOptions): void;
     clear(): void;
+    /** 编码图坐标是否足够接近最近一次悬停结果，可直接作为点击确认。 */
+    canReusePoint(point: Point, maxDistance?: number): boolean;
+    /**
+     * 点击确认：距离最近悬停点足够近时直接返回预览掩码，否则按同一套 hover 后处理再推理。
+     */
+    confirmPoint(point: Point, maxDistance?: number): Promise<Sam3HoverResult>;
     private kick;
     private flush;
 }
+
+declare function maskToPolygons(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][][];
+declare function maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][];
 
 declare function pickBestMask(masks: readonly Segmentation[], ious?: readonly number[], options?: {
     pick?: Sam3HoverPick;
     point?: Point;
 }): Segmentation | null;
+/**
+ * 从 PVS 多候选中选出预览/点击应展示的那一块：默认点选 smallest + 连通域裁剪。
+ */
+declare function selectVisualMask(result: Sam3PvsResult, options?: Sam3HoverSelectOptions, promptBox?: Rect | null): Sam3HoverResult;
 declare function isolateMaskComponent(mask: Segmentation, point: Point): Segmentation;
-declare function maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][];
+/** 把编码图上的 Segmentation 采样到显示/标注图像坐标系。 */
+declare function maskToImagePixels(mask: Segmentation, options: Sam3MaskRasterOptions): Sam3ImagePixelMask | null;
 
 declare function pointerToImagePoint(event: Sam3PointerLike, target: HTMLElement | DOMRect, options?: Sam3PointerToImageOptions): Point;
 declare function mapImagePoint(point: Point, from: {
@@ -642,6 +680,11 @@ declare class Sam3 {
      */
     drawMask(context: CanvasRenderingContext2D, mask: Segmentation, options?: Sam3MaskOverlayOptions): void;
     maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][];
+    maskToPolygons(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][][];
+    toImagePixelMask(mask: Segmentation, imageWidth: number, imageHeight: number, options?: Omit<Sam3MaskRasterOptions, 'imageWidth' | 'imageHeight'>): Sam3ImagePixelMask | null;
+    selectVisualMask(result: Sam3PvsResult, options?: Sam3HoverSelectOptions, promptBox?: Rect | null): Sam3HoverResult;
+    /** 把 hover / confirm 选中的候选写入 PVS 状态，不再次推理。 */
+    acceptVisualResult(result: Sam3HoverResult): Sam3HoverResult;
     selectVisualCandidate(index: number): Sam3PvsResult;
     removePoint(index: number): Promise<Sam3PvsResult>;
     drawSegmentations(source: Sam3ImageInput, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
@@ -654,6 +697,7 @@ declare class Sam3 {
     private encodedSize;
     private pointerImageSize;
     private selectHoverMask;
+    private withSourceSize;
     private ensureHandler;
     private ensureState;
 }
@@ -708,4 +752,4 @@ declare class DrawTool {
     private static clamp;
 }
 
-export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type OrtBundle, type OrtModule, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, Sam3, type Sam3BoxPrompt, type Sam3HoverBoxOptions, type Sam3HoverMode, type Sam3HoverPick, type Sam3HoverPointOptions, Sam3HoverPreview, type Sam3HoverPreviewOptions, type Sam3HoverResult, type Sam3HoverSelectOptions, type Sam3ImageInput, type Sam3InferenceState, type Sam3MaskOverlayOptions, type Sam3MaskPolygonOptions, type Sam3MaskPrompt, type Sam3Options, type Sam3PcsPrompt, type Sam3PcsRawOutput, type Sam3PointPrompt, type Sam3PointerLike, type Sam3PointerToImageOptions, type Sam3PvsPrompt, type Sam3PvsResult, type Sam3TokenizerTables, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, isWebAssemblyJspiAvailable, isolateMaskComponent, mapImageBox, mapImagePoint, maskToPolygon, ort, pickBestMask, pointerToImagePoint, resolveOrtBundle, splitTextPrompts };
+export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type OrtBundle, type OrtModule, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, Sam3, type Sam3BoxPrompt, type Sam3HoverBoxOptions, type Sam3HoverMode, type Sam3HoverPick, type Sam3HoverPointOptions, Sam3HoverPreview, type Sam3HoverPreviewOptions, type Sam3HoverResult, type Sam3HoverSelectOptions, type Sam3ImageInput, type Sam3ImagePixelMask, type Sam3InferenceState, type Sam3MaskOverlayOptions, type Sam3MaskPolygonOptions, type Sam3MaskPrompt, type Sam3MaskRasterOptions, type Sam3Options, type Sam3PcsPrompt, type Sam3PcsRawOutput, type Sam3PointPrompt, type Sam3PointerLike, type Sam3PointerToImageOptions, type Sam3PvsPrompt, type Sam3PvsResult, type Sam3TokenizerTables, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, isWebAssemblyJspiAvailable, isolateMaskComponent, mapImageBox, mapImagePoint, maskToImagePixels, maskToPolygon, maskToPolygons, ort, pickBestMask, pointerToImagePoint, resolveOrtBundle, selectVisualMask, splitTextPrompts };

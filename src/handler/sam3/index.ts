@@ -16,10 +16,12 @@ export type {
   Sam3HoverResult,
   Sam3HoverSelectOptions,
   Sam3ImageInput,
+  Sam3ImagePixelMask,
   Sam3InferenceState,
   Sam3MaskOverlayOptions,
   Sam3MaskPolygonOptions,
   Sam3MaskPrompt,
+  Sam3MaskRasterOptions,
   Sam3Options,
   Sam3PcsPrompt,
   Sam3PcsRawOutput,
@@ -31,5 +33,12 @@ export type {
   Sam3TokenizerTables,
 } from './types';
 export { Sam3HoverPreview } from './sam3-hover';
-export { isolateMaskComponent, maskToPolygon, pickBestMask } from './sam3-mask';
+export {
+  isolateMaskComponent,
+  maskToImagePixels,
+  maskToPolygon,
+  maskToPolygons,
+  pickBestMask,
+  selectVisualMask,
+} from './sam3-mask';
 export { mapImageBox, mapImagePoint, pointerToImagePoint } from './sam3-pointer';

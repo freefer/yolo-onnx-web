@@ -1,7 +1,16 @@
 import { DrawTool } from '../../draw-tool';
 import { Segmentation } from '../../types';
 import type { Point, Rect } from '../../types';
-import type { Sam3HoverPick, Sam3MaskPolygonOptions } from './types';
+import type {
+  Sam3HoverPick,
+  Sam3HoverResult,
+  Sam3HoverSelectOptions,
+  Sam3ImagePixelMask,
+  Sam3MaskRasterOptions,
+  Sam3PvsResult,
+} from './types';
+
+export { maskToPolygon, maskToPolygons } from './sam3-contours';
 
 export function packedMaskSize(mask: Segmentation): { width: number; height: number } {
   if (mask.pixelMaskWidth && mask.pixelMaskHeight) {
@@ -49,6 +58,42 @@ export function pickBestMask(
   return masks[bestIndex] ?? masks[0] ?? null;
 }
 
+/**
+ * 从 PVS 多候选中选出预览/点击应展示的那一块：默认点选 smallest + 连通域裁剪。
+ */
+export function selectVisualMask(
+  result: Sam3PvsResult,
+  options: Sam3HoverSelectOptions = {},
+  promptBox?: Rect | null,
+): Sam3HoverResult {
+  const promptPoint = options.promptPoint;
+  const picked = pickBestMask(result.masks, result.ious, {
+    pick: options.pick ?? (promptPoint ? 'smallest' : 'iou'),
+    point: promptPoint,
+  });
+  const maskIndex = picked ? Math.max(0, result.masks.indexOf(picked)) : 0;
+  let mask = picked;
+  const isolateAt =
+    promptPoint ??
+    (promptBox
+      ? {
+          x: (promptBox.left + promptBox.right) / 2,
+          y: (promptBox.top + promptBox.bottom) / 2,
+        }
+      : undefined);
+  if (mask && options.isolateComponent !== false && isolateAt) {
+    mask = isolateMaskComponent(mask, isolateAt);
+  }
+
+  return {
+    ...result,
+    mask,
+    maskIndex,
+    promptPoint,
+    promptBox: promptBox ?? undefined,
+  };
+}
+
 export function isolateMaskComponent(mask: Segmentation, point: Point): Segmentation {
   const size = packedMaskSize(mask);
   const width = size.width;
@@ -88,7 +133,7 @@ export function isolateMaskComponent(mask: Segmentation, point: Point): Segmenta
     }
   }
 
-  return new Segmentation({
+  const isolated = new Segmentation({
     label: mask.label,
     confidence: mask.confidence,
     boundingBox: {
@@ -101,44 +146,128 @@ export function isolateMaskComponent(mask: Segmentation, point: Point): Segmenta
     pixelMaskWidth: cropWidth,
     pixelMaskHeight: cropHeight,
   });
+  isolated.segmentationEdgePoints = DrawTool.extractSegmentationEdgePoints(isolated);
+  return isolated;
 }
 
-export function maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][] {
+/** 把编码图上的 Segmentation 采样到显示/标注图像坐标系。 */
+export function maskToImagePixels(mask: Segmentation, options: Sam3MaskRasterOptions): Sam3ImagePixelMask | null {
+  const imageWidth = options.imageWidth;
+  const imageHeight = options.imageHeight;
+  const sourceWidth = options.sourceWidth || imageWidth;
+  const sourceHeight = options.sourceHeight || imageHeight;
   const size = packedMaskSize(mask);
-  const local = new Segmentation({
-    label: mask.label,
-    confidence: mask.confidence,
-    boundingBox: { left: 0, top: 0, right: size.width, bottom: size.height },
-    bitPackedPixelMask: mask.bitPackedPixelMask,
-    pixelMaskWidth: size.width,
-    pixelMaskHeight: size.height,
-  });
-  const sourceWidth = options.sourceWidth || options.imageWidth || 1;
-  const sourceHeight = options.sourceHeight || options.imageHeight || 1;
-  const scaleX = options.imageWidth / sourceWidth;
-  const scaleY = options.imageHeight / sourceHeight;
-  const box = mask.boundingBox;
-  const boxWidth = Math.max(box.right - box.left, 1e-6);
-  const boxHeight = Math.max(box.bottom - box.top, 1e-6);
-  const contours = DrawTool.splitEdgeContours(DrawTool.extractSegmentationEdgePoints(local)).map(contour =>
-    contour.map(point => ({
-      x: (box.left + (point.x * boxWidth) / size.width) * scaleX,
-      y: (box.top + (point.y * boxHeight) / size.height) * scaleY,
-    })),
-  );
-  const prompt = options.prompt
-    ? {
-        x: options.prompt.x * scaleX,
-        y: options.prompt.y * scaleY,
+  const packed = mask.bitPackedPixelMask;
+  if (imageWidth <= 0 || imageHeight <= 0 || packed.byteLength * 8 < size.width * size.height) {
+    return null;
+  }
+
+  const displayBox = {
+    left: (mask.boundingBox.left * imageWidth) / sourceWidth,
+    top: (mask.boundingBox.top * imageHeight) / sourceHeight,
+    right: (mask.boundingBox.right * imageWidth) / sourceWidth,
+    bottom: (mask.boundingBox.bottom * imageHeight) / sourceHeight,
+  };
+  const left = Math.max(0, Math.floor(displayBox.left));
+  const top = Math.max(0, Math.floor(displayBox.top));
+  const right = Math.min(imageWidth, Math.ceil(displayBox.right));
+  const bottom = Math.min(imageHeight, Math.ceil(displayBox.bottom));
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  const sampled = new Uint8Array(width * height);
+  let area = 0;
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = Math.min(
+      size.height - 1,
+      Math.max(
+        0,
+        Math.floor(
+          ((top + y + 0.5 - displayBox.top) / Math.max(displayBox.bottom - displayBox.top, 1e-6)) * size.height,
+        ),
+      ),
+    );
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = Math.min(
+        size.width - 1,
+        Math.max(
+          0,
+          Math.floor(
+            ((left + x + 0.5 - displayBox.left) / Math.max(displayBox.right - displayBox.left, 1e-6)) * size.width,
+          ),
+        ),
+      );
+      if (!isPackedMaskSet(packed, sourceY * size.width + sourceX)) {
+        continue;
       }
-    : undefined;
-  const best = pickBestContour(contours, prompt);
-  const raw = best.map(point => [
-    clamp(point.x, 0, options.imageWidth),
-    clamp(point.y, 0, options.imageHeight),
-  ]);
-  const simplified = simplifyRdp(raw, options.epsilon ?? 1.25);
-  return simplified.length >= 3 ? simplified : raw;
+      sampled[y * width + x] = 1;
+      area += 1;
+    }
+  }
+
+  return cropBinaryPixels(left, top, width, height, sampled, area);
+}
+
+function cropBinaryPixels(
+  originX: number,
+  originY: number,
+  width: number,
+  height: number,
+  pixels: Uint8Array,
+  area: number,
+): Sam3ImagePixelMask | null {
+  if (area <= 0) {
+    return null;
+  }
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!pixels[y * width + x]) {
+        continue;
+      }
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+
+  const cropWidth = maxX - minX + 1;
+  const cropHeight = maxY - minY + 1;
+  const cropped = new Uint8Array(cropWidth * cropHeight);
+  const packed = new Uint8Array(Math.ceil((cropWidth * cropHeight) / 8));
+  let cropArea = 0;
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      if (!pixels[y * width + x]) {
+        continue;
+      }
+      const local = (y - minY) * cropWidth + (x - minX);
+      cropped[local] = 1;
+      packed[local >> 3] |= 1 << (local & 0b0111);
+      cropArea += 1;
+    }
+  }
+
+  return {
+    x: originX + minX,
+    y: originY + minY,
+    width: cropWidth,
+    height: cropHeight,
+    area: cropArea,
+    pixels: cropped,
+    packed,
+  };
 }
 
 function floodFillMask(
@@ -215,62 +344,6 @@ function findNearestSetPixel(
   return best;
 }
 
-function pickBestContour(contours: readonly Point[][], prompt?: Point): Point[] {
-  if (contours.length === 0) {
-    return [];
-  }
-
-  const ranked = [...contours].sort((left, right) => polygonArea(right) - polygonArea(left));
-  const closed = ranked.filter(isMostlyClosedContour);
-  const pool = closed.length > 0 ? closed : ranked;
-  if (!prompt) {
-    return pool[0] ?? [];
-  }
-
-  const containing = pool.filter(contour => pointInPolygon(prompt, contour));
-  return containing[0] ?? pool[0] ?? [];
-}
-
-function isMostlyClosedContour(points: readonly Point[]): boolean {
-  if (points.length < 3) {
-    return false;
-  }
-
-  const first = points[0];
-  const last = points[points.length - 1];
-  const gap = Math.max(Math.abs(first.x - last.x), Math.abs(first.y - last.y));
-  return gap <= Math.max(estimateEdgeStep(points) * 3, 4);
-}
-
-function estimateEdgeStep(points: readonly Point[]): number {
-  return DrawTool.estimateEdgeStep(points);
-}
-
-function polygonArea(points: readonly Point[]): number {
-  let area = 0;
-  for (let index = 0; index < points.length; index += 1) {
-    const current = points[index];
-    const next = points[(index + 1) % points.length];
-    area += current.x * next.y - next.x * current.y;
-  }
-  return Math.abs(area) / 2;
-}
-
-function pointInPolygon(point: Point, polygon: readonly Point[]): boolean {
-  let inside = false;
-  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
-    const current = polygon[index];
-    const last = polygon[previous];
-    const intersects =
-      current.y > point.y !== last.y > point.y &&
-      point.x < ((last.x - current.x) * (point.y - current.y)) / ((last.y - current.y) || 1e-6) + current.x;
-    if (intersects) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
 function pointInBox(point: Point, box: Rect): boolean {
   return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
 }
@@ -293,44 +366,4 @@ function isPackedMaskSet(packed: Uint8Array, pixelIndex: number): boolean {
   }
 
   return (packed[byteIndex] & (1 << (pixelIndex & 0b0111))) !== 0;
-}
-
-function simplifyRdp(points: number[][], epsilon: number): number[][] {
-  if (points.length <= 4) {
-    return points;
-  }
-
-  const first = points[0];
-  const last = points[points.length - 1];
-  let maxDistance = 0;
-  let maxIndex = 0;
-  for (let index = 1; index < points.length - 1; index += 1) {
-    const distance = perpendicularDistance(points[index], first, last);
-    if (distance > maxDistance) {
-      maxDistance = distance;
-      maxIndex = index;
-    }
-  }
-
-  if (maxDistance <= epsilon) {
-    return [first, last];
-  }
-
-  const left = simplifyRdp(points.slice(0, maxIndex + 1), epsilon);
-  const right = simplifyRdp(points.slice(maxIndex), epsilon);
-  return [...left.slice(0, -1), ...right];
-}
-
-function perpendicularDistance(point: number[], start: number[], end: number[]): number {
-  const dx = end[0] - start[0];
-  const dy = end[1] - start[1];
-  const length = Math.hypot(dx, dy) || 1;
-  return Math.abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / length;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  if (!Number.isFinite(max) || max <= min) {
-    return Math.max(min, value);
-  }
-  return Math.min(Math.max(value, min), max);
 }
