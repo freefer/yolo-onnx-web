@@ -175,6 +175,77 @@ export function getLoadedOrtBundle(): Exclude<OrtBundle, 'auto'> | null {
   return loadedBundle;
 }
 
+const WEBGPU_SESSION_BUSY = /another WebGPU EP inference session is being created/i;
+let webGpuSessionLock: Promise<void> = Promise.resolve();
+
+function sessionUsesWebGpu(options?: OrtTypes.InferenceSession.SessionOptions): boolean {
+  const providers = options?.executionProviders ?? [];
+  return providers.some(provider => {
+    if (typeof provider === 'string') {
+      return provider === 'webgpu';
+    }
+    return (provider as { name?: string }).name === 'webgpu';
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function createInferenceSession(
+  model: string | ArrayBufferLike | Uint8Array,
+  options?: OrtTypes.InferenceSession.SessionOptions,
+): Promise<OrtTypes.InferenceSession> {
+  if (typeof model === 'string') {
+    return ort.InferenceSession.create(model, options);
+  }
+  if (model instanceof Uint8Array) {
+    return ort.InferenceSession.create(model, options);
+  }
+  return ort.InferenceSession.create(model, options);
+}
+
+/**
+ * onnxruntime-web WebGPU EP only allows one InferenceSession.create at a time.
+ * Queue WebGPU session creation globally so SAM3's multiple encoders/decoders cannot race.
+ */
+export async function createOrtInferenceSession(
+  model: string | ArrayBufferLike | Uint8Array,
+  options?: OrtTypes.InferenceSession.SessionOptions,
+): Promise<OrtTypes.InferenceSession> {
+  if (!sessionUsesWebGpu(options)) {
+    return createInferenceSession(model, options);
+  }
+
+  let release!: () => void;
+  const previous = webGpuSessionLock;
+  webGpuSessionLock = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  await previous;
+
+  try {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        return await createInferenceSession(model, options);
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!WEBGPU_SESSION_BUSY.test(message) || attempt === 5) {
+          throw error;
+        }
+        await delay(40 * (attempt + 1));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  } finally {
+    release();
+  }
+}
+
 /** Compatible alias used after initialization (Tensor / InferenceSession / env). */
 export const ort: OrtModule = new Proxy({} as OrtModule, {
   get(_target, property, receiver) {

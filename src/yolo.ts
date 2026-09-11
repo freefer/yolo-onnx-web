@@ -1,7 +1,7 @@
 import type * as OrtTypes from 'onnxruntime-web';
 import { DrawTool } from './draw-tool';
 import { parseOnnxModel } from './onnx-model';
-import { ensureOnnxRuntimeWebInitialized, ort } from './runtime';
+import { createOrtInferenceSession, ensureOnnxRuntimeWebInitialized, ort } from './runtime';
 import type {
   Classification,
   ClassificationDrawingOptions,
@@ -381,18 +381,7 @@ export class Yolo {
   }
 
   private createSession(model: YoloModelSource): Promise<OrtTypes.InferenceSession> {
-    const options: OrtTypes.InferenceSession.SessionOptions = this.createSessionOptions();
- 
-    if (typeof model === 'string') {
-
-      return ort.InferenceSession.create(model, options);
-    }
-
-    if (model instanceof Uint8Array) {
-      return ort.InferenceSession.create(model, options);
-    }
-
-    return ort.InferenceSession.create(model, options);
+    return createOrtInferenceSession(model, this.createSessionOptions());
   }
 
   private ensureSession(): OrtTypes.InferenceSession {

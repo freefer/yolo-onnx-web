@@ -112,6 +112,61 @@ function getOrt() {
 function getLoadedOrtBundle() {
   return loadedBundle;
 }
+var WEBGPU_SESSION_BUSY = /another WebGPU EP inference session is being created/i;
+var webGpuSessionLock = Promise.resolve();
+function sessionUsesWebGpu(options) {
+  var _a;
+  const providers = (_a = options == null ? void 0 : options.executionProviders) != null ? _a : [];
+  return providers.some((provider) => {
+    if (typeof provider === "string") {
+      return provider === "webgpu";
+    }
+    return provider.name === "webgpu";
+  });
+}
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+function createInferenceSession(model, options) {
+  if (typeof model === "string") {
+    return ort.InferenceSession.create(model, options);
+  }
+  if (model instanceof Uint8Array) {
+    return ort.InferenceSession.create(model, options);
+  }
+  return ort.InferenceSession.create(model, options);
+}
+async function createOrtInferenceSession(model, options) {
+  if (!sessionUsesWebGpu(options)) {
+    return createInferenceSession(model, options);
+  }
+  let release;
+  const previous = webGpuSessionLock;
+  webGpuSessionLock = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    let lastError;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        return await createInferenceSession(model, options);
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!WEBGPU_SESSION_BUSY.test(message) || attempt === 5) {
+          throw error;
+        }
+        await delay(40 * (attempt + 1));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  } finally {
+    release();
+  }
+}
 var ort = new Proxy({}, {
   get(_target, property, receiver) {
     return Reflect.get(getOrt(), property, receiver);
@@ -2884,14 +2939,7 @@ var Yolo = class _Yolo {
     };
   }
   createSession(model) {
-    const options = this.createSessionOptions();
-    if (typeof model === "string") {
-      return ort.InferenceSession.create(model, options);
-    }
-    if (model instanceof Uint8Array) {
-      return ort.InferenceSession.create(model, options);
-    }
-    return ort.InferenceSession.create(model, options);
+    return createOrtInferenceSession(model, this.createSessionOptions());
   }
   ensureSession() {
     if (!this.session) {
@@ -5256,31 +5304,43 @@ var Sam3 = class _Sam3 {
       const progress = this.options.onLoadProgress;
       progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D\u89C6\u89C9\u7F16\u7801\u5668...");
       this.visionSession = await this.createSession("vision", this.options.visionEncoder);
-      progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D\u6587\u672C / Grounding / Prompt / tokenizer...");
       const promptSource = this.options.promptDecoder;
-      const textPromise = this.createSession("text", this.options.textEncoder);
-      const groundingPromise = this.createSession("grounding", this.options.groundingDecoder);
-      const promptPromise = promptSource ? this.createSession("prompt", promptSource) : Promise.resolve(null);
       const tokenizerPromise = this.options.tokenizer ? loadClipTokenizer(this.options.tokenizer) : Promise.resolve(null);
-      try {
-        const [textSession, groundingSession, promptSession, tokenizer] = await Promise.all([
-          textPromise,
-          groundingPromise,
-          promptPromise,
-          tokenizerPromise
-        ]);
-        this.textSession = textSession;
-        this.groundingSession = groundingSession;
-        this.promptSession = promptSession;
-        this.tokenizer = tokenizer;
-      } catch (error) {
-        const settled = await Promise.allSettled([textPromise, groundingPromise, promptPromise]);
-        await Promise.all(
-          settled.map(
-            (item) => item.status === "fulfilled" && item.value ? item.value.release() : Promise.resolve()
-          )
-        );
-        throw error;
+      if (this.webGpu) {
+        progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D\u6587\u672C\u7F16\u7801\u5668...");
+        this.textSession = await this.createSession("text", this.options.textEncoder);
+        progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D Grounding \u89E3\u7801\u5668...");
+        this.groundingSession = await this.createSession("grounding", this.options.groundingDecoder);
+        if (promptSource) {
+          progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D Prompt \u89E3\u7801\u5668...");
+          this.promptSession = await this.createSession("prompt", promptSource);
+        }
+        this.tokenizer = await tokenizerPromise;
+      } else {
+        progress == null ? void 0 : progress("\u6B63\u5728\u52A0\u8F7D\u6587\u672C / Grounding / Prompt / tokenizer...");
+        const textPromise = this.createSession("text", this.options.textEncoder);
+        const groundingPromise = this.createSession("grounding", this.options.groundingDecoder);
+        const promptPromise = promptSource ? this.createSession("prompt", promptSource) : Promise.resolve(null);
+        try {
+          const [textSession, groundingSession, promptSession, tokenizer] = await Promise.all([
+            textPromise,
+            groundingPromise,
+            promptPromise,
+            tokenizerPromise
+          ]);
+          this.textSession = textSession;
+          this.groundingSession = groundingSession;
+          this.promptSession = promptSession;
+          this.tokenizer = tokenizer;
+        } catch (error) {
+          const settled = await Promise.allSettled([textPromise, groundingPromise, promptPromise]);
+          await Promise.all(
+            settled.map(
+              (item) => item.status === "fulfilled" && item.value ? item.value.release() : Promise.resolve()
+            )
+          );
+          throw error;
+        }
       }
       if (!this.tokenizer) {
         throw new Error("SAM3 tokenizer tables are required. Pass tokenizer: clip_bpe.json or parsed tables.");
@@ -5637,13 +5697,7 @@ var Sam3 = class _Sam3 {
     }
   }
   async createSessionWithOptions(model, options) {
-    if (typeof model === "string") {
-      return ort.InferenceSession.create(model, options);
-    }
-    if (model instanceof Uint8Array) {
-      return ort.InferenceSession.create(model, options);
-    }
-    return ort.InferenceSession.create(model, options);
+    return createOrtInferenceSession(model, options);
   }
   encodedSize() {
     const state = this.ensureState();

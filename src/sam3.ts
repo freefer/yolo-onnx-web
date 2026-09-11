@@ -33,7 +33,7 @@ import {
   selectVisualMask,
 } from './handler/sam3/sam3-mask';
 import { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
-import { ensureOnnxRuntimeWebInitialized, ort } from './runtime';
+import { createOrtInferenceSession, ensureOnnxRuntimeWebInitialized, ort } from './runtime';
 import type { Point, Rect, Segmentation, SegmentationDrawingOptions, YoloModelSource } from './types';
 
 const DEFAULT_EXECUTION_PROVIDERS = ['wasm'] as const;
@@ -104,34 +104,48 @@ export class Sam3 {
       progress?.('正在加载视觉编码器...');
       this.visionSession = await this.createSession('vision', this.options.visionEncoder);
 
-      progress?.('正在加载文本 / Grounding / Prompt / tokenizer...');
       const promptSource = this.options.promptDecoder;
-      const textPromise = this.createSession('text', this.options.textEncoder);
-      const groundingPromise = this.createSession('grounding', this.options.groundingDecoder);
-      const promptPromise = promptSource ? this.createSession('prompt', promptSource) : Promise.resolve(null);
       const tokenizerPromise = this.options.tokenizer
         ? loadClipTokenizer(this.options.tokenizer)
         : Promise.resolve(null);
 
-      try {
-        const [textSession, groundingSession, promptSession, tokenizer] = await Promise.all([
-          textPromise,
-          groundingPromise,
-          promptPromise,
-          tokenizerPromise,
-        ]);
-        this.textSession = textSession;
-        this.groundingSession = groundingSession;
-        this.promptSession = promptSession;
-        this.tokenizer = tokenizer;
-      } catch (error) {
-        const settled = await Promise.allSettled([textPromise, groundingPromise, promptPromise]);
-        await Promise.all(
-          settled.map(item =>
-            item.status === 'fulfilled' && item.value ? item.value.release() : Promise.resolve(),
-          ),
-        );
-        throw error;
+      // WebGPU EP forbids overlapping InferenceSession.create calls.
+      if (this.webGpu) {
+        progress?.('正在加载文本编码器...');
+        this.textSession = await this.createSession('text', this.options.textEncoder);
+        progress?.('正在加载 Grounding 解码器...');
+        this.groundingSession = await this.createSession('grounding', this.options.groundingDecoder);
+        if (promptSource) {
+          progress?.('正在加载 Prompt 解码器...');
+          this.promptSession = await this.createSession('prompt', promptSource);
+        }
+        this.tokenizer = await tokenizerPromise;
+      } else {
+        progress?.('正在加载文本 / Grounding / Prompt / tokenizer...');
+        const textPromise = this.createSession('text', this.options.textEncoder);
+        const groundingPromise = this.createSession('grounding', this.options.groundingDecoder);
+        const promptPromise = promptSource ? this.createSession('prompt', promptSource) : Promise.resolve(null);
+
+        try {
+          const [textSession, groundingSession, promptSession, tokenizer] = await Promise.all([
+            textPromise,
+            groundingPromise,
+            promptPromise,
+            tokenizerPromise,
+          ]);
+          this.textSession = textSession;
+          this.groundingSession = groundingSession;
+          this.promptSession = promptSession;
+          this.tokenizer = tokenizer;
+        } catch (error) {
+          const settled = await Promise.allSettled([textPromise, groundingPromise, promptPromise]);
+          await Promise.all(
+            settled.map(item =>
+              item.status === 'fulfilled' && item.value ? item.value.release() : Promise.resolve(),
+            ),
+          );
+          throw error;
+        }
       }
 
       if (!this.tokenizer) {
@@ -588,15 +602,7 @@ export class Sam3 {
     model: YoloModelSource,
     options: OrtTypes.InferenceSession.SessionOptions,
   ): Promise<OrtTypes.InferenceSession> {
-    if (typeof model === 'string') {
-      return ort.InferenceSession.create(model, options);
-    }
-
-    if (model instanceof Uint8Array) {
-      return ort.InferenceSession.create(model, options);
-    }
-
-    return ort.InferenceSession.create(model, options);
+    return createOrtInferenceSession(model, options);
   }
 
   private encodedSize(): { width: number; height: number } {
