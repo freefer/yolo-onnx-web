@@ -312,5 +312,6 @@ export interface IYoloHandler{
   RunSegmentation(img: YoloImageSource, confidence: number, pixelConfidence: number, iou: number, roi?: Rect | null): Promise<Segmentation[]>
   RunPoseEstimation(img: YoloImageSource, confidence: number, iou: number, roi?: Rect | null): Promise<PoseEstimation[]>
   RunClassification(img: YoloImageSource, classes: number): Promise<Classification[]>
+  releaseGpuResources?(): void
 
 }

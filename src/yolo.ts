@@ -308,6 +308,15 @@ export class Yolo {
     DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
 
+  drawSegmentationEdgePoints(
+    source: YoloImageSource,
+    segmentations: readonly Segmentation[],
+    canvas: HTMLCanvasElement,
+    options: SegmentationDrawingOptions = {},
+  ): void {
+    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, options);
+  }
+
   drawPoseEstimations(
     source: YoloImageSource,
     poseEstimations: readonly PoseEstimation[],
@@ -334,7 +343,7 @@ export class Yolo {
   }
 
   async getWebGpuDevice(): Promise<any> {
-    const device = (ort.env as any).webgpu?.device;
+    const device = await (ort.env as { webgpu?: { device?: Promise<any> | any } }).webgpu?.device;
 
     if (!device) {
       throw new Error('WebGPU device is not initialized by ONNX Runtime Web.');
@@ -356,7 +365,11 @@ export class Yolo {
   }
 
   async dispose(): Promise<void> {
+    this._handler?.releaseGpuResources?.();
+
     if (!this.session) {
+      this._onnxModel = null;
+      this._handler = null;
       return;
     }
 

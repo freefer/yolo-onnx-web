@@ -490,22 +490,13 @@ export class Sam3 {
     canvas: HTMLCanvasElement,
     options: SegmentationDrawingOptions = {},
   ): void {
-    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, {
+    DrawTool.drawSam3Segmentations(source, segmentations, canvas, {
       drawBoundingBoxes: true,
       drawLabel: true,
       drawSegmentationPixelMask: true,
       fillSegmentationEdgePoints: true,
       ...options,
     });
-  }
-
-  drawSegmentationEdgePoints(
-    source: Sam3ImageInput,
-    segmentations: readonly Segmentation[],
-    canvas: HTMLCanvasElement,
-    options: SegmentationDrawingOptions = {},
-  ): void {
-    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, options);
   }
 
   async dispose(): Promise<void> {

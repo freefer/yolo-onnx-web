@@ -24,8 +24,10 @@ English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob
   - 姿态估计
 - 为所有支持的任务提供通用绘制方法。
 - 支持 RF-DETR 目标检测和实例分割模型。
+- RF-DETR 的 WebGPU 预处理纹理和 buffer 会跨帧复用，`yolo.dispose()` 时释放。
 - 提供 `Sam3`，用于 SAM 3.1 multiplex：文本概念分割（PCS）和交互式视觉分割（PVS）。
 - 导出 `DrawTool`，可以脱离 `Yolo` 实例单独使用绘制工具。
+- 分割绘制已拆分：YOLO / RF-DETR 使用 `drawSegmentationEdgePoints`；SAM 3 使用 `sam3.drawSegmentations()`（内部走 `DrawTool.drawSam3Segmentations`）。
 
 ## 安装
 
@@ -159,6 +161,22 @@ yolo.drawSegmentations(image, results, canvas, {
 });
 ```
 
+如果要把 YOLO / RF-DETR 结果持久化后再重绘，先提取多边形。即使丢掉 `bitPackedPixelMask`，边点绘制仍能填充轮廓：
+
+```ts
+results.forEach(segmentation => {
+  segmentation.segmentationEdgePoints = yolo.extractSegmentationEdgePoints(segmentation);
+});
+
+yolo.drawSegmentationEdgePoints(image, results, canvas, {
+  drawBoundingBoxes: true,
+  drawLabel: true,
+  drawSegmentationPixelMask: true,
+  fillSegmentationEdgePoints: true,
+  resultOpacity: 0.7,
+});
+```
+
 ### 姿态估计
 
 ```ts
@@ -245,6 +263,16 @@ yolo.drawPoseEstimations(image, poses, canvas, {
 });
 ```
 
+分割绘制按模型家族拆开：
+
+| API | 适用 | 填充来源 |
+| --- | --- | --- |
+| `yolo.drawSegmentations()` / `DrawTool.drawSegmentations()` | 当场绘制 YOLO packed mask | `bitPackedPixelMask` |
+| `yolo.drawSegmentationEdgePoints()` / `DrawTool.drawSegmentationEdgePoints()` | YOLO / RF-DETR，含 JSON 缓存后的多边形 | 有 packed mask 时用 mask，否则用 `segmentationEdgePoints` |
+| `sam3.drawSegmentations()` / `DrawTool.drawSam3Segmentations()` | SAM 3 PCS / PVS | packed mask + 轮廓 |
+
+不要用 `DrawTool.drawSam3Segmentations` 重绘 YOLO / RF-DETR。`Sam3.drawSegmentationEdgePoints` 已移除，请改用 `sam3.drawSegmentations()`。
+
 `DrawTool` 也可以作为独立绘制工具使用。适合推理和绘制分离、或者需要渲染缓存检测结果的场景：
 
 ```ts
@@ -324,10 +352,10 @@ const canvas = document.querySelector('canvas')!;
 await sam3.setImage(image);
 
 const pcs = await sam3.setTextPrompt('person, car, dog', 'wearing a red hat');
-sam3.drawSegmentationEdgePoints(image, pcs, canvas);
+sam3.drawSegmentations(image, pcs, canvas);
 
 const pvs = await sam3.addPoint({ x: 120, y: 80 }, 1);
-sam3.drawSegmentationEdgePoints(image, pvs.masks, canvas);
+sam3.drawSegmentations(image, pvs.masks, canvas);
 
 await sam3.dispose();
 ```
@@ -359,10 +387,10 @@ sam3.resetVisualPrompts();
 
 ### 绘制
 
-PCS 后处理会按 bbox 裁剪 mask，并填写 `segmentationEdgePoints`。请用 `sam3.drawSegmentationEdgePoints()` 或独立的 `DrawTool` 绘制。
+PCS 后处理会按 bbox 裁剪 mask，并填写 `segmentationEdgePoints`。请用 `sam3.drawSegmentations()` 绘制。
 
 ```ts
-sam3.drawSegmentationEdgePoints(image, masks, canvas, {
+sam3.drawSegmentations(image, masks, canvas, {
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,
@@ -415,6 +443,7 @@ npm run build:pages
 
 - YOLO 模型需要包含 Ultralytics 兼容的 ONNX metadata。
 - SAM 3 图来自 `scripts/export_sam3_onnx.py`。浏览器请加载 fp16 视觉/文本编码器；全精度编码器很容易触发 WASM `bad_alloc`。
+- 更换模型或卸载页面时请调用 `yolo.dispose()`，以便释放 RF-DETR WebGPU 预处理纹理和 buffer。
 - WebGPU、WebNN、WebGL 等后端是否可用取决于浏览器和设备。
 - WebGPU 通常需要 HTTPS 或 localhost 环境。
 - GitHub Pages 不托管数 GB 的 SAM 3 权重。在线 SAM 3 Demo 需要你选择本地导出目录。

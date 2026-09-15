@@ -571,7 +571,7 @@ function redraw(): void {
   const opacity = getThresholdValue(resultOpacityInput, 1);
 
   if (sam3 && currentMasks.length > 0 && getTaskMode() === 'pcs') {
-    sam3.drawSegmentationEdgePoints(sourceImage, currentMasks, preview, {
+    sam3.drawSegmentations(sourceImage, currentMasks, preview, {
       ...getSegmentationDrawOptions(),
       fillSegmentationEdgePoints: !dragStart,
     });

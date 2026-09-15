@@ -253,13 +253,21 @@ export class DrawTool {
     }
   }
 
+  private static hasPackedMask(segmentation: Segmentation): boolean {
+    return (segmentation.bitPackedPixelMask?.byteLength ?? 0) > 0;
+  }
+
   static extractSegmentationEdgePoints(segmentation: Segmentation): { x: number; y: number }[] {
+    if (!this.hasPackedMask(segmentation)) {
+      return segmentation.segmentationEdgePoints?.map(point => ({ x: point.x, y: point.y })) ?? [];
+    }
+
     const { left, top, right, bottom } = segmentation.boundingBox;
     const destWidth = right - left;
     const destHeight = bottom - top;
     const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
 
-    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
+    if (destWidth <= 0 || destHeight <= 0 || maskWidth <= 0) {
       return [];
     }
 
@@ -288,7 +296,10 @@ export class DrawTool {
   }
 
   static extractSegmentationContours(segmentation: Segmentation): Point[][] {
-    return this.splitEdgeContours(this.extractSegmentationEdgePoints(segmentation));
+    const points = segmentation.segmentationEdgePoints?.length
+      ? segmentation.segmentationEdgePoints
+      : this.extractSegmentationEdgePoints(segmentation);
+    return this.splitEdgeContours(points);
   }
 
   static splitEdgeContours(points: readonly Point[]): Point[][] {
@@ -351,7 +362,7 @@ export class DrawTool {
     const destHeight = box.bottom - box.top;
     const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
 
-    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
+    if (destWidth <= 0 || destHeight <= 0 || !this.hasPackedMask(segmentation) || maskWidth <= 0) {
       return;
     }
 
@@ -666,7 +677,7 @@ export class DrawTool {
     const destHeight = bottom - top;
     const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
 
-    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    if (destWidth <= 0 || destHeight <= 0 || !this.hasPackedMask(segmentation)) {
       return;
     }
 
@@ -702,7 +713,7 @@ export class DrawTool {
     const width = right - left;
     const height = bottom - top;
 
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    if (width <= 0 || height <= 0 || !this.hasPackedMask(segmentation)) {
       return;
     }
 
@@ -723,7 +734,11 @@ export class DrawTool {
     }
   }
 
-  public static drawSegmentationEdgePoints(
+  /**
+   * SAM3 绘制：用 packed mask 填充，轮廓从 mask / 已提取边点拆成多段折线。
+   * YOLO / RF-DETR 请先 extractSegmentationEdgePoints，再走 {@link drawSegmentationEdgePoints}。
+   */
+  public static drawSam3Segmentations(
     source: YoloImageSource,
     segmentations: readonly Segmentation[],
     canvas: HTMLCanvasElement,
@@ -740,8 +755,7 @@ export class DrawTool {
         ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1))
         : fillBaseOpacity;
 
-    for (let index = 0; index < segmentations.length; index += 1) {
-      const segmentation = segmentations[index];
+    for (const segmentation of segmentations) {
       const contours = this.extractSegmentationContours(segmentation);
       const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
       const fillColor = this.getDetectionColor(
@@ -751,12 +765,69 @@ export class DrawTool {
         fillOpacity,
       );
       if (options.drawSegmentationPixelMask === true) {
-        if (options.fillSegmentationEdgePoints === true) {
+        if (options.fillSegmentationEdgePoints === true && this.hasPackedMask(segmentation)) {
           this.drawSegmentationMask(context, segmentation, fillColor);
         }
 
         this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
       }
+    }
+
+    if (drawBoundingBoxes || options.drawLabel !== false) {
+      this.drawBoundingBoxes(context, segmentations, width, height, options);
+    }
+  }
+
+  /**
+   * YOLO / RF-DETR：使用已提取的 `segmentationEdgePoints` 描边和填充。
+   * 没有 packed mask 时按多边形填充，不要求携带 bitPackedPixelMask。
+   */
+  public static drawSegmentationEdgePoints(
+    source: YoloImageSource,
+    segmentations: readonly Segmentation[],
+    canvas: HTMLCanvasElement,
+    options: SegmentationDrawingOptions = {},
+  ): void {
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
+    const thickness = options.contourThickness ?? 2;
+    const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
+    const drawOverlay = options.drawSegmentationPixelMask ?? true;
+    const fillShapes = options.fillSegmentationEdgePoints ?? true;
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fillBaseOpacity = options.pixelMaskOpacity ?? DEFAULT_EDGE_FILL_OPACITY;
+    const fillOpacity =
+      options.resultOpacity !== undefined
+        ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1))
+        : fillBaseOpacity;
+
+    for (const segmentation of segmentations) {
+      const contours = this.extractSegmentationContours(segmentation);
+      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
+      const fillColor = this.getDetectionColor(
+        segmentation,
+        colors,
+        options.fillStyle,
+        fillOpacity,
+      );
+
+      if (!drawOverlay) {
+        continue;
+      }
+
+      if (fillShapes && this.hasPackedMask(segmentation)) {
+        this.drawSegmentationMask(context, segmentation, fillColor);
+        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
+        continue;
+      }
+
+      this.drawOrderedEdgeContours(
+        context,
+        contours,
+        strokeColor,
+        thickness,
+        fillShapes ? fillColor : undefined,
+      );
     }
 
     if (drawBoundingBoxes || options.drawLabel !== false) {
@@ -824,6 +895,10 @@ export class DrawTool {
         width: Math.max(1, Math.round(segmentation.pixelMaskWidth)),
         height: Math.max(1, Math.round(segmentation.pixelMaskHeight)),
       };
+    }
+
+    if (!this.hasPackedMask(segmentation)) {
+      return { width: destWidth, height: destHeight };
     }
 
     const expectedBytes = Math.ceil((destWidth * destHeight) / 8);

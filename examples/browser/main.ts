@@ -365,7 +365,7 @@ async function runCameraInferenceLoop(): Promise<void> {
     const result = await runInferenceByModelType(yolo, cameraVideo);
     const elapsedMs = performance.now() - startedAt;
 
-     drawInferenceResult(yolo, cameraVideo, result, preview, false);
+    drawInferenceResult(yolo, cameraVideo, result, preview, false);
     updateFps(performance.now());
     writeOutput(formatInferenceResult(result, elapsedMs));
   } catch (error) {

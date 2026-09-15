@@ -24,8 +24,10 @@ Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-we
   - Pose estimation
 - Includes canvas drawing utilities for all supported task types.
 - Supports RF-DETR object detection and segmentation models.
+- Reuses RF-DETR WebGPU preprocess textures and buffers across frames; `yolo.dispose()` releases them.
 - Adds `Sam3` for SAM 3.1 multiplex: text concept segmentation (PCS) and interactive visual segmentation (PVS).
 - Exports `DrawTool` so drawing helpers can be used independently from a `Yolo` instance.
+- Splits segmentation drawing: YOLO / RF-DETR use `drawSegmentationEdgePoints`; SAM 3 uses `sam3.drawSegmentations()` (`DrawTool.drawSam3Segmentations`).
 
 ## Installation
 
@@ -159,6 +161,22 @@ yolo.drawSegmentations(image, results, canvas, {
 });
 ```
 
+For YOLO / RF-DETR results that you persist and redraw later, extract polygons first, then use edge-point drawing (works even after `bitPackedPixelMask` is dropped):
+
+```ts
+results.forEach(segmentation => {
+  segmentation.segmentationEdgePoints = yolo.extractSegmentationEdgePoints(segmentation);
+});
+
+yolo.drawSegmentationEdgePoints(image, results, canvas, {
+  drawBoundingBoxes: true,
+  drawLabel: true,
+  drawSegmentationPixelMask: true,
+  fillSegmentationEdgePoints: true,
+  resultOpacity: 0.7,
+});
+```
+
 ### Pose Estimation
 
 ```ts
@@ -245,6 +263,16 @@ yolo.drawPoseEstimations(image, poses, canvas, {
 });
 ```
 
+Segmentation drawing is split by model family:
+
+| API | Use for | Fill source |
+| --- | --- | --- |
+| `yolo.drawSegmentations()` / `DrawTool.drawSegmentations()` | Live YOLO packed masks | `bitPackedPixelMask` |
+| `yolo.drawSegmentationEdgePoints()` / `DrawTool.drawSegmentationEdgePoints()` | YOLO / RF-DETR, including cached JSON polygons | packed mask when present, otherwise `segmentationEdgePoints` |
+| `sam3.drawSegmentations()` / `DrawTool.drawSam3Segmentations()` | SAM 3 PCS / PVS | packed mask plus contours |
+
+Do not use `DrawTool.drawSam3Segmentations` for YOLO / RF-DETR replay. `Sam3.drawSegmentationEdgePoints` was removed; call `sam3.drawSegmentations()` instead.
+
 `DrawTool` is also exported as a standalone helper. This is useful when inference and drawing live in different modules, or when you want to render cached results:
 
 ```ts
@@ -324,10 +352,10 @@ const canvas = document.querySelector('canvas')!;
 await sam3.setImage(image);
 
 const pcs = await sam3.setTextPrompt('person, car, dog', 'wearing a red hat');
-sam3.drawSegmentationEdgePoints(image, pcs, canvas);
+sam3.drawSegmentations(image, pcs, canvas);
 
 const pvs = await sam3.addPoint({ x: 120, y: 80 }, 1);
-sam3.drawSegmentationEdgePoints(image, pvs.masks, canvas);
+sam3.drawSegmentations(image, pvs.masks, canvas);
 
 await sam3.dispose();
 ```
@@ -359,10 +387,10 @@ sam3.resetVisualPrompts();
 
 ### Drawing
 
-PCS postprocessing packs masks by bbox and fills `segmentationEdgePoints`. Draw with `sam3.drawSegmentationEdgePoints()` or the standalone `DrawTool`.
+PCS postprocessing packs masks by bbox and fills `segmentationEdgePoints`. Draw with `sam3.drawSegmentations()`.
 
 ```ts
-sam3.drawSegmentationEdgePoints(image, masks, canvas, {
+sam3.drawSegmentations(image, masks, canvas, {
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,
@@ -409,6 +437,7 @@ The package is built with `tsup` into `dist/`. The GitHub Pages demo is built in
 
 - YOLO models should include Ultralytics-compatible ONNX metadata.
 - SAM 3 graphs come from `scripts/export_sam3_onnx.py`. In the browser, load fp16 vision/text encoders; full-precision encoders often hit WASM `bad_alloc`.
+- Call `yolo.dispose()` when replacing a model or tearing down the page so RF-DETR WebGPU preprocess textures/buffers are released.
 - Browser support depends on the selected execution provider and the user's device/browser.
 - For WebGPU, use a browser with WebGPU enabled and HTTPS or localhost.
 - GitHub Pages does not host the multi-GB SAM 3 weights. The online SAM 3 demo asks you to select a local export directory.

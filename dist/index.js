@@ -434,12 +434,20 @@ var DrawTool = class {
       this.drawBoundingBoxes(context, poseEstimations, width, height, options);
     }
   }
+  static hasPackedMask(segmentation) {
+    var _a, _b;
+    return ((_b = (_a = segmentation.bitPackedPixelMask) == null ? void 0 : _a.byteLength) != null ? _b : 0) > 0;
+  }
   static extractSegmentationEdgePoints(segmentation) {
+    var _a, _b;
+    if (!this.hasPackedMask(segmentation)) {
+      return (_b = (_a = segmentation.segmentationEdgePoints) == null ? void 0 : _a.map((point) => ({ x: point.x, y: point.y }))) != null ? _b : [];
+    }
     const { left, top, right, bottom } = segmentation.boundingBox;
     const destWidth = right - left;
     const destHeight = bottom - top;
     const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
-    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
+    if (destWidth <= 0 || destHeight <= 0 || maskWidth <= 0) {
       return [];
     }
     const edgeKeys = /* @__PURE__ */ new Set();
@@ -464,7 +472,9 @@ var DrawTool = class {
     return segmentations.map((segmentation) => this.extractSegmentationEdgePoints(segmentation));
   }
   static extractSegmentationContours(segmentation) {
-    return this.splitEdgeContours(this.extractSegmentationEdgePoints(segmentation));
+    var _a;
+    const points = ((_a = segmentation.segmentationEdgePoints) == null ? void 0 : _a.length) ? segmentation.segmentationEdgePoints : this.extractSegmentationEdgePoints(segmentation);
+    return this.splitEdgeContours(points);
   }
   static splitEdgeContours(points) {
     if (points.length === 0) {
@@ -512,7 +522,7 @@ var DrawTool = class {
     const destWidth = box.right - box.left;
     const destHeight = box.bottom - box.top;
     const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
-    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0 || maskWidth <= 0) {
+    if (destWidth <= 0 || destHeight <= 0 || !this.hasPackedMask(segmentation) || maskWidth <= 0) {
       return;
     }
     const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
@@ -741,7 +751,7 @@ var DrawTool = class {
     const destWidth = right - left;
     const destHeight = bottom - top;
     const { width: maskWidth, height: maskHeight } = this.resolvePackedMaskSize(segmentation);
-    if (destWidth <= 0 || destHeight <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    if (destWidth <= 0 || destHeight <= 0 || !this.hasPackedMask(segmentation)) {
       return;
     }
     const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
@@ -765,7 +775,7 @@ var DrawTool = class {
     const { left, top, right, bottom } = segmentation.boundingBox;
     const width = right - left;
     const height = bottom - top;
-    if (width <= 0 || height <= 0 || segmentation.bitPackedPixelMask.byteLength === 0) {
+    if (width <= 0 || height <= 0 || !this.hasPackedMask(segmentation)) {
       return;
     }
     context.fillStyle = color;
@@ -781,7 +791,11 @@ var DrawTool = class {
       }
     }
   }
-  static drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
+  /**
+   * SAM3 绘制：用 packed mask 填充，轮廓从 mask / 已提取边点拆成多段折线。
+   * YOLO / RF-DETR 请先 extractSegmentationEdgePoints，再走 {@link drawSegmentationEdgePoints}。
+   */
+  static drawSam3Segmentations(source, segmentations, canvas, options = {}) {
     var _a, _b, _c, _d;
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
@@ -790,8 +804,7 @@ var DrawTool = class {
     const alpha = this.getDetectionDrawingAlpha(options);
     const fillBaseOpacity = (_d = options.pixelMaskOpacity) != null ? _d : DEFAULT_EDGE_FILL_OPACITY;
     const fillOpacity = options.resultOpacity !== void 0 ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1)) : fillBaseOpacity;
-    for (let index = 0; index < segmentations.length; index += 1) {
-      const segmentation = segmentations[index];
+    for (const segmentation of segmentations) {
       const contours = this.extractSegmentationContours(segmentation);
       const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
       const fillColor = this.getDetectionColor(
@@ -801,11 +814,55 @@ var DrawTool = class {
         fillOpacity
       );
       if (options.drawSegmentationPixelMask === true) {
-        if (options.fillSegmentationEdgePoints === true) {
+        if (options.fillSegmentationEdgePoints === true && this.hasPackedMask(segmentation)) {
           this.drawSegmentationMask(context, segmentation, fillColor);
         }
         this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
       }
+    }
+    if (drawBoundingBoxes || options.drawLabel !== false) {
+      this.drawBoundingBoxes(context, segmentations, width, height, options);
+    }
+  }
+  /**
+   * YOLO / RF-DETR：使用已提取的 `segmentationEdgePoints` 描边和填充。
+   * 没有 packed mask 时按多边形填充，不要求携带 bitPackedPixelMask。
+   */
+  static drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
+    var _a, _b, _c, _d, _e, _f;
+    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
+    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
+    const thickness = (_b = options.contourThickness) != null ? _b : 2;
+    const drawBoundingBoxes = (_c = options.drawBoundingBoxes) != null ? _c : true;
+    const drawOverlay = (_d = options.drawSegmentationPixelMask) != null ? _d : true;
+    const fillShapes = (_e = options.fillSegmentationEdgePoints) != null ? _e : true;
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fillBaseOpacity = (_f = options.pixelMaskOpacity) != null ? _f : DEFAULT_EDGE_FILL_OPACITY;
+    const fillOpacity = options.resultOpacity !== void 0 ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1)) : fillBaseOpacity;
+    for (const segmentation of segmentations) {
+      const contours = this.extractSegmentationContours(segmentation);
+      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
+      const fillColor = this.getDetectionColor(
+        segmentation,
+        colors,
+        options.fillStyle,
+        fillOpacity
+      );
+      if (!drawOverlay) {
+        continue;
+      }
+      if (fillShapes && this.hasPackedMask(segmentation)) {
+        this.drawSegmentationMask(context, segmentation, fillColor);
+        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
+        continue;
+      }
+      this.drawOrderedEdgeContours(
+        context,
+        contours,
+        strokeColor,
+        thickness,
+        fillShapes ? fillColor : void 0
+      );
     }
     if (drawBoundingBoxes || options.drawLabel !== false) {
       this.drawBoundingBoxes(context, segmentations, width, height, options);
@@ -855,6 +912,9 @@ var DrawTool = class {
         width: Math.max(1, Math.round(segmentation.pixelMaskWidth)),
         height: Math.max(1, Math.round(segmentation.pixelMaskHeight))
       };
+    }
+    if (!this.hasPackedMask(segmentation)) {
+      return { width: destWidth, height: destHeight };
     }
     const expectedBytes = Math.ceil(destWidth * destHeight / 8);
     if (segmentation.bitPackedPixelMask.byteLength >= expectedBytes) {
@@ -1940,8 +2000,16 @@ var RF_DETRHandler = class {
     this.interpolationCacheKey = "";
     this.topIndices = null;
     this.topScores = null;
+    this.backgroundClassIndex = null;
     this.webGpuPipeline = null;
     this.webGpuDevice = null;
+    this.webGpuTexture = null;
+    this.webGpuOutputBuffer = null;
+    this.webGpuParamsBuffer = null;
+    this.webGpuBindGroup = null;
+    this.webGpuOutputByteLength = 0;
+    this.webGpuCanvas = null;
+    this.webGpuContext = null;
     this.webGpuFallbackWarned = false;
     this._yolo = yolo;
   }
@@ -2022,7 +2090,7 @@ var RF_DETRHandler = class {
     const sourceRect = this.getSourceRect(img, roi);
     const resizeMode = (_a = this._yolo.yoloOptions.imageResize) != null ? _a : "stretch";
     const { drawWidth, drawHeight, xPad, yPad, gain } = resizeMode === "stretch" ? { drawWidth: modelWidth, drawHeight: modelHeight, xPad: 0, yPad: 0, gain: 1 } : this.calculateProportionalResize(sourceRect.width, sourceRect.height, modelWidth, modelHeight);
-    const context = this.getPreprocessContext(modelWidth, modelHeight);
+    const context = this.getWebGpuPreprocessContext(modelWidth, modelHeight);
     const coversCanvas = xPad <= 0 && yPad <= 0 && drawWidth >= modelWidth && drawHeight >= modelHeight;
     if (!coversCanvas) {
       context.clearRect(0, 0, modelWidth, modelHeight);
@@ -2057,69 +2125,91 @@ var RF_DETRHandler = class {
   }
   async createWebGpuInputTensor(canvas, inputShape, imageMean, imageStd) {
     const [, channels, height, width] = inputShape;
+    const device = await this.ensureWebGpuResources(width, height, channels, imageMean, imageStd);
+    device.queue.copyExternalImageToTexture(
+      { source: canvas },
+      { texture: this.webGpuTexture },
+      { width, height }
+    );
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.webGpuPipeline);
+    pass.setBindGroup(0, this.webGpuBindGroup);
+    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    return this._yolo.tensorFromGpuBuffer(this.webGpuOutputBuffer, inputShape);
+  }
+  async ensureWebGpuResources(width, height, channels, imageMean, imageStd) {
     const device = await this._yolo.getWebGpuDevice();
     const usage = globalThis.GPUBufferUsage;
     const textureUsage = globalThis.GPUTextureUsage;
     const outputByteLength = channels * width * height * Float32Array.BYTES_PER_ELEMENT;
-    const texture = device.createTexture({
-      size: [width, height, 1],
-      format: "rgba8unorm",
-      usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT
-    });
-    const outputBuffer = device.createBuffer({
-      size: outputByteLength,
-      usage: usage.STORAGE | usage.COPY_SRC | usage.COPY_DST
-    });
-    const paramsBuffer = device.createBuffer({
-      size: 48,
-      usage: usage.UNIFORM | usage.COPY_DST
-    });
-    const params = new Float32Array([
-      width,
-      height,
-      0,
-      0,
-      1 / imageStd[0],
-      1 / imageStd[1],
-      1 / imageStd[2],
-      0,
-      -imageMean[0] / imageStd[0],
-      -imageMean[1] / imageStd[1],
-      -imageMean[2] / imageStd[2],
-      0
-    ]);
-    device.queue.copyExternalImageToTexture(
-      { source: canvas },
-      { texture },
-      { width, height }
-    );
-    device.queue.writeBuffer(paramsBuffer, 0, params);
-    const pipeline = this.getWebGpuPreprocessPipeline(device);
-    const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: texture.createView() },
-        { binding: 1, resource: { buffer: outputBuffer } },
-        { binding: 2, resource: { buffer: paramsBuffer } }
-      ]
-    });
-    const encoder = device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
-    pass.end();
-    device.queue.submit([encoder.finish()]);
-    texture.destroy();
-    paramsBuffer.destroy();
-    return this._yolo.tensorFromGpuBuffer(outputBuffer, inputShape, () => outputBuffer.destroy());
-  }
-  getWebGpuPreprocessPipeline(device) {
-    if (this.webGpuPipeline && this.webGpuDevice === device) {
-      return this.webGpuPipeline;
+    if (!usage || !textureUsage) {
+      throw new Error("WebGPU buffer usage flags are not available.");
     }
-    this.webGpuDevice = device;
-    this.webGpuPipeline = device.createComputePipeline({
+    if (this.webGpuDevice !== device || this.webGpuOutputByteLength !== outputByteLength || !this.webGpuPipeline || !this.webGpuTexture || !this.webGpuOutputBuffer || !this.webGpuParamsBuffer) {
+      this.releaseGpuResources();
+      this.webGpuDevice = device;
+      this.webGpuOutputByteLength = outputByteLength;
+      this.webGpuTexture = device.createTexture({
+        size: [width, height, 1],
+        format: "rgba8unorm",
+        usage: textureUsage.TEXTURE_BINDING | textureUsage.COPY_DST | textureUsage.RENDER_ATTACHMENT
+      });
+      this.webGpuOutputBuffer = device.createBuffer({
+        size: outputByteLength,
+        usage: usage.STORAGE | usage.COPY_SRC | usage.COPY_DST
+      });
+      this.webGpuParamsBuffer = device.createBuffer({
+        size: 48,
+        usage: usage.UNIFORM | usage.COPY_DST
+      });
+      this.webGpuPipeline = this.createWebGpuPreprocessPipeline(device);
+      device.queue.writeBuffer(
+        this.webGpuParamsBuffer,
+        0,
+        new Float32Array([
+          width,
+          height,
+          0,
+          0,
+          1 / imageStd[0],
+          1 / imageStd[1],
+          1 / imageStd[2],
+          0,
+          -imageMean[0] / imageStd[0],
+          -imageMean[1] / imageStd[1],
+          -imageMean[2] / imageStd[2],
+          0
+        ])
+      );
+      this.webGpuBindGroup = device.createBindGroup({
+        layout: this.webGpuPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.webGpuTexture.createView() },
+          { binding: 1, resource: { buffer: this.webGpuOutputBuffer } },
+          { binding: 2, resource: { buffer: this.webGpuParamsBuffer } }
+        ]
+      });
+    }
+    return device;
+  }
+  releaseGpuResources() {
+    var _a, _b, _c;
+    (_a = this.webGpuTexture) == null ? void 0 : _a.destroy();
+    (_b = this.webGpuOutputBuffer) == null ? void 0 : _b.destroy();
+    (_c = this.webGpuParamsBuffer) == null ? void 0 : _c.destroy();
+    this.webGpuTexture = null;
+    this.webGpuOutputBuffer = null;
+    this.webGpuParamsBuffer = null;
+    this.webGpuBindGroup = null;
+    this.webGpuPipeline = null;
+    this.webGpuDevice = null;
+    this.webGpuOutputByteLength = 0;
+  }
+  createWebGpuPreprocessPipeline(device) {
+    return device.createComputePipeline({
       layout: "auto",
       compute: {
         module: device.createShaderModule({
@@ -2156,21 +2246,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         entryPoint: "main"
       }
     });
-    return this.webGpuPipeline;
   }
   async RunObjectDetection(img, confidence, iou, roi = null) {
-    var _a, _b;
     if (this._yolo.onnxModel.modelType !== "ObjectDetection") {
       unsupportedTask("ObjectDetection");
     }
     const input = await this.preprocessImageForRun(img, roi);
-    const result = await this.runWithPreprocessedInput(input);
-    const dets = (_a = result.dets) == null ? void 0 : _a.data;
-    const labels = (_b = result.labels) == null ? void 0 : _b.data;
+    const result = await this.runWithPreprocessedInput(input, ["dets", "labels"]);
+    const dets = await this.readFloatTensor(result.dets);
+    const labels = await this.readFloatTensor(result.labels);
     if (!dets || !labels) {
       throw new Error(`Unsupported RF-DETR outputs: ${Object.keys(result).join(", ")}`);
     }
-    return this.decodeObjectDetections(dets, labels, input, confidence);
+    try {
+      return this.decodeObjectDetections(dets, labels, input, confidence);
+    } finally {
+      this.disposeRunResult(result);
+    }
   }
   RunObbDetection(img, confidence, iou, roi = null) {
     unsupportedTask("ObbDetection");
@@ -2195,11 +2287,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     const predictions = detsShape[1];
     const classCount = labelsShape[2];
-    const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
-      (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
-    );
     const labels = this._yolo.onnxModel.labels;
-    const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
+    const backgroundClassIndex = this.getBackgroundClassIndex();
+    const { topIndices, topScores, topCount } = this.getRankedCandidates(
+      logits,
+      predictions,
+      classCount,
+      backgroundClassIndex
+    );
     const objects = [];
     for (let i = 0; i < topCount; i += 1) {
       const candidateConfidence = topScores[i];
@@ -2234,26 +2329,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     return objects;
   }
   async runSegmentation(img, confidence, roi) {
-    var _a, _b, _c;
     const input = await this.preprocessImageForRun(img, roi);
-    const result = await this.runWithPreprocessedInput(input);
-    const dets = (_a = result.dets) == null ? void 0 : _a.data;
-    const logits = (_b = result.labels) == null ? void 0 : _b.data;
-    const masks = (_c = result.masks) == null ? void 0 : _c.data;
+    const result = await this.runWithPreprocessedInput(input, ["dets", "labels", "masks"]);
+    const dets = await this.readFloatTensor(result.dets);
+    const logits = await this.readFloatTensor(result.labels);
+    const masks = await this.readFloatTensor(result.masks);
     if (!dets || !logits || !masks) {
       throw new Error(`Unsupported RF-DETR segmentation outputs: ${Object.keys(result).join(", ")}`);
     }
-    return this.decodeSegmentations(dets, logits, masks, input, confidence);
-  }
-  async runWithPreprocessedInput(input) {
-    var _a, _b;
-    const inputTensor = (_a = input.inputTensor) != null ? _a : this._yolo.tensor("float32", input.tensorData, input.inputShape);
     try {
-      return await this._yolo.run({
-        [input.inputName]: inputTensor
-      });
+      return this.decodeSegmentations(dets, logits, masks, input, confidence);
     } finally {
-      (_b = input.inputTensor) == null ? void 0 : _b.dispose();
+      this.disposeRunResult(result);
+    }
+  }
+  async runWithPreprocessedInput(input, outputNames) {
+    var _a;
+    const inputTensor = (_a = input.inputTensor) != null ? _a : this._yolo.tensor("float32", input.tensorData, input.inputShape);
+    return this._yolo.runWithFetches(
+      {
+        [input.inputName]: inputTensor
+      },
+      outputNames
+    );
+  }
+  async readFloatTensor(tensor) {
+    if (!tensor) {
+      return void 0;
+    }
+    const data = tensor.location === "cpu" || tensor.location === "cpu-pinned" ? tensor.data : await tensor.getData();
+    return data;
+  }
+  disposeRunResult(result) {
+    for (const tensor of Object.values(result)) {
+      tensor.dispose();
     }
   }
   decodeSegmentations(dets, logits, masks, input, confidence) {
@@ -2268,11 +2377,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     const maskHeight = masksShape[2];
     const maskWidth = masksShape[3];
     const maskPlaneSize = maskWidth * maskHeight;
-    const backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
-      (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
-    );
+    const backgroundClassIndex = this.getBackgroundClassIndex();
     const labels = this._yolo.onnxModel.labels;
-    const { topIndices, topScores, topCount } = this.getRankedCandidates(logits, predictions, classCount);
+    const { topIndices, topScores, topCount } = this.getRankedCandidates(
+      logits,
+      predictions,
+      classCount,
+      backgroundClassIndex
+    );
     const segmentations = [];
     for (let i = 0; i < topCount; i += 1) {
       const candidateConfidence = topScores[i];
@@ -2316,7 +2428,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     return segmentations;
   }
-  getRankedCandidates(logits, predictions, classCount) {
+  getRankedCandidates(logits, predictions, classCount, skipLabelIndex) {
     const maxDetections = predictions;
     const { topIndices, topScores } = this.getTopKBuffers(maxDetections);
     let topCount = 0;
@@ -2325,6 +2437,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (let prediction = 0; prediction < predictions; prediction += 1) {
       const labelOffset = prediction * classCount;
       for (let labelIndex = 0; labelIndex < classCount; labelIndex += 1) {
+        if (labelIndex === skipLabelIndex) {
+          continue;
+        }
         const score = this.sigmoid(logits[labelOffset + labelIndex]);
         const flatIndex = labelOffset + labelIndex;
         if (topCount < maxDetections) {
@@ -2662,6 +2777,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     return this.preprocessContext;
   }
+  getWebGpuPreprocessContext(width, height) {
+    if (!this.webGpuCanvas) {
+      this.webGpuCanvas = document.createElement("canvas");
+    }
+    if (this.webGpuCanvas.width !== width) {
+      this.webGpuCanvas.width = width;
+    }
+    if (this.webGpuCanvas.height !== height) {
+      this.webGpuCanvas.height = height;
+    }
+    if (!this.webGpuContext) {
+      this.webGpuContext = this.webGpuCanvas.getContext("2d", { alpha: false });
+    }
+    if (!this.webGpuContext) {
+      throw new Error("Canvas 2D context is not available.");
+    }
+    return this.webGpuContext;
+  }
+  getBackgroundClassIndex() {
+    if (this.backgroundClassIndex !== null) {
+      return this.backgroundClassIndex;
+    }
+    this.backgroundClassIndex = this._yolo.onnxModel.labels.findIndex(
+      (label) => label.name.toLowerCase().startsWith(BACKGROUND_CLASS_PREFIX)
+    );
+    return this.backgroundClassIndex;
+  }
   getPreprocessTensorData(size) {
     if (!this.preprocessTensorData || this.preprocessTensorSize !== size) {
       this.preprocessTensorData = new Float32Array(size);
@@ -2890,6 +3032,9 @@ var Yolo = class _Yolo {
   drawSegmentations(source, segmentations, canvas, options = {}) {
     DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
+  drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
+    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, options);
+  }
   drawPoseEstimations(source, poseEstimations, canvas, options = {}) {
     DrawTool.drawPoseEstimations(source, poseEstimations, canvas, options);
   }
@@ -2904,7 +3049,7 @@ var Yolo = class _Yolo {
   }
   async getWebGpuDevice() {
     var _a;
-    const device = (_a = ort.env.webgpu) == null ? void 0 : _a.device;
+    const device = await ((_a = ort.env.webgpu) == null ? void 0 : _a.device);
     if (!device) {
       throw new Error("WebGPU device is not initialized by ONNX Runtime Web.");
     }
@@ -2918,7 +3063,11 @@ var Yolo = class _Yolo {
     });
   }
   async dispose() {
+    var _a, _b;
+    (_b = (_a = this._handler) == null ? void 0 : _a.releaseGpuResources) == null ? void 0 : _b.call(_a);
     if (!this.session) {
+      this._onnxModel = null;
+      this._handler = null;
       return;
     }
     await this.session.release();
@@ -5605,16 +5754,13 @@ var Sam3 = class _Sam3 {
     return this.ensureHandler().removePoint(index, this.ensureState());
   }
   drawSegmentations(source, segmentations, canvas, options = {}) {
-    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, {
+    DrawTool.drawSam3Segmentations(source, segmentations, canvas, {
       drawBoundingBoxes: true,
       drawLabel: true,
       drawSegmentationPixelMask: true,
       fillSegmentationEdgePoints: true,
       ...options
     });
-  }
-  drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
-    DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, options);
   }
   async dispose() {
     var _a;

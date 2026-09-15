@@ -248,6 +248,7 @@ interface IYoloHandler {
     RunSegmentation(img: YoloImageSource, confidence: number, pixelConfidence: number, iou: number, roi?: Rect | null): Promise<Segmentation[]>;
     RunPoseEstimation(img: YoloImageSource, confidence: number, iou: number, roi?: Rect | null): Promise<PoseEstimation[]>;
     RunClassification(img: YoloImageSource, classes: number): Promise<Classification[]>;
+    releaseGpuResources?(): void;
 }
 
 type OrtBundle = 'auto' | 'webgpu' | 'jspi' | 'wasm' | 'webgl' | 'all';
@@ -315,6 +316,7 @@ declare class Yolo {
     drawClassifications(source: YoloImageSource, classifications: readonly Classification[], canvas: HTMLCanvasElement, options?: ClassificationDrawingOptions): void;
     drawObbDetections(source: YoloImageSource, detections: readonly OBBDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
     drawSegmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
+    drawSegmentationEdgePoints(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     drawPoseEstimations(source: YoloImageSource, poseEstimations: readonly PoseEstimation[], canvas: HTMLCanvasElement, options?: PoseDrawingOptions): void;
     extractSegmentationEdgePoints(segmentation: Segmentation): {
         x: number;
@@ -688,7 +690,6 @@ declare class Sam3 {
     selectVisualCandidate(index: number): Sam3PvsResult;
     removePoint(index: number): Promise<Sam3PvsResult>;
     drawSegmentations(source: Sam3ImageInput, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
-    drawSegmentationEdgePoints(source: Sam3ImageInput, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     dispose(): Promise<void>;
     private createSessionOptions;
     private createExecutionProviders;
@@ -708,6 +709,7 @@ declare class DrawTool {
     static drawObbDetections(source: YoloImageSource, detections: readonly OBBDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
     static drawSegmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     static drawPoseEstimations(source: YoloImageSource, poseEstimations: readonly PoseEstimation[], canvas: HTMLCanvasElement, options?: PoseDrawingOptions): void;
+    private static hasPackedMask;
     static extractSegmentationEdgePoints(segmentation: Segmentation): {
         x: number;
         y: number;
@@ -739,6 +741,15 @@ declare class DrawTool {
     private static getObbCorners;
     private static drawSegmentationMask;
     private static drawSegmentationContour;
+    /**
+     * SAM3 绘制：用 packed mask 填充，轮廓从 mask / 已提取边点拆成多段折线。
+     * YOLO / RF-DETR 请先 extractSegmentationEdgePoints，再走 {@link drawSegmentationEdgePoints}。
+     */
+    static drawSam3Segmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
+    /**
+     * YOLO / RF-DETR：使用已提取的 `segmentationEdgePoints` 描边和填充。
+     * 没有 packed mask 时按多边形填充，不要求携带 bitPackedPixelMask。
+     */
     static drawSegmentationEdgePoints(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     private static drawOrderedEdgeContours;
     private static isMostlyClosedContour;
