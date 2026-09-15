@@ -189,24 +189,33 @@ export class DrawTool {
     const drawMask = options.drawSegmentationPixelMask ?? true;
     const drawContour = options.drawContour ?? false;
     const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
-    const pixelMaskOpacity = options.pixelMaskOpacity ?? 128;
+    const overlayOpacity = this.getResultOverlayOpacity(options);
+    if (overlayOpacity <= 0) {
+      return;
+    }
 
-    if (drawMask) {
+    const alpha = this.getDetectionDrawingAlpha(options);
+    const fillOpacity = this.getPixelMaskDrawingAlpha(options, 128);
+
+    if (drawMask && fillOpacity > 0) {
       for (const segmentation of segmentations) {
-        this.drawSegmentationMask(context, segmentation, this.getDetectionColor(segmentation, colors, undefined, pixelMaskOpacity));
+        this.drawSegmentationMask(
+          context,
+          segmentation,
+          this.getDetectionColor(segmentation, colors, undefined, fillOpacity),
+        );
       }
     }
 
-    if (drawContour) {
+    if (drawContour && alpha > 0) {
       for (let index = 0; index < segmentations.length; index += 1) {
         const segmentation = segmentations[index];
 
         this.drawSegmentationContour(
           context,
           segmentation,
-          this.getDetectionColor(segmentation, colors, options.strokeStyle),
+          this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha),
           options.contourThickness ?? 2,
-
         );
       }
     }
@@ -369,6 +378,10 @@ export class DrawTool {
     const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
     const fill = this.parseCanvasColor(options.fill ?? 'rgba(34, 197, 94, 0.35)');
     const stroke = this.parseCanvasColor(options.stroke ?? options.fill ?? '#22c55e');
+    if (fill.a <= 0 && stroke.a <= 0) {
+      return;
+    }
+
     const pixels = imageData.data;
     const total = maskWidth * maskHeight;
     const packed = segmentation.bitPackedPixelMask;
@@ -590,23 +603,42 @@ export class DrawTool {
 
   private static getDetectionDrawingAlpha(options: DetectionDrawingOptions): number {
     if (options.resultOpacity !== undefined) {
-      return Math.round(this.clamp(options.resultOpacity, 0, 1) * 255);
+      return Math.round(this.getResultOverlayOpacity(options) * 255);
     }
 
     return options.boundingBoxOpacity ?? 255;
   }
 
-  private static withAlpha(color: string, alpha: number): string {
-    if (!color.startsWith('#') || color.length !== 7) {
-      return color;
+  private static getResultOverlayOpacity(options: DetectionDrawingOptions): number {
+    if (options.resultOpacity === undefined) {
+      return 1;
     }
 
-    const r = Number.parseInt(color.slice(1, 3), 16);
-    const g = Number.parseInt(color.slice(3, 5), 16);
-    const b = Number.parseInt(color.slice(5, 7), 16);
+    return this.clamp(options.resultOpacity, 0, 1);
+  }
+
+  private static getPixelMaskDrawingAlpha(options: SegmentationDrawingOptions, defaultOpacity: number): number {
+    const fillBaseOpacity = options.pixelMaskOpacity ?? defaultOpacity;
+
+    if (options.resultOpacity === undefined) {
+      return fillBaseOpacity;
+    }
+
+    return Math.round(fillBaseOpacity * this.getResultOverlayOpacity(options));
+  }
+
+  private static withAlpha(color: string, alpha: number): string {
     const normalizedAlpha = this.clamp(alpha, 0, 255) / 255;
 
-    return `rgba(${r}, ${g}, ${b}, ${normalizedAlpha})`;
+    if (color.startsWith('#') && color.length === 7) {
+      const r = Number.parseInt(color.slice(1, 3), 16);
+      const g = Number.parseInt(color.slice(3, 5), 16);
+      const b = Number.parseInt(color.slice(5, 7), 16);
+      return `rgba(${r}, ${g}, ${b}, ${normalizedAlpha})`;
+    }
+
+    const parsed = this.parseCanvasColor(color);
+    return `rgba(${parsed.r}, ${parsed.g}, ${parsed.b}, ${normalizedAlpha})`;
   }
 
   private static drawDetectionLabel(
@@ -683,6 +715,10 @@ export class DrawTool {
 
     const { canvas: maskCanvas, context: maskContext, imageData } = getPooledMaskTarget(maskWidth, maskHeight);
     const rgba = this.parseCanvasColor(color);
+    if (rgba.a <= 0) {
+      return;
+    }
+
     const total = maskWidth * maskHeight;
     const pixels = imageData.data;
 
@@ -695,11 +731,15 @@ export class DrawTool {
       pixels[offset] = rgba.r;
       pixels[offset + 1] = rgba.g;
       pixels[offset + 2] = rgba.b;
-      pixels[offset + 3] = rgba.a;
+      pixels[offset + 3] = 255;
     }
 
     maskContext.putImageData(imageData, 0, 0);
+    context.save();
+    context.globalAlpha *= rgba.a / 255;
+    context.imageSmoothingEnabled = false;
     context.drawImage(maskCanvas, 0, 0, maskWidth, maskHeight, left, top, destWidth, destHeight);
+    context.restore();
   }
 
   private static drawSegmentationContour(
@@ -748,12 +788,13 @@ export class DrawTool {
     const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
     const thickness = options.contourThickness ?? 2;
     const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
+    const overlayOpacity = this.getResultOverlayOpacity(options);
+    if (overlayOpacity <= 0) {
+      return;
+    }
+
     const alpha = this.getDetectionDrawingAlpha(options);
-    const fillBaseOpacity = options.pixelMaskOpacity ?? DEFAULT_EDGE_FILL_OPACITY;
-    const fillOpacity =
-      options.resultOpacity !== undefined
-        ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1))
-        : fillBaseOpacity;
+    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
 
     for (const segmentation of segmentations) {
       const contours = this.extractSegmentationContours(segmentation);
@@ -765,7 +806,7 @@ export class DrawTool {
         fillOpacity,
       );
       if (options.drawSegmentationPixelMask === true) {
-        if (options.fillSegmentationEdgePoints === true && this.hasPackedMask(segmentation)) {
+        if (options.fillSegmentationEdgePoints === true && this.hasPackedMask(segmentation) && fillOpacity > 0) {
           this.drawSegmentationMask(context, segmentation, fillColor);
         }
 
@@ -794,12 +835,13 @@ export class DrawTool {
     const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
     const drawOverlay = options.drawSegmentationPixelMask ?? true;
     const fillShapes = options.fillSegmentationEdgePoints ?? true;
+    const overlayOpacity = this.getResultOverlayOpacity(options);
+    if (overlayOpacity <= 0) {
+      return;
+    }
+
     const alpha = this.getDetectionDrawingAlpha(options);
-    const fillBaseOpacity = options.pixelMaskOpacity ?? DEFAULT_EDGE_FILL_OPACITY;
-    const fillOpacity =
-      options.resultOpacity !== undefined
-        ? Math.round(fillBaseOpacity * this.clamp(options.resultOpacity, 0, 1))
-        : fillBaseOpacity;
+    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
 
     for (const segmentation of segmentations) {
       const contours = this.extractSegmentationContours(segmentation);
@@ -816,7 +858,9 @@ export class DrawTool {
       }
 
       if (fillShapes && this.hasPackedMask(segmentation)) {
-        this.drawSegmentationMask(context, segmentation, fillColor);
+        if (fillOpacity > 0) {
+          this.drawSegmentationMask(context, segmentation, fillColor);
+        }
         this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
         continue;
       }

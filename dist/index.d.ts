@@ -735,6 +735,8 @@ declare class DrawTool {
     private static prepareDrawingCanvas;
     private static getDetectionColor;
     private static getDetectionDrawingAlpha;
+    private static getResultOverlayOpacity;
+    private static getPixelMaskDrawingAlpha;
     private static withAlpha;
     private static drawDetectionLabel;
     private static getCanvasFontSize;
