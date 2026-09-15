@@ -47,7 +47,7 @@ The browser example runs at the fixed Vite port configured in `vite.config.ts`.
 
 ## Browser Runtime Setup
 
-This package currently depends on `onnxruntime-web@1.27.0`.
+This package currently depends on `onnxruntime-web@1.30.0`.
 
 `onnxruntime-web` needs access to its WASM files. Configure the path before creating a model:
 

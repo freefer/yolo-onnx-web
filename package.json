@@ -59,6 +59,6 @@
     "vite": "^6.4.3"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.27.0"
+    "onnxruntime-web": "^1.30.0"
   }
 }

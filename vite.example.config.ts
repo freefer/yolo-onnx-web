@@ -2,7 +2,7 @@ import { cpSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 
-const ORT_CDN_VERSION = '1.27.0';
+const ORT_CDN_VERSION = '1.30.0';
 const ORT_CDN_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist`;
 
 /**

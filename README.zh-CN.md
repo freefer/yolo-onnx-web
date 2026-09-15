@@ -47,7 +47,7 @@ npm start
 
 ## 浏览器运行时配置
 
-当前包依赖的 ONNX Runtime Web 版本是 `onnxruntime-web@1.27.0`。
+当前包依赖的 ONNX Runtime Web 版本是 `onnxruntime-web@1.30.0`。
 
 `onnxruntime-web` 需要找到 WASM 文件。创建模型前可以这样配置：
 
