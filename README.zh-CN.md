@@ -27,7 +27,7 @@ English documentation: [README.md](https://github.com/freefer/yolo-onnx-web/blob
 - RF-DETR 的 WebGPU 预处理纹理和 buffer 会跨帧复用，`yolo.dispose()` 时释放。
 - 提供 `Sam3`，用于 SAM 3.1 multiplex：文本概念分割（PCS）和交互式视觉分割（PVS）。
 - 导出 `DrawTool`，可以脱离 `Yolo` 实例单独使用绘制工具。
-- 分割绘制已拆分：YOLO / RF-DETR 使用 `drawSegmentationEdgePoints`；SAM 3 使用 `sam3.drawSegmentations()`（内部走 `DrawTool.drawSam3Segmentations`）。
+- YOLO、RF-DETR、SAM 3 共用一套多边形提取和 `DrawTool.drawSegmentations()` 绘制流程，同时保留原始 packed mask 与 polygon 两种绘制方式。
 
 ## 安装
 
@@ -155,20 +155,29 @@ yolo.drawObbDetections(image, results, canvas);
 ```ts
 const results = await yolo.RunSegmentation(image, 0.2, 0.65, 0.7);
 yolo.drawSegmentations(image, results, canvas, {
+  segmentationRenderMode: 'mask',
   drawSegmentationPixelMask: true,
   pixelMaskOpacity: 128,
-  drawContour: false,
+  drawContour: true,
 });
 ```
 
-如果要把 YOLO / RF-DETR 结果持久化后再重绘，先提取多边形。即使丢掉 `bitPackedPixelMask`，边点绘制仍能填充轮廓：
+YOLO、RF-DETR、SAM 3 都使用 `drawSegmentations()`。设置 `segmentationRenderMode: 'mask'` 可绘制原始 packed mask；设置为 `'polygon'` 则让所有模型使用同一套多边形提取逻辑：
+
+`yolo.extractSegmentationPolygons()`、`DrawTool.extractSegmentationPolygons()` 和同名独立导出都调用该提取器，并返回 `Point[][]`（`{ x, y }[][]`）。
 
 ```ts
-results.forEach(segmentation => {
-  segmentation.segmentationEdgePoints = yolo.extractSegmentationEdgePoints(segmentation);
-});
+const polygonsByResult = results.map(segmentation =>
+  yolo.extractSegmentationPolygons(segmentation, {
+    imageWidth: image.naturalWidth,
+    imageHeight: image.naturalHeight,
+    sourceWidth: image.naturalWidth,
+    sourceHeight: image.naturalHeight,
+  }),
+);
 
-yolo.drawSegmentationEdgePoints(image, results, canvas, {
+yolo.drawSegmentations(image, results, canvas, {
+  segmentationRenderMode: 'polygon',
   drawBoundingBoxes: true,
   drawLabel: true,
   drawSegmentationPixelMask: true,
@@ -250,6 +259,7 @@ yolo.drawObjectDetections(image, detections, canvas, {
 
 ```ts
 yolo.drawSegmentations(image, segmentations, canvas, {
+  segmentationRenderMode: 'auto',
   drawSegmentationPixelMask: true,
   pixelMaskOpacity: 128,
   drawContour: true,
@@ -263,15 +273,21 @@ yolo.drawPoseEstimations(image, poses, canvas, {
 });
 ```
 
-分割绘制按模型家族拆开：
+分割绘制不再按模型家族拆分：
 
-| API | 适用 | 填充来源 |
-| --- | --- | --- |
-| `yolo.drawSegmentations()` / `DrawTool.drawSegmentations()` | 当场绘制 YOLO packed mask | `bitPackedPixelMask` |
-| `yolo.drawSegmentationEdgePoints()` / `DrawTool.drawSegmentationEdgePoints()` | YOLO / RF-DETR，含 JSON 缓存后的多边形 | 有 packed mask 时用 mask，否则用 `segmentationEdgePoints` |
-| `sam3.drawSegmentations()` / `DrawTool.drawSam3Segmentations()` | SAM 3 PCS / PVS | packed mask + 轮廓 |
+| `segmentationRenderMode` | 行为 |
+| --- | --- |
+| `auto`（默认） | 有 `bitPackedPixelMask` 时绘制 mask，否则把 `segmentationEdgePoints` 作为 polygon 填充 |
+| `mask` | 优先绘制原始 packed mask；没有 mask 时自动回退到 polygon |
+| `polygon` | packed mask 使用统一多边形提取器；仅有缓存边点时使用 `segmentationEdgePoints` |
 
-不要用 `DrawTool.drawSam3Segmentations` 重绘 YOLO / RF-DETR。`Sam3.drawSegmentationEdgePoints` 已移除，请改用 `sam3.drawSegmentations()`。
+### 已弃用的分割 API
+
+- `DrawTool.drawSam3Segmentations()` → 使用 `DrawTool.drawSegmentations()`。
+- `DrawTool.drawSegmentationEdgePoints()`、`yolo.drawSegmentationEdgePoints()` → 使用 `drawSegmentations({ segmentationRenderMode: 'polygon' })`。
+- 独立函数 `maskToPolygon()`、`maskToPolygons()` → 使用 `extractSegmentationPolygon()`、`extractSegmentationPolygons()`。
+
+旧方法仍作为兼容包装保留，并已标记 `@deprecated`；它们不会再走独立的绘制或提取实现。
 
 `DrawTool` 也可以作为独立绘制工具使用。适合推理和绘制分离、或者需要渲染缓存检测结果的场景：
 
@@ -290,11 +306,15 @@ const image = document.querySelector('img')!;
 const canvas = document.querySelector('canvas')!;
 const segmentations = await yolo.RunSegmentation(image, 0.35, 0.5, 0.7);
 
-segmentations.forEach(segmentation => {
-  segmentation.segmentationEdgePoints = DrawTool.extractSegmentationEdgePoints(segmentation);
-});
+const polygons = segmentations.map(segmentation =>
+  DrawTool.extractSegmentationPolygons(segmentation, {
+    imageWidth: image.naturalWidth,
+    imageHeight: image.naturalHeight,
+  }),
+);
 
-DrawTool.drawSegmentationEdgePoints(image, segmentations, canvas, {
+DrawTool.drawSegmentations(image, segmentations, canvas, {
+  segmentationRenderMode: 'polygon',
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,
@@ -387,10 +407,11 @@ sam3.resetVisualPrompts();
 
 ### 绘制
 
-PCS 后处理会按 bbox 裁剪 mask，并填写 `segmentationEdgePoints`。请用 `sam3.drawSegmentations()` 绘制。
+PCS 后处理会按 bbox 裁剪 mask，并填写 `segmentationEdgePoints`。`sam3.drawSegmentations()` 与 YOLO、RF-DETR 使用同一绘制流程，可通过 `segmentationRenderMode` 选择 `auto`、`mask` 或 `polygon`。
 
 ```ts
 sam3.drawSegmentations(image, masks, canvas, {
+  segmentationRenderMode: 'auto',
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,

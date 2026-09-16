@@ -114,7 +114,23 @@ interface SegmentationDrawingOptions extends DetectionDrawingOptions {
     drawContour?: boolean;
     contourThickness?: number;
     drawBoundingBoxes?: boolean;
+    /**
+     * auto 优先绘制原始 mask，无 mask 时绘制 polygon；
+     * mask / polygon 可强制统一渲染路径。
+     */
+    segmentationRenderMode?: SegmentationRenderMode;
     fillSegmentationEdgePoints?: boolean;
+}
+type SegmentationRenderMode = 'auto' | 'mask' | 'polygon';
+interface SegmentationPolygonOptions {
+    imageWidth: number;
+    imageHeight: number;
+    sourceWidth?: number;
+    sourceHeight?: number;
+    prompt?: Point;
+    epsilon?: number;
+    /** 单条轮廓最多保留的点数，默认 96 */
+    maxPoints?: number;
 }
 interface KeyPointConnection {
     index: number;
@@ -283,6 +299,20 @@ declare function getLoadedOrtBundle(): Exclude<OrtBundle, 'auto'> | null;
 /** Compatible alias used after initialization (Tensor / InferenceSession / env). */
 declare const ort: OrtModule;
 
+type WebGpuDeviceLostInfo = {
+    reason?: string;
+    message?: string;
+};
+type WebGpuLifecycleListener = (info?: WebGpuDeviceLostInfo) => void | Promise<void>;
+declare function isWebGpuDeviceLostError(error: unknown): boolean;
+declare function isOrtWebGpuDeviceLost(): boolean;
+declare function getOrtWebGpuDeviceGeneration(): number;
+declare function onOrtWebGpuDeviceLost(listener: WebGpuLifecycleListener): () => void;
+declare function onOrtWebGpuDeviceRestored(listener: WebGpuLifecycleListener): () => void;
+declare function watchOrtWebGpuDevice(): Promise<void>;
+declare function ensureOrtWebGpuReady(): Promise<void>;
+declare function recoverOrtWebGpuDevice(info?: WebGpuDeviceLostInfo): Promise<void>;
+
 declare class Yolo {
     private readonly options;
     private readonly model?;
@@ -293,6 +323,7 @@ declare class Yolo {
     private preprocessContext;
     private preprocessTensorData;
     private preprocessTensorSize;
+    private loadedWebGpuGeneration;
     constructor(options?: YoloOptions);
     get yoloOptions(): YoloOptions;
     get preprocessBackend(): 'cpu' | 'webgpu';
@@ -316,6 +347,7 @@ declare class Yolo {
     drawClassifications(source: YoloImageSource, classifications: readonly Classification[], canvas: HTMLCanvasElement, options?: ClassificationDrawingOptions): void;
     drawObbDetections(source: YoloImageSource, detections: readonly OBBDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
     drawSegmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
+    /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'polygon'. */
     drawSegmentationEdgePoints(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     drawPoseEstimations(source: YoloImageSource, poseEstimations: readonly PoseEstimation[], canvas: HTMLCanvasElement, options?: PoseDrawingOptions): void;
     extractSegmentationEdgePoints(segmentation: Segmentation): {
@@ -326,6 +358,14 @@ declare class Yolo {
         x: number;
         y: number;
     }[][];
+    extractSegmentationPolygons(segmentation: Segmentation, options: SegmentationPolygonOptions): {
+        x: number;
+        y: number;
+    }[][];
+    extractSegmentationsPolygons(segmentations: readonly Segmentation[], options: SegmentationPolygonOptions): {
+        x: number;
+        y: number;
+    }[][][];
     tensor<T extends ort$1.Tensor.Type>(type: T, data: ort$1.Tensor.DataTypeMap[T], dims?: readonly number[]): ort$1.Tensor;
     getWebGpuDevice(): Promise<any>;
     tensorFromGpuBuffer(gpuBuffer: ort$1.Tensor.GpuBufferType, dims: readonly number[], dispose?: () => void): ort$1.Tensor;
@@ -343,6 +383,7 @@ declare class Yolo {
     private ensureHandler;
     private requireModel;
     private hasWebGpuExecutionProvider;
+    private withWebGpuRetry;
     private isSupportedModel;
 }
 
@@ -443,16 +484,7 @@ interface Sam3MaskOverlayOptions {
     sourceWidth?: number;
     sourceHeight?: number;
 }
-interface Sam3MaskPolygonOptions {
-    imageWidth: number;
-    imageHeight: number;
-    sourceWidth?: number;
-    sourceHeight?: number;
-    prompt?: Point;
-    epsilon?: number;
-    /** 单条轮廓最多保留的点数，默认 96 */
-    maxPoints?: number;
-}
+type Sam3MaskPolygonOptions = SegmentationPolygonOptions;
 interface Sam3PointerToImageOptions {
     imageWidth?: number;
     imageHeight?: number;
@@ -587,7 +619,9 @@ declare class Sam3HoverPreview {
     private flush;
 }
 
+/** @deprecated Use extractSegmentationPolygons() instead. */
 declare function maskToPolygons(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][][];
+/** @deprecated Use extractSegmentationPolygon() instead. */
 declare function maskToPolygon(mask: Segmentation, options: Sam3MaskPolygonOptions): number[][];
 
 declare function pickBestMask(masks: readonly Segmentation[], ious?: readonly number[], options?: {
@@ -628,6 +662,7 @@ declare class Sam3 {
     private tokenizer;
     private state;
     private readonly webGpu;
+    private loadedWebGpuGeneration;
     constructor(options: Sam3Options);
     static create(options: Sam3Options): Promise<Sam3>;
     get isLoaded(): boolean;
@@ -700,8 +735,16 @@ declare class Sam3 {
     private selectHoverMask;
     private withSourceSize;
     private ensureHandler;
+    private withWebGpuRetry;
     private ensureState;
 }
+
+/**
+ * 将任意模型返回的 bit-packed segmentation mask 转为图像坐标 polygon。
+ * YOLO、RF-DETR 与 SAM3 共用该实现。
+ */
+declare function extractSegmentationPolygons(segmentation: Segmentation, options: SegmentationPolygonOptions): Point[][];
+declare function extractSegmentationPolygon(segmentation: Segmentation, options: SegmentationPolygonOptions): Point[];
 
 declare class DrawTool {
     static drawObjectDetections(source: YoloImageSource, detections: readonly ObjectDetection[], canvas: HTMLCanvasElement, options?: DetectionDrawingOptions): void;
@@ -710,6 +753,9 @@ declare class DrawTool {
     static drawSegmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     static drawPoseEstimations(source: YoloImageSource, poseEstimations: readonly PoseEstimation[], canvas: HTMLCanvasElement, options?: PoseDrawingOptions): void;
     private static hasPackedMask;
+    static extractSegmentationPolygon(segmentation: Segmentation, options: SegmentationPolygonOptions): Point[];
+    static extractSegmentationPolygons(segmentation: Segmentation, options: SegmentationPolygonOptions): Point[][];
+    static extractSegmentationsPolygons(segmentations: readonly Segmentation[], options: SegmentationPolygonOptions): Point[][][];
     static extractSegmentationEdgePoints(segmentation: Segmentation): {
         x: number;
         y: number;
@@ -742,16 +788,9 @@ declare class DrawTool {
     private static getCanvasFontSize;
     private static getObbCorners;
     private static drawSegmentationMask;
-    private static drawSegmentationContour;
-    /**
-     * SAM3 绘制：用 packed mask 填充，轮廓从 mask / 已提取边点拆成多段折线。
-     * YOLO / RF-DETR 请先 extractSegmentationEdgePoints，再走 {@link drawSegmentationEdgePoints}。
-     */
+    /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'auto'. */
     static drawSam3Segmentations(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
-    /**
-     * YOLO / RF-DETR：使用已提取的 `segmentationEdgePoints` 描边和填充。
-     * 没有 packed mask 时按多边形填充，不要求携带 bitPackedPixelMask。
-     */
+    /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'polygon'. */
     static drawSegmentationEdgePoints(source: YoloImageSource, segmentations: readonly Segmentation[], canvas: HTMLCanvasElement, options?: SegmentationDrawingOptions): void;
     private static drawOrderedEdgeContours;
     private static isMostlyClosedContour;
@@ -765,4 +804,4 @@ declare class DrawTool {
     private static clamp;
 }
 
-export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type OrtBundle, type OrtModule, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, Sam3, type Sam3BoxPrompt, type Sam3HoverBoxOptions, type Sam3HoverMode, type Sam3HoverPick, type Sam3HoverPointOptions, Sam3HoverPreview, type Sam3HoverPreviewOptions, type Sam3HoverResult, type Sam3HoverSelectOptions, type Sam3ImageInput, type Sam3ImagePixelMask, type Sam3InferenceState, type Sam3MaskOverlayOptions, type Sam3MaskPolygonOptions, type Sam3MaskPrompt, type Sam3MaskRasterOptions, type Sam3Options, type Sam3PcsPrompt, type Sam3PcsRawOutput, type Sam3PointPrompt, type Sam3PointerLike, type Sam3PointerToImageOptions, type Sam3PvsPrompt, type Sam3PvsResult, type Sam3TokenizerTables, Segmentation, type SegmentationDrawingOptions, TrackingInfo, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, getLoadedOrtBundle, getOrt, initializeOnnxRuntimeWeb, isWebAssemblyJspiAvailable, isolateMaskComponent, mapImageBox, mapImagePoint, maskToImagePixels, maskToPolygon, maskToPolygons, ort, pickBestMask, pointerToImagePoint, resolveOrtBundle, selectVisualMask, splitTextPrompts };
+export { Classification, type ClassificationDrawingOptions, type Detection, type DetectionDrawingOptions, DrawTool, type IYoloHandler, type KeyPoint, type KeyPointConnection, type KeyPointMarker, type LabelModel, type ModelDataType, type ModelType, type ModelVersion, OBBDetection, ObjectDetection, type OnnxModel, type OnnxRuntimeWebOptions, type OrtBundle, type OrtModule, type Point, type PoseDrawingOptions, PoseEstimation, type Rect, SAM3_IMAGE_SIZE, SAM3_MASK_SIZE, SAM3_TEXT_LENGTH, Sam3, type Sam3BoxPrompt, type Sam3HoverBoxOptions, type Sam3HoverMode, type Sam3HoverPick, type Sam3HoverPointOptions, Sam3HoverPreview, type Sam3HoverPreviewOptions, type Sam3HoverResult, type Sam3HoverSelectOptions, type Sam3ImageInput, type Sam3ImagePixelMask, type Sam3InferenceState, type Sam3MaskOverlayOptions, type Sam3MaskPolygonOptions, type Sam3MaskPrompt, type Sam3MaskRasterOptions, type Sam3Options, type Sam3PcsPrompt, type Sam3PcsRawOutput, type Sam3PointPrompt, type Sam3PointerLike, type Sam3PointerToImageOptions, type Sam3PvsPrompt, type Sam3PvsResult, type Sam3TokenizerTables, Segmentation, type SegmentationDrawingOptions, type SegmentationPolygonOptions, type SegmentationRenderMode, TrackingInfo, type WebGpuDeviceLostInfo, type WebGpuLifecycleListener, Yolo, type YoloExecutionProvider, YoloExecutionProviderNames, YoloExecutionProviderOptions, type YoloFeeds, type YoloFetches, type YoloImageSource, type YoloLabels, type YoloModelSource, type YoloOptions, type YoloPreprocessResult, type YoloRunOptions, type YoloRunResult, type YoloTensor, YoloWebExecutionProviderOptions, canReuseOrtBundle, ensureOnnxRuntimeWebInitialized, ensureOrtWebGpuReady, extractSegmentationPolygon, extractSegmentationPolygons, getLoadedOrtBundle, getOrt, getOrtWebGpuDeviceGeneration, initializeOnnxRuntimeWeb, isOrtWebGpuDeviceLost, isWebAssemblyJspiAvailable, isWebGpuDeviceLostError, isolateMaskComponent, mapImageBox, mapImagePoint, maskToImagePixels, maskToPolygon, maskToPolygons, onOrtWebGpuDeviceLost, onOrtWebGpuDeviceRestored, ort, pickBestMask, pointerToImagePoint, recoverOrtWebGpuDevice, resolveOrtBundle, selectVisualMask, splitTextPrompts, watchOrtWebGpuDevice };

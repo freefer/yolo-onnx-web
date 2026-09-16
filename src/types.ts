@@ -122,8 +122,25 @@ export interface SegmentationDrawingOptions extends DetectionDrawingOptions {
   drawContour?: boolean;
   contourThickness?: number;
   drawBoundingBoxes?: boolean;
- 
+  /**
+   * auto 优先绘制原始 mask，无 mask 时绘制 polygon；
+   * mask / polygon 可强制统一渲染路径。
+   */
+  segmentationRenderMode?: SegmentationRenderMode;
   fillSegmentationEdgePoints?: boolean;
+}
+
+export type SegmentationRenderMode = 'auto' | 'mask' | 'polygon';
+
+export interface SegmentationPolygonOptions {
+  imageWidth: number;
+  imageHeight: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  prompt?: Point;
+  epsilon?: number;
+  /** 单条轮廓最多保留的点数，默认 96 */
+  maxPoints?: number;
 }
 
 export interface KeyPointConnection {

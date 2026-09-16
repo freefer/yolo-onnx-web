@@ -1,9 +1,372 @@
 'use strict';
 
+// src/webgpu-lifecycle.ts
+var DEVICE_LOST_RE = /device lost|GPUDevice was lost|parent device is lost|GPUBuffer used after destroy|Destroyed (?:buffer|texture)|Device is lost|Device was destroyed|device\.destroy|GPU process crashed|Invalid CommandBuffer|vk::Device|DXGI_ERROR_DEVICE_REMOVED|GPUDevice\.lost/i;
+var getOrtFn = null;
+var capturedBackend = null;
+var watchedDevice = null;
+var deviceLost = false;
+var deviceGeneration = 0;
+var recoveryPromise = null;
+var recoveryDepth = 0;
+var sessionTeardownDepth = 0;
+var wasmHooksInstalled = false;
+var pageHooksInstalled = false;
+var lostListeners = /* @__PURE__ */ new Set();
+var restoredListeners = /* @__PURE__ */ new Set();
+function bindOrtGetter(getter) {
+  getOrtFn = getter;
+}
+function isWebGpuDeviceLostError(error) {
+  const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return DEVICE_LOST_RE.test(message);
+}
+function isOrtWebGpuDeviceLost() {
+  return deviceLost;
+}
+function getOrtWebGpuDeviceGeneration() {
+  return deviceGeneration;
+}
+function onOrtWebGpuDeviceLost(listener) {
+  lostListeners.add(listener);
+  return () => lostListeners.delete(listener);
+}
+function onOrtWebGpuDeviceRestored(listener) {
+  restoredListeners.add(listener);
+  return () => restoredListeners.delete(listener);
+}
+function installWebGpuLifecycleHooks() {
+  installWasmJsepCapture();
+  installPageLifecycleHooks();
+}
+async function withOrtWebGpuSessionTeardown(operation) {
+  sessionTeardownDepth += 1;
+  try {
+    return await operation();
+  } finally {
+    await Promise.resolve();
+    sessionTeardownDepth -= 1;
+  }
+}
+async function watchOrtWebGpuDevice() {
+  installWebGpuLifecycleHooks();
+  const device = await resolveOrtWebGpuDevice();
+  if (!device || device === watchedDevice) {
+    return;
+  }
+  watchDevice(device);
+}
+async function ensureOrtWebGpuReady() {
+  if (recoveryPromise && recoveryDepth === 0) {
+    await recoveryPromise;
+  }
+  if (deviceLost && recoveryDepth === 0) {
+    await recoverOrtWebGpuDevice();
+  }
+}
+async function recoverOrtWebGpuDevice(info) {
+  if (recoveryDepth > 0) {
+    return;
+  }
+  if (recoveryPromise) {
+    return recoveryPromise;
+  }
+  if (isExpectedGpuDeviceDestroy(info) && !deviceLost) {
+    watchedDevice = null;
+    return;
+  }
+  recoveryPromise = (async () => {
+    recoveryDepth += 1;
+    deviceLost = true;
+    const lostInfo = info != null ? info : { reason: "unknown", message: "WebGPU device was released" };
+    let notifiedLost = false;
+    try {
+      await notify(lostListeners, lostInfo);
+      notifiedLost = true;
+      await waitUntilDocumentVisible();
+      await delay(50);
+      const rebuilt = await reinitializeOrtWebGpuBackend(lostInfo);
+      deviceLost = false;
+      if (rebuilt) {
+        deviceGeneration += 1;
+      }
+      await notify(restoredListeners, lostInfo);
+      if (rebuilt) {
+        await watchOrtWebGpuDevice();
+      }
+    } catch (error) {
+      deviceLost = false;
+      deviceGeneration += 1;
+      if (notifiedLost) {
+        await notify(restoredListeners, lostInfo);
+      }
+      console.warn("[yolo-onnx-web] WebGPU \u6062\u590D\u5931\u8D25\uFF0C\u5C06\u5728\u4E0B\u6B21\u521B\u5EFA\u4F1A\u8BDD\u65F6\u91CD\u8BD5:", error);
+    } finally {
+      recoveryDepth -= 1;
+    }
+  })().finally(() => {
+    recoveryPromise = null;
+  });
+  return recoveryPromise;
+}
+function isExpectedGpuDeviceDestroy(info) {
+  var _a, _b;
+  const reason = (_a = info == null ? void 0 : info.reason) != null ? _a : "";
+  const message = (_b = info == null ? void 0 : info.message) != null ? _b : "";
+  const destroyed = reason === "destroyed" || /device was destroyed/i.test(message);
+  if (!destroyed) {
+    return false;
+  }
+  return sessionTeardownDepth > 0;
+}
+function captureWebGpuBackend(impl) {
+  if (!impl || typeof impl !== "object") {
+    return;
+  }
+  const backend = impl;
+  if (typeof backend.initialize === "function" && typeof backend.dispose === "function") {
+    capturedBackend = backend;
+  }
+}
+function wrapJsepInit(fn) {
+  if (fn.__yoloOrtWrapped) {
+    return fn;
+  }
+  const wrapped = function jsepInit(name, impl) {
+    if (name === "webgpu" && Array.isArray(impl) && impl[0]) {
+      captureWebGpuBackend(impl[0]);
+    }
+    return fn.apply(this, arguments);
+  };
+  wrapped.__yoloOrtWrapped = true;
+  return wrapped;
+}
+function installWasmJsepCapture() {
+  if (wasmHooksInstalled || typeof WebAssembly === "undefined") {
+    return;
+  }
+  wasmHooksInstalled = true;
+  const wrapInstance = (instance) => {
+    const exportsObject = instance.exports;
+    if (typeof exportsObject.jsepInit !== "function") {
+      return instance;
+    }
+    return new Proxy(instance, {
+      get(target, property, receiver) {
+        if (property !== "exports") {
+          return Reflect.get(target, property, receiver);
+        }
+        return new Proxy(exportsObject, {
+          get(exportTarget, exportName, exportReceiver) {
+            const value = Reflect.get(exportTarget, exportName, exportReceiver);
+            if (exportName !== "jsepInit" || typeof value !== "function") {
+              return value;
+            }
+            return wrapJsepInit(value);
+          }
+        });
+      }
+    });
+  };
+  const originalInstantiate = WebAssembly.instantiate.bind(WebAssembly);
+  WebAssembly.instantiate = (async (source, imports) => {
+    const result = await originalInstantiate(source, imports);
+    if ("instance" in result) {
+      return { ...result, instance: wrapInstance(result.instance) };
+    }
+    return wrapInstance(result);
+  });
+  if (typeof WebAssembly.instantiateStreaming === "function") {
+    const originalStreaming = WebAssembly.instantiateStreaming.bind(WebAssembly);
+    WebAssembly.instantiateStreaming = (async (source, imports) => {
+      const result = await originalStreaming(source, imports);
+      return { ...result, instance: wrapInstance(result.instance) };
+    });
+  }
+}
+function installPageLifecycleHooks() {
+  if (pageHooksInstalled || typeof window === "undefined" || typeof document === "undefined") {
+    return;
+  }
+  pageHooksInstalled = true;
+  const probe = () => {
+    void probeWebGpuDevice();
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      probe();
+    }
+  });
+  window.addEventListener("pageshow", probe);
+}
+async function probeWebGpuDevice() {
+  if (recoveryPromise || sessionTeardownDepth > 0) {
+    return;
+  }
+  const device = watchedDevice != null ? watchedDevice : await resolveOrtWebGpuDevice().catch(() => null);
+  if (!device) {
+    return;
+  }
+  if (await isDeviceLostSettled(device)) {
+    const info = await device.lost.catch(() => ({ reason: "unknown", message: "WebGPU device was lost" }));
+    if ((info == null ? void 0 : info.reason) === "destroyed" || isExpectedGpuDeviceDestroy(info)) {
+      watchedDevice = null;
+      deviceLost = false;
+      return;
+    }
+    await recoverOrtWebGpuDevice({
+      reason: (info == null ? void 0 : info.reason) || "unknown",
+      message: (info == null ? void 0 : info.message) || "WebGPU device was lost while the page was in the background"
+    }).catch((error) => {
+      console.warn("[yolo-onnx-web] WebGPU \u540E\u53F0\u6062\u590D\u5931\u8D25:", error);
+    });
+    return;
+  }
+  try {
+    const usage = globalThis.GPUBufferUsage;
+    if (!usage) {
+      return;
+    }
+    const buffer = device.createBuffer({ size: 16, usage: usage.COPY_DST | usage.MAP_READ });
+    buffer.destroy();
+  } catch (error) {
+    if (isWebGpuDeviceLostError(error)) {
+      await recoverOrtWebGpuDevice({
+        reason: "unknown",
+        message: error instanceof Error ? error.message : String(error)
+      }).catch((recoverError) => {
+        console.warn("[yolo-onnx-web] WebGPU \u63A2\u6D4B\u6062\u590D\u5931\u8D25:", recoverError);
+      });
+    }
+  }
+}
+function watchDevice(device) {
+  watchedDevice = device;
+  void device.lost.then((info) => {
+    if (watchedDevice !== device) {
+      return;
+    }
+    watchedDevice = null;
+    if (isExpectedGpuDeviceDestroy(info) || (info == null ? void 0 : info.reason) === "destroyed") {
+      deviceLost = false;
+      return;
+    }
+    void recoverOrtWebGpuDevice({
+      reason: info == null ? void 0 : info.reason,
+      message: (info == null ? void 0 : info.message) || "WebGPU device.lost"
+    }).catch((error) => {
+      console.warn("[yolo-onnx-web] WebGPU device.lost \u6062\u590D\u5931\u8D25:", error);
+    });
+  });
+}
+async function reinitializeOrtWebGpuBackend(info) {
+  var _a, _b;
+  let ort2 = null;
+  try {
+    ort2 = (_a = getOrtFn == null ? void 0 : getOrtFn()) != null ? _a : null;
+  } catch (e) {
+    ort2 = null;
+  }
+  const webgpu = (_b = ort2 == null ? void 0 : ort2.env) == null ? void 0 : _b.webgpu;
+  if (webgpu) {
+    try {
+      delete webgpu.device;
+    } catch (e) {
+    }
+  }
+  if (!capturedBackend || typeof capturedBackend.initialize !== "function") {
+    console.warn(
+      `[yolo-onnx-web] WebGPU \u8BBE\u5907\u5DF2\u91CA\u653E\uFF08${info.message || info.reason || "device lost"}\uFF09\u3002\u672A\u6355\u83B7 JSEP \u540E\u7AEF\uFF0C\u8DF3\u8FC7\u539F\u5730\u91CD\u5EFA\u3002`
+    );
+    return false;
+  }
+  try {
+    capturedBackend.dispose();
+  } catch (e) {
+  }
+  const adapter = await requestWebGpuAdapter();
+  await capturedBackend.initialize(ort2 == null ? void 0 : ort2.env, adapter);
+  return true;
+}
+async function requestWebGpuAdapter() {
+  var _a, _b, _c, _d;
+  const gpu = navigator.gpu;
+  if (!gpu) {
+    throw new Error("\u5F53\u524D\u6D4F\u89C8\u5668\u4E0D\u652F\u6301 WebGPU");
+  }
+  const powerPreference = (_d = (_c = (_b = (_a = getOrtFn == null ? void 0 : getOrtFn()) == null ? void 0 : _a.env) == null ? void 0 : _b.webgpu) == null ? void 0 : _c.powerPreference) != null ? _d : "high-performance";
+  let lastError;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      const adapter = await gpu.requestAdapter({ powerPreference });
+      if (adapter) {
+        return adapter;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(120 * (attempt + 1));
+  }
+  throw lastError instanceof Error ? lastError : new Error("\u65E0\u6CD5\u91CD\u65B0\u7533\u8BF7 WebGPU \u9002\u914D\u5668\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u540E\u91CD\u8BD5");
+}
+async function resolveOrtWebGpuDevice() {
+  var _a, _b, _c, _d;
+  try {
+    const ort2 = getOrtFn == null ? void 0 : getOrtFn();
+    const device = await ((_b = (_a = ort2 == null ? void 0 : ort2.env) == null ? void 0 : _a.webgpu) == null ? void 0 : _b.device);
+    return (_c = device != null ? device : capturedBackend == null ? void 0 : capturedBackend.device) != null ? _c : null;
+  } catch (e) {
+    return (_d = capturedBackend == null ? void 0 : capturedBackend.device) != null ? _d : null;
+  }
+}
+function isDeviceLostSettled(device) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (lost) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(lost);
+    };
+    void device.lost.then(() => finish(true));
+    queueMicrotask(() => finish(false));
+  });
+}
+async function waitUntilDocumentVisible() {
+  if (typeof document === "undefined" || document.visibilityState === "visible") {
+    return;
+  }
+  await new Promise((resolve) => {
+    const onChange = () => {
+      if (document.visibilityState === "visible") {
+        document.removeEventListener("visibilitychange", onChange);
+        resolve();
+      }
+    };
+    document.addEventListener("visibilitychange", onChange);
+  });
+}
+async function notify(listeners, info) {
+  for (const listener of [...listeners]) {
+    try {
+      await listener(info);
+    } catch (e) {
+    }
+  }
+}
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+installWebGpuLifecycleHooks();
+
 // src/runtime.ts
 var ortModule = null;
 var loadedBundle = null;
 var loadingPromise = null;
+installWebGpuLifecycleHooks();
 function isWebAssemblyJspiAvailable() {
   const wasm = globalThis.WebAssembly;
   return Boolean(wasm && "Suspending" in wasm);
@@ -111,6 +474,7 @@ function getOrt() {
   }
   return ortModule;
 }
+bindOrtGetter(() => getOrt());
 function getLoadedOrtBundle() {
   return loadedBundle;
 }
@@ -126,7 +490,7 @@ function sessionUsesWebGpu(options) {
     return provider.name === "webgpu";
   });
 }
-function delay(ms) {
+function delay2(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
@@ -144,29 +508,46 @@ async function createOrtInferenceSession(model, options) {
   if (!sessionUsesWebGpu(options)) {
     return createInferenceSession(model, options);
   }
-  let release;
-  const previous = webGpuSessionLock;
-  webGpuSessionLock = new Promise((resolve) => {
-    release = resolve;
-  });
-  await previous;
-  try {
-    let lastError;
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      try {
-        return await createInferenceSession(model, options);
-      } catch (error) {
-        lastError = error;
-        const message = error instanceof Error ? error.message : String(error);
-        if (!WEBGPU_SESSION_BUSY.test(message) || attempt === 5) {
-          throw error;
+  const createLocked = async () => {
+    let release;
+    const previous = webGpuSessionLock;
+    webGpuSessionLock = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await ensureOrtWebGpuReady();
+      let lastError;
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          const session = await createInferenceSession(model, options);
+          void watchOrtWebGpuDevice();
+          return session;
+        } catch (error) {
+          lastError = error;
+          const message = error instanceof Error ? error.message : String(error);
+          if (!WEBGPU_SESSION_BUSY.test(message) || attempt === 5) {
+            throw error;
+          }
+          await delay2(40 * (attempt + 1));
         }
-        await delay(40 * (attempt + 1));
       }
+      throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    } finally {
+      release();
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
-  } finally {
-    release();
+  };
+  try {
+    return await createLocked();
+  } catch (error) {
+    if (!isWebGpuDeviceLostError(error)) {
+      throw error;
+    }
+    await recoverOrtWebGpuDevice({
+      reason: "unknown",
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return createLocked();
   }
 }
 var ort = new Proxy({}, {
@@ -253,6 +634,291 @@ var Classification = class {
     this.confidence = confidence;
   }
 };
+
+// src/segmentation-contours.ts
+var DEFAULT_MAX_POLYGON_POINTS = 96;
+var MAX_MASK_POLYGONS = 16;
+var MIN_MASK_POLYGON_AREA_RATIO = 0.01;
+function extractSegmentationPolygons(segmentation, options) {
+  return extractNumberPolygons(segmentation, options).map(
+    (polygon) => polygon.map((point) => ({ x: point[0], y: point[1] }))
+  );
+}
+function extractSegmentationPolygon(segmentation, options) {
+  var _a;
+  return (_a = extractSegmentationPolygons(segmentation, options)[0]) != null ? _a : [];
+}
+function extractNumberPolygons(segmentation, options) {
+  var _a, _b;
+  const imageWidth = options.imageWidth;
+  const imageHeight = options.imageHeight;
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return [];
+  }
+  const contours = tracePackedMaskContours(segmentation);
+  if (contours.length === 0) {
+    return [];
+  }
+  const sourceWidth = options.sourceWidth || imageWidth || 1;
+  const sourceHeight = options.sourceHeight || imageHeight || 1;
+  const size = packedMaskSize(segmentation);
+  const box = segmentation.boundingBox;
+  const boxWidth = box.right - box.left;
+  const boxHeight = box.bottom - box.top;
+  const maxPoints = (_a = options.maxPoints) != null ? _a : DEFAULT_MAX_POLYGON_POINTS;
+  const mapped = contours.map((contour) => {
+    const points = contour.map((point) => [
+      clamp((box.left + point[0] * boxWidth / size.width) * (imageWidth / sourceWidth), 0, imageWidth),
+      clamp((box.top + point[1] * boxHeight / size.height) * (imageHeight / sourceHeight), 0, imageHeight)
+    ]);
+    return { points, area: Math.abs(signedContourArea(points)) };
+  }).filter((item) => item.points.length >= 3 && item.area > 0).sort((left, right) => right.area - left.area);
+  if (mapped.length === 0) {
+    return [];
+  }
+  if (options.prompt) {
+    const mappedPrompt = {
+      x: options.prompt.x * imageWidth / sourceWidth,
+      y: options.prompt.y * imageHeight / sourceHeight
+    };
+    const selected = (_b = mapped.find((item) => pointInNumberContour(mappedPrompt, item.points))) != null ? _b : mapped[0];
+    return [finalizePolygon(selected.points, imageWidth, imageHeight, maxPoints, options.epsilon)];
+  }
+  const minArea = mapped[0].area * MIN_MASK_POLYGON_AREA_RATIO;
+  const outerContours = [];
+  for (const candidate of mapped) {
+    if (candidate.area < minArea || outerContours.length >= MAX_MASK_POLYGONS) {
+      break;
+    }
+    const probe = { x: candidate.points[0][0], y: candidate.points[0][1] };
+    if (outerContours.some((outer) => pointInNumberContour(probe, outer))) {
+      continue;
+    }
+    outerContours.push(finalizePolygon(candidate.points, imageWidth, imageHeight, maxPoints, options.epsilon));
+  }
+  return outerContours.filter((polygon) => polygon.length >= 3);
+}
+function packedMaskSize(segmentation) {
+  if (segmentation.pixelMaskWidth && segmentation.pixelMaskHeight) {
+    return {
+      width: Math.max(1, Math.round(segmentation.pixelMaskWidth)),
+      height: Math.max(1, Math.round(segmentation.pixelMaskHeight))
+    };
+  }
+  return {
+    width: Math.max(1, Math.round(segmentation.boundingBox.right - segmentation.boundingBox.left)),
+    height: Math.max(1, Math.round(segmentation.boundingBox.bottom - segmentation.boundingBox.top))
+  };
+}
+function tracePackedMaskContours(segmentation) {
+  const packed = segmentation.bitPackedPixelMask;
+  const { width, height } = packedMaskSize(segmentation);
+  if (!(packed == null ? void 0 : packed.byteLength) || width * height > packed.byteLength * 8) {
+    return [];
+  }
+  const vertexWidth = width + 1;
+  const edges = [];
+  const outgoing = /* @__PURE__ */ new Map();
+  const isSet = (x, y) => {
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+      return false;
+    }
+    const index = y * width + x;
+    return (packed[index >> 3] & 1 << (index & 7)) !== 0;
+  };
+  const addEdge = (fromX, fromY, toX, toY, direction) => {
+    const edge = { fromX, fromY, toX, toY, direction, used: false };
+    edges.push(edge);
+    const key = fromY * vertexWidth + fromX;
+    const next = outgoing.get(key);
+    if (next) {
+      next.push(edge);
+    } else {
+      outgoing.set(key, [edge]);
+    }
+  };
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!isSet(x, y)) {
+        continue;
+      }
+      if (!isSet(x, y - 1)) {
+        addEdge(x, y, x + 1, y, 0);
+      }
+      if (!isSet(x + 1, y)) {
+        addEdge(x + 1, y, x + 1, y + 1, 1);
+      }
+      if (!isSet(x, y + 1)) {
+        addEdge(x + 1, y + 1, x, y + 1, 2);
+      }
+      if (!isSet(x - 1, y)) {
+        addEdge(x, y + 1, x, y, 3);
+      }
+    }
+  }
+  const contours = [];
+  for (const first of edges) {
+    if (first.used) {
+      continue;
+    }
+    const startKey = first.fromY * vertexWidth + first.fromX;
+    const points = [[first.fromX, first.fromY]];
+    let current = first;
+    let closed = false;
+    for (let guard = 0; current && guard <= edges.length; guard += 1) {
+      current.used = true;
+      points.push([current.toX, current.toY]);
+      const endKey = current.toY * vertexWidth + current.toX;
+      if (endKey === startKey) {
+        closed = true;
+        break;
+      }
+      current = chooseNextBoundaryEdge(outgoing.get(endKey), current.direction);
+    }
+    if (!closed || points.length < 4) {
+      continue;
+    }
+    points.pop();
+    if (signedContourArea(points) > 0) {
+      contours.push(points);
+    }
+  }
+  return contours;
+}
+function chooseNextBoundaryEdge(candidates, incomingDirection) {
+  let selected;
+  let selectedRank = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates != null ? candidates : []) {
+    if (candidate.used) {
+      continue;
+    }
+    const turn = (candidate.direction - incomingDirection + 4) % 4;
+    const rank = turn === 1 ? 0 : turn === 0 ? 1 : turn === 3 ? 2 : 3;
+    if (rank < selectedRank) {
+      selected = candidate;
+      selectedRank = rank;
+    }
+  }
+  return selected;
+}
+function finalizePolygon(points, imageWidth, imageHeight, maxPoints, epsilon) {
+  const pointLimit = Math.min(512, Math.max(3, Math.round(maxPoints)));
+  const dense = simplifyClosedPolygon(points, 0);
+  if (dense.length <= pointLimit) {
+    return dense.length >= 3 ? dense : samplePolygon(points, pointLimit);
+  }
+  let lowerEpsilon = 0;
+  let upperEpsilon = epsilon != null ? epsilon : polygonEpsilon(imageWidth, imageHeight);
+  let aboveLimit = dense;
+  let belowLimit = simplifyClosedPolygon(points, upperEpsilon);
+  while (belowLimit.length > pointLimit && upperEpsilon < 128) {
+    lowerEpsilon = upperEpsilon;
+    aboveLimit = belowLimit;
+    upperEpsilon *= 2;
+    belowLimit = simplifyClosedPolygon(points, upperEpsilon);
+  }
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    const mid = (lowerEpsilon + upperEpsilon) / 2;
+    const candidate = simplifyClosedPolygon(points, mid);
+    if (candidate.length > pointLimit) {
+      lowerEpsilon = mid;
+      aboveLimit = candidate;
+    } else {
+      upperEpsilon = mid;
+      belowLimit = candidate;
+    }
+  }
+  if (aboveLimit.length > pointLimit) {
+    return samplePolygon(aboveLimit, pointLimit);
+  }
+  return belowLimit.length >= 3 ? belowLimit : samplePolygon(dense, pointLimit);
+}
+function polygonEpsilon(width, height) {
+  return Math.max(1.25, Math.max(width, height) / 2048);
+}
+function signedContourArea(points) {
+  let area = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += current[0] * next[1] - next[0] * current[1];
+  }
+  return area / 2;
+}
+function pointInNumberContour(point, contour) {
+  let inside = false;
+  for (let index = 0, previous = contour.length - 1; index < contour.length; previous = index, index += 1) {
+    const current = contour[index];
+    const last = contour[previous];
+    if (current[1] > point.y !== last[1] > point.y && point.x < (last[0] - current[0]) * (point.y - current[1]) / (last[1] - current[1] || 1e-6) + current[0]) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+function samplePolygon(points, limit) {
+  if (points.length <= limit) {
+    return points;
+  }
+  const sampled = [];
+  const step = points.length / limit;
+  for (let index = 0; index < limit; index += 1) {
+    sampled.push(points[Math.floor(index * step)]);
+  }
+  return sampled;
+}
+function simplifyClosedPolygon(points, epsilon) {
+  if (points.length <= 4) {
+    return points;
+  }
+  const closed = [...points, points[0]];
+  const simplified = simplifyRdp(closed, epsilon);
+  if (simplified.length > 1 && simplified[0][0] === simplified[simplified.length - 1][0] && simplified[0][1] === simplified[simplified.length - 1][1]) {
+    simplified.pop();
+  }
+  return simplified;
+}
+function simplifyRdp(points, epsilon) {
+  if (points.length <= 4) {
+    return points;
+  }
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1;
+  keep[points.length - 1] = 1;
+  const stack = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [startIndex, endIndex] = stack.pop();
+    let maxDistance = 0;
+    let maxIndex = -1;
+    for (let index = startIndex + 1; index < endIndex; index += 1) {
+      const distance = perpendicularDistance(points[index], points[startIndex], points[endIndex]);
+      if (distance > maxDistance) {
+        maxDistance = distance;
+        maxIndex = index;
+      }
+    }
+    if (maxIndex >= 0 && maxDistance > epsilon) {
+      keep[maxIndex] = 1;
+      stack.push([startIndex, maxIndex], [maxIndex, endIndex]);
+    }
+  }
+  return points.filter((_, index) => keep[index] === 1);
+}
+function perpendicularDistance(point, start, end) {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const length = Math.hypot(dx, dy);
+  if (length <= 1e-6) {
+    return Math.hypot(point[0] - start[0], point[1] - start[1]);
+  }
+  return Math.abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / length;
+}
+function clamp(value, min, max) {
+  if (!Number.isFinite(max) || max <= min) {
+    return Math.max(min, value);
+  }
+  return Math.min(Math.max(value, min), max);
+}
 
 // src/draw-tool.ts
 var DEFAULT_BOX_COLORS = [
@@ -383,35 +1049,57 @@ var DrawTool = class {
     }
   }
   static drawSegmentations(source, segmentations, canvas, options = {}) {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
-    const drawMask = (_b = options.drawSegmentationPixelMask) != null ? _b : true;
-    const drawContour = (_c = options.drawContour) != null ? _c : false;
+    const drawOverlay = (_b = options.drawSegmentationPixelMask) != null ? _b : true;
+    const drawContour = (_c = options.drawContour) != null ? _c : true;
     const drawBoundingBoxes = (_d = options.drawBoundingBoxes) != null ? _d : true;
+    const fillShapes = (_e = options.fillSegmentationEdgePoints) != null ? _e : true;
+    const requestedRenderMode = (_f = options.segmentationRenderMode) != null ? _f : "auto";
     const overlayOpacity = this.getResultOverlayOpacity(options);
     if (overlayOpacity <= 0) {
       return;
     }
     const alpha = this.getDetectionDrawingAlpha(options);
-    const fillOpacity = this.getPixelMaskDrawingAlpha(options, 128);
-    if (drawMask && fillOpacity > 0) {
+    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
+    if (drawOverlay) {
       for (const segmentation of segmentations) {
-        this.drawSegmentationMask(
+        const hasMask = this.hasPackedMask(segmentation);
+        const renderMode = requestedRenderMode === "auto" ? hasMask ? "mask" : "polygon" : requestedRenderMode;
+        const useMask = renderMode !== "polygon" && hasMask;
+        const needsContours = drawContour || !useMask && fillShapes && fillOpacity > 0;
+        const contours = !needsContours ? [] : hasMask ? this.extractSegmentationPolygons(segmentation, {
+          imageWidth: width,
+          imageHeight: height,
+          sourceWidth: width,
+          sourceHeight: height
+        }) : this.extractSegmentationContours(segmentation);
+        const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
+        const fillColor = this.getDetectionColor(segmentation, colors, options.fillStyle, fillOpacity);
+        if (useMask) {
+          if (fillShapes && fillOpacity > 0) {
+            this.drawSegmentationMask(context, segmentation, fillColor);
+          }
+          if (drawContour) {
+            this.drawOrderedEdgeContours(
+              context,
+              contours,
+              strokeColor,
+              (_g = options.contourThickness) != null ? _g : 2,
+              void 0,
+              true
+            );
+          }
+          continue;
+        }
+        this.drawOrderedEdgeContours(
           context,
-          segmentation,
-          this.getDetectionColor(segmentation, colors, void 0, fillOpacity)
-        );
-      }
-    }
-    if (drawContour && alpha > 0) {
-      for (let index = 0; index < segmentations.length; index += 1) {
-        const segmentation = segmentations[index];
-        this.drawSegmentationContour(
-          context,
-          segmentation,
-          this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha),
-          (_e = options.contourThickness) != null ? _e : 2
+          contours,
+          drawContour ? strokeColor : void 0,
+          (_h = options.contourThickness) != null ? _h : 2,
+          fillShapes && fillOpacity > 0 ? fillColor : void 0,
+          true
         );
       }
     }
@@ -448,6 +1136,15 @@ var DrawTool = class {
   static hasPackedMask(segmentation) {
     var _a, _b;
     return ((_b = (_a = segmentation.bitPackedPixelMask) == null ? void 0 : _a.byteLength) != null ? _b : 0) > 0;
+  }
+  static extractSegmentationPolygon(segmentation, options) {
+    return extractSegmentationPolygon(segmentation, options);
+  }
+  static extractSegmentationPolygons(segmentation, options) {
+    return extractSegmentationPolygons(segmentation, options);
+  }
+  static extractSegmentationsPolygons(segmentations, options) {
+    return segmentations.map((segmentation) => this.extractSegmentationPolygons(segmentation, options));
   }
   static extractSegmentationEdgePoints(segmentation) {
     var _a, _b;
@@ -807,112 +1504,21 @@ var DrawTool = class {
     context.drawImage(maskCanvas, 0, 0, maskWidth, maskHeight, left, top, destWidth, destHeight);
     context.restore();
   }
-  static drawSegmentationContour(context, segmentation, color, thickness) {
-    const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
-    if (width <= 0 || height <= 0 || !this.hasPackedMask(segmentation)) {
-      return;
-    }
-    context.fillStyle = color;
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const pixelIndex = y * width + x;
-        if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
-          continue;
-        }
-        if (this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, width, height)) {
-          context.fillRect(left + x, top + y, thickness, thickness);
-        }
-      }
-    }
-  }
-  /**
-   * SAM3 绘制：用 packed mask 填充，轮廓从 mask / 已提取边点拆成多段折线。
-   * YOLO / RF-DETR 请先 extractSegmentationEdgePoints，再走 {@link drawSegmentationEdgePoints}。
-   */
+  /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'auto'. */
   static drawSam3Segmentations(source, segmentations, canvas, options = {}) {
-    var _a, _b, _c;
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
-    const thickness = (_b = options.contourThickness) != null ? _b : 2;
-    const drawBoundingBoxes = (_c = options.drawBoundingBoxes) != null ? _c : true;
-    const overlayOpacity = this.getResultOverlayOpacity(options);
-    if (overlayOpacity <= 0) {
-      return;
-    }
-    const alpha = this.getDetectionDrawingAlpha(options);
-    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
-    for (const segmentation of segmentations) {
-      const contours = this.extractSegmentationContours(segmentation);
-      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
-      const fillColor = this.getDetectionColor(
-        segmentation,
-        colors,
-        options.fillStyle,
-        fillOpacity
-      );
-      if (options.drawSegmentationPixelMask === true) {
-        if (options.fillSegmentationEdgePoints === true && this.hasPackedMask(segmentation) && fillOpacity > 0) {
-          this.drawSegmentationMask(context, segmentation, fillColor);
-        }
-        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
-      }
-    }
-    if (drawBoundingBoxes || options.drawLabel !== false) {
-      this.drawBoundingBoxes(context, segmentations, width, height, options);
-    }
+    this.drawSegmentations(source, segmentations, canvas, {
+      segmentationRenderMode: "auto",
+      ...options
+    });
   }
-  /**
-   * YOLO / RF-DETR：使用已提取的 `segmentationEdgePoints` 描边和填充。
-   * 没有 packed mask 时按多边形填充，不要求携带 bitPackedPixelMask。
-   */
+  /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'polygon'. */
   static drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
-    var _a, _b, _c, _d, _e;
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
-    const thickness = (_b = options.contourThickness) != null ? _b : 2;
-    const drawBoundingBoxes = (_c = options.drawBoundingBoxes) != null ? _c : true;
-    const drawOverlay = (_d = options.drawSegmentationPixelMask) != null ? _d : true;
-    const fillShapes = (_e = options.fillSegmentationEdgePoints) != null ? _e : true;
-    const overlayOpacity = this.getResultOverlayOpacity(options);
-    if (overlayOpacity <= 0) {
-      return;
-    }
-    const alpha = this.getDetectionDrawingAlpha(options);
-    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
-    for (const segmentation of segmentations) {
-      const contours = this.extractSegmentationContours(segmentation);
-      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
-      const fillColor = this.getDetectionColor(
-        segmentation,
-        colors,
-        options.fillStyle,
-        fillOpacity
-      );
-      if (!drawOverlay) {
-        continue;
-      }
-      if (fillShapes && this.hasPackedMask(segmentation)) {
-        if (fillOpacity > 0) {
-          this.drawSegmentationMask(context, segmentation, fillColor);
-        }
-        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
-        continue;
-      }
-      this.drawOrderedEdgeContours(
-        context,
-        contours,
-        strokeColor,
-        thickness,
-        fillShapes ? fillColor : void 0
-      );
-    }
-    if (drawBoundingBoxes || options.drawLabel !== false) {
-      this.drawBoundingBoxes(context, segmentations, width, height, options);
-    }
+    this.drawSegmentations(source, segmentations, canvas, {
+      segmentationRenderMode: "polygon",
+      ...options
+    });
   }
-  static drawOrderedEdgeContours(context, contours, strokeColor, thickness, fillColor) {
+  static drawOrderedEdgeContours(context, contours, strokeColor, thickness, fillColor, closeContours = false) {
     if (contours.length === 0) {
       return;
     }
@@ -920,7 +1526,9 @@ var DrawTool = class {
     context.lineWidth = thickness;
     context.lineJoin = "round";
     context.lineCap = "round";
-    context.strokeStyle = strokeColor;
+    if (strokeColor) {
+      context.strokeStyle = strokeColor;
+    }
     for (const contour of contours) {
       if (contour.length === 0) {
         continue;
@@ -930,12 +1538,17 @@ var DrawTool = class {
       for (let index = 1; index < contour.length; index += 1) {
         context.lineTo(contour[index].x, contour[index].y);
       }
-      if (fillColor && this.isMostlyClosedContour(contour)) {
+      const shouldClose = closeContours || fillColor && this.isMostlyClosedContour(contour);
+      if (shouldClose) {
         context.closePath();
+      }
+      if (fillColor && shouldClose) {
         context.fillStyle = fillColor;
         context.fill();
       }
-      context.stroke();
+      if (strokeColor) {
+        context.stroke();
+      }
     }
     context.restore();
   }
@@ -1342,7 +1955,7 @@ function toDetection(object) {
     boundingBox: object.boundingBox
   };
 }
-function clamp(value, min, max) {
+function clamp2(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 function sigmoid(value) {
@@ -1353,8 +1966,8 @@ function scalePoint(x, y, input) {
   const roiLeft = (_b = (_a = input.roi) == null ? void 0 : _a.left) != null ? _b : 0;
   const roiTop = (_d = (_c = input.roi) == null ? void 0 : _c.top) != null ? _d : 0;
   return {
-    x: roiLeft + clamp(Math.trunc((x - input.xPad) * input.gain), 0, input.sourceWidth - 1),
-    y: roiTop + clamp(Math.trunc((y - input.yPad) * input.gain), 0, input.sourceHeight - 1)
+    x: roiLeft + clamp2(Math.trunc((x - input.xPad) * input.gain), 0, input.sourceWidth - 1),
+    y: roiTop + clamp2(Math.trunc((y - input.yPad) * input.gain), 0, input.sourceHeight - 1)
   };
 }
 function removeOverlappingBoxes(detections, iouThreshold) {
@@ -1394,10 +2007,10 @@ function packSegmentationMask(proto, maskWeights, maskWidth, maskHeight, crop, t
   const totalPixels = targetWidth * targetHeight;
   const packed = new Uint8Array(Math.ceil(totalPixels / 8));
   const planeSize = maskWidth * maskHeight;
-  const cropLeft = clamp(Math.trunc(crop.left), 0, maskWidth - 1);
-  const cropTop = clamp(Math.trunc(crop.top), 0, maskHeight - 1);
-  const cropRight = clamp(Math.trunc(crop.right), cropLeft + 1, maskWidth);
-  const cropBottom = clamp(Math.trunc(crop.bottom), cropTop + 1, maskHeight);
+  const cropLeft = clamp2(Math.trunc(crop.left), 0, maskWidth - 1);
+  const cropTop = clamp2(Math.trunc(crop.top), 0, maskHeight - 1);
+  const cropRight = clamp2(Math.trunc(crop.right), cropLeft + 1, maskWidth);
+  const cropBottom = clamp2(Math.trunc(crop.bottom), cropTop + 1, maskHeight);
   const cropWidth = cropRight - cropLeft;
   const cropHeight = cropBottom - cropTop;
   const activeWeights = [];
@@ -1441,7 +2054,7 @@ function packSegmentationMask(proto, maskWeights, maskWidth, maskHeight, crop, t
   const yScale = cropHeight / targetHeight;
   for (let targetX = 0; targetX < targetWidth; targetX += 1) {
     const sourceX = (targetX + 0.5) * xScale - 0.5;
-    const x0 = clamp(Math.floor(sourceX), 0, cropWidth - 1);
+    const x0 = clamp2(Math.floor(sourceX), 0, cropWidth - 1);
     const x1 = x0 < cropWidth - 1 ? x0 + 1 : x0;
     x0Lookup[targetX] = x0;
     x1Lookup[targetX] = x1;
@@ -1449,7 +2062,7 @@ function packSegmentationMask(proto, maskWeights, maskWidth, maskHeight, crop, t
   }
   for (let targetY = 0; targetY < targetHeight; targetY += 1) {
     const sourceY = (targetY + 0.5) * yScale - 0.5;
-    const y0 = clamp(Math.floor(sourceY), 0, cropHeight - 1);
+    const y0 = clamp2(Math.floor(sourceY), 0, cropHeight - 1);
     const y1 = y0 < cropHeight - 1 ? y0 + 1 : y0;
     const yWeight = sourceY - y0;
     const row0 = y0 * cropWidth;
@@ -1477,10 +2090,10 @@ function downscaleBoxToMask(box, maskWidth, maskHeight, inputWidth, inputHeight)
   const scalingFactorW = maskWidth / inputWidth;
   const scalingFactorH = maskHeight / inputHeight;
   return {
-    left: clamp(Math.floor(box.left * scalingFactorW), 0, maskWidth - 1),
-    top: clamp(Math.floor(box.top * scalingFactorH), 0, maskHeight - 1),
-    right: clamp(Math.ceil(box.right * scalingFactorW), 0, maskWidth - 1),
-    bottom: clamp(Math.ceil(box.bottom * scalingFactorH), 0, maskHeight - 1)
+    left: clamp2(Math.floor(box.left * scalingFactorW), 0, maskWidth - 1),
+    top: clamp2(Math.floor(box.top * scalingFactorH), 0, maskHeight - 1),
+    right: clamp2(Math.ceil(box.right * scalingFactorW), 0, maskWidth - 1),
+    bottom: clamp2(Math.ceil(box.bottom * scalingFactorH), 0, maskHeight - 1)
   };
 }
 
@@ -2021,7 +2634,7 @@ var RT_DETRHandler = class {
     unsupportedTask("Classification");
   }
   clamp(value, min, max) {
-    return clamp(value, min, max);
+    return clamp2(value, min, max);
   }
 };
 
@@ -2535,10 +3148,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       const scaledHeight = Math.trunc(input.sourceHeight * scale);
       const padX = (inputWidth - scaledWidth) / 2;
       const padY = (inputHeight - scaledHeight) / 2;
-      cropLeft = clamp(Math.round(padX * maskWidth / inputWidth), 0, maskWidth - 1);
-      cropTop = clamp(Math.round(padY * maskHeight / inputHeight), 0, maskHeight - 1);
-      cropRight = clamp(Math.round((padX + scaledWidth) * maskWidth / inputWidth), cropLeft + 1, maskWidth);
-      cropBottom = clamp(Math.round((padY + scaledHeight) * maskHeight / inputHeight), cropTop + 1, maskHeight);
+      cropLeft = clamp2(Math.round(padX * maskWidth / inputWidth), 0, maskWidth - 1);
+      cropTop = clamp2(Math.round(padY * maskHeight / inputHeight), 0, maskHeight - 1);
+      cropRight = clamp2(Math.round((padX + scaledWidth) * maskWidth / inputWidth), cropLeft + 1, maskWidth);
+      cropBottom = clamp2(Math.round((padY + scaledHeight) * maskHeight / inputHeight), cropTop + 1, maskHeight);
     }
     const cropWidth = cropRight - cropLeft;
     const cropHeight = cropBottom - cropTop;
@@ -2547,7 +3160,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (let y = 0; y < targetHeight; y += 1) {
       const absoluteY = box.top + y;
       const sourceY = (absoluteY + 0.5) * yScale - 0.5;
-      const y0Local = clamp(Math.floor(sourceY), 0, cropHeight - 1);
+      const y0Local = clamp2(Math.floor(sourceY), 0, cropHeight - 1);
       const y1Local = y0Local < cropHeight - 1 ? y0Local + 1 : y0Local;
       const yWeight = sourceY - y0Local;
       const row0 = maskOffset + (cropTop + y0Local) * maskWidth;
@@ -2556,7 +3169,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       for (let x = 0; x < targetWidth; x += 1) {
         const absoluteX = box.left + x;
         const sourceX = (absoluteX + 0.5) * xScale - 0.5;
-        const x0Local = clamp(Math.floor(sourceX), 0, cropWidth - 1);
+        const x0Local = clamp2(Math.floor(sourceX), 0, cropWidth - 1);
         const x1Local = x0Local < cropWidth - 1 ? x0Local + 1 : x0Local;
         const xWeight = sourceX - x0Local;
         const x0 = cropLeft + x0Local;
@@ -2608,10 +3221,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     const roiTop = (_d = (_c = input.roi) == null ? void 0 : _c.top) != null ? _d : 0;
     if (input.resizeMode === "stretch") {
       return {
-        left: roiLeft + clamp(Math.trunc(x1 * input.sourceWidth), 0, input.sourceWidth - 1),
-        top: roiTop + clamp(Math.trunc(y1 * input.sourceHeight), 0, input.sourceHeight - 1),
-        right: roiLeft + clamp(Math.trunc(x2 * input.sourceWidth), 0, input.sourceWidth),
-        bottom: roiTop + clamp(Math.trunc(y2 * input.sourceHeight), 0, input.sourceHeight)
+        left: roiLeft + clamp2(Math.trunc(x1 * input.sourceWidth), 0, input.sourceWidth - 1),
+        top: roiTop + clamp2(Math.trunc(y1 * input.sourceHeight), 0, input.sourceHeight - 1),
+        right: roiLeft + clamp2(Math.trunc(x2 * input.sourceWidth), 0, input.sourceWidth),
+        bottom: roiTop + clamp2(Math.trunc(y2 * input.sourceHeight), 0, input.sourceHeight)
       };
     }
     return this._yolo.scaleBoundingBox(
@@ -2771,10 +3384,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (!roi) {
       return { x: 0, y: 0, width, height };
     }
-    const left = clamp(Math.trunc(roi.left), 0, width - 1);
-    const top = clamp(Math.trunc(roi.top), 0, height - 1);
-    const right = clamp(Math.trunc(roi.right), left + 1, width);
-    const bottom = clamp(Math.trunc(roi.bottom), top + 1, height);
+    const left = clamp2(Math.trunc(roi.left), 0, width - 1);
+    const top = clamp2(Math.trunc(roi.top), 0, height - 1);
+    const right = clamp2(Math.trunc(roi.right), left + 1, width);
+    const bottom = clamp2(Math.trunc(roi.bottom), top + 1, height);
     return {
       x: left,
       y: top,
@@ -2897,6 +3510,7 @@ var Yolo = class _Yolo {
     this.preprocessContext = null;
     this.preprocessTensorData = null;
     this.preprocessTensorSize = 0;
+    this.loadedWebGpuGeneration = -1;
     this.options = options;
     this.model = options.model;
   }
@@ -2936,6 +3550,7 @@ var Yolo = class _Yolo {
   }
   async load(model = this.requireModel()) {
     await ensureOnnxRuntimeWebInitialized(this.options);
+    await ensureOrtWebGpuReady();
     await this.dispose();
     this.session = await this.createSession(model);
     this._onnxModel = await parseOnnxModel(this.session, model, this.options);
@@ -2970,31 +3585,33 @@ var Yolo = class _Yolo {
       default:
         throw new Error("Unsupported model version: " + modelVersion);
     }
+    this.loadedWebGpuGeneration = getOrtWebGpuDeviceGeneration();
+    void watchOrtWebGpuDevice();
     return this;
   }
   run(feeds, options) {
-    return this.ensureSession().run(feeds, options);
+    return this.withWebGpuRetry(() => this.ensureSession().run(feeds, options));
   }
   runWithFetches(feeds, fetches, options) {
-    return this.ensureSession().run(feeds, fetches, options);
+    return this.withWebGpuRetry(() => this.ensureSession().run(feeds, fetches, options));
   }
   predict(feeds, options) {
     return this.run(feeds, options);
   }
   RunObjectDetection(img, confidence = 0.2, iou = 0.7, roi = null) {
-    return this.ensureHandler().RunObjectDetection(img, confidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunObjectDetection(img, confidence, iou, roi));
   }
   RunObbDetection(img, confidence = 0.2, iou = 0.7, roi = null) {
-    return this.ensureHandler().RunObbDetection(img, confidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunObbDetection(img, confidence, iou, roi));
   }
   RunSegmentation(img, confidence = 0.2, pixelConfidence = 0.65, iou = 0.7, roi = null) {
-    return this.ensureHandler().RunSegmentation(img, confidence, pixelConfidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunSegmentation(img, confidence, pixelConfidence, iou, roi));
   }
   RunPoseEstimation(img, confidence = 0.2, iou = 0.7, roi = null) {
-    return this.ensureHandler().RunPoseEstimation(img, confidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunPoseEstimation(img, confidence, iou, roi));
   }
   RunClassification(img, classes = 5) {
-    return this.ensureHandler().RunClassification(img, classes);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunClassification(img, classes));
   }
   preprocessImage(img, roi = null) {
     var _a;
@@ -3076,6 +3693,7 @@ var Yolo = class _Yolo {
   drawSegmentations(source, segmentations, canvas, options = {}) {
     DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
+  /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'polygon'. */
   drawSegmentationEdgePoints(source, segmentations, canvas, options = {}) {
     DrawTool.drawSegmentationEdgePoints(source, segmentations, canvas, options);
   }
@@ -3087,6 +3705,12 @@ var Yolo = class _Yolo {
   }
   extractSegmentationsEdgePoints(segmentations) {
     return DrawTool.extractSegmentationsEdgePoints(segmentations);
+  }
+  extractSegmentationPolygons(segmentation, options) {
+    return DrawTool.extractSegmentationPolygons(segmentation, options);
+  }
+  extractSegmentationsPolygons(segmentations, options) {
+    return DrawTool.extractSegmentationsPolygons(segmentations, options);
   }
   tensor(type, data, dims) {
     return new ort.Tensor(type, data, dims);
@@ -3107,21 +3731,23 @@ var Yolo = class _Yolo {
     });
   }
   async dispose() {
-    var _a, _b;
-    (_b = (_a = this._handler) == null ? void 0 : _a.releaseGpuResources) == null ? void 0 : _b.call(_a);
-    if (!this.session) {
+    await withOrtWebGpuSessionTeardown(async () => {
+      var _a, _b;
+      (_b = (_a = this._handler) == null ? void 0 : _a.releaseGpuResources) == null ? void 0 : _b.call(_a);
+      if (!this.session) {
+        this._onnxModel = null;
+        this._handler = null;
+        return;
+      }
+      await this.session.release();
+      this.session = null;
       this._onnxModel = null;
       this._handler = null;
-      return;
-    }
-    await this.session.release();
-    this.session = null;
-    this._onnxModel = null;
-    this._handler = null;
-    this.preprocessCanvas = null;
-    this.preprocessContext = null;
-    this.preprocessTensorData = null;
-    this.preprocessTensorSize = 0;
+      this.preprocessCanvas = null;
+      this.preprocessContext = null;
+      this.preprocessTensorData = null;
+      this.preprocessTensorSize = 0;
+    });
   }
   createSessionOptions() {
     var _a, _b, _c;
@@ -3263,6 +3889,27 @@ var Yolo = class _Yolo {
       return (executionProvider == null ? void 0 : executionProvider.name) === "webgpu";
     });
   }
+  async withWebGpuRetry(operation) {
+    if (!this.hasWebGpuExecutionProvider()) {
+      return operation();
+    }
+    await ensureOrtWebGpuReady();
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isWebGpuDeviceLostError(error)) {
+        throw error;
+      }
+      await recoverOrtWebGpuDevice({
+        reason: "unknown",
+        message: error instanceof Error ? error.message : String(error)
+      });
+      if (this.loadedWebGpuGeneration !== getOrtWebGpuDeviceGeneration()) {
+        await this.load();
+      }
+      return operation();
+    }
+  }
   isSupportedModel(modelVersion, modelType) {
     const allTasks = [
       "Classification",
@@ -3386,7 +4033,7 @@ function preprocessSam3Image(image, imageSize = SAM3_IMAGE_SIZE) {
   }
   return { data, width: imageSize, height: imageSize, sourceWidth, sourceHeight };
 }
-function clamp2(value, min, max) {
+function clamp3(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 function sigmoid2(value) {
@@ -3424,10 +4071,10 @@ function rectToCxcywh(box, sourceWidth, sourceHeight) {
   const width = Math.max(box.right - box.left, 1);
   const height = Math.max(box.bottom - box.top, 1);
   return [
-    clamp2((box.left + box.right) / 2 / sourceWidth, 0, 1),
-    clamp2((box.top + box.bottom) / 2 / sourceHeight, 0, 1),
-    clamp2(width / sourceWidth, 0, 1),
-    clamp2(height / sourceHeight, 0, 1)
+    clamp3((box.left + box.right) / 2 / sourceWidth, 0, 1),
+    clamp3((box.top + box.bottom) / 2 / sourceHeight, 0, 1),
+    clamp3(width / sourceWidth, 0, 1),
+    clamp3(height / sourceHeight, 0, 1)
   ];
 }
 function cxcywhToRect(cx, cy, width, height, sourceWidth, sourceHeight) {
@@ -3436,14 +4083,14 @@ function cxcywhToRect(cx, cy, width, height, sourceWidth, sourceHeight) {
   const right = (cx + width / 2) * sourceWidth;
   const bottom = (cy + height / 2) * sourceHeight;
   return {
-    left: clamp2(left, 0, sourceWidth),
-    top: clamp2(top, 0, sourceHeight),
-    right: clamp2(right, 0, sourceWidth),
-    bottom: clamp2(bottom, 0, sourceHeight)
+    left: clamp3(left, 0, sourceWidth),
+    top: clamp3(top, 0, sourceHeight),
+    right: clamp3(right, 0, sourceWidth),
+    bottom: clamp3(bottom, 0, sourceHeight)
   };
 }
 function pointToNormalized(point, sourceWidth, sourceHeight) {
-  return [clamp2(point.x / sourceWidth, 0, 1), clamp2(point.y / sourceHeight, 0, 1)];
+  return [clamp3(point.x / sourceWidth, 0, 1), clamp3(point.y / sourceHeight, 0, 1)];
 }
 function pointToModel(point, sourceWidth, sourceHeight, imageSize = SAM3_IMAGE_SIZE) {
   return [
@@ -3478,12 +4125,12 @@ function bilinearResizeRegion(source, sourceWidth, sourceHeight, srcLeft, srcTop
   const regionHeight = Math.max(srcBottom - srcTop, 1e-6);
   for (let y = 0; y < targetHeight; y += 1) {
     const sourceY = srcTop + (y + 0.5) / targetHeight * regionHeight - 0.5;
-    const y0 = clamp2(Math.floor(sourceY), 0, sourceHeight - 1);
+    const y0 = clamp3(Math.floor(sourceY), 0, sourceHeight - 1);
     const y1 = y0 < sourceHeight - 1 ? y0 + 1 : y0;
     const wy = sourceY - y0;
     for (let x = 0; x < targetWidth; x += 1) {
       const sourceX = srcLeft + (x + 0.5) / targetWidth * regionWidth - 0.5;
-      const x0 = clamp2(Math.floor(sourceX), 0, sourceWidth - 1);
+      const x0 = clamp3(Math.floor(sourceX), 0, sourceWidth - 1);
       const x1 = x0 < sourceWidth - 1 ? x0 + 1 : x0;
       const wx = sourceX - x0;
       const v00 = (_a = source[y0 * sourceWidth + x0]) != null ? _a : 0;
@@ -3521,10 +4168,10 @@ function maskBounds(mask, width, height, threshold = 0.5) {
   return { left, top, right, bottom };
 }
 function integerRect(rect, sourceWidth, sourceHeight) {
-  const left = clamp2(Math.floor(rect.left), 0, sourceWidth);
-  const top = clamp2(Math.floor(rect.top), 0, sourceHeight);
-  const right = clamp2(Math.ceil(rect.right), left, sourceWidth);
-  const bottom = clamp2(Math.ceil(rect.bottom), top, sourceHeight);
+  const left = clamp3(Math.floor(rect.left), 0, sourceWidth);
+  const top = clamp3(Math.floor(rect.top), 0, sourceHeight);
+  const right = clamp3(Math.ceil(rect.right), left, sourceWidth);
+  const bottom = clamp3(Math.ceil(rect.bottom), top, sourceHeight);
   return {
     left,
     top,
@@ -3536,7 +4183,7 @@ function logitThreshold(pixelThreshold, applySigmoid) {
   if (!applySigmoid) {
     return pixelThreshold;
   }
-  const probability = clamp2(pixelThreshold, 1e-6, 1 - 1e-6);
+  const probability = clamp3(pixelThreshold, 1e-6, 1 - 1e-6);
   return Math.log(probability / (1 - probability));
 }
 function sourceRectToMaskRect(box, sourceWidth, sourceHeight, maskWidth, maskHeight) {
@@ -3718,9 +4365,15 @@ async function getOrtWebGpuDevice() {
 }
 async function waitForWebGpuOutputs(_result) {
   var _a, _b;
-  const device = await ((_a = ort.env.webgpu) == null ? void 0 : _a.device);
-  if (typeof ((_b = device == null ? void 0 : device.queue) == null ? void 0 : _b.onSubmittedWorkDone) === "function") {
-    await device.queue.onSubmittedWorkDone();
+  try {
+    const device = await ((_a = ort.env.webgpu) == null ? void 0 : _a.device);
+    if (typeof ((_b = device == null ? void 0 : device.queue) == null ? void 0 : _b.onSubmittedWorkDone) === "function") {
+      await device.queue.onSubmittedWorkDone();
+    }
+  } catch (error) {
+    if (isWebGpuDeviceLostError(error)) {
+      throw error;
+    }
   }
 }
 var Sam3WebGpuPreprocessor = class {
@@ -4216,7 +4869,7 @@ var Sam3Handler = class {
           state.sourceWidth,
           state.sourceHeight,
           "object",
-          clamp2(predictedIou, 0, 1),
+          clamp3(predictedIou, 0, 1),
           0,
           false
         )
@@ -4680,8 +5333,8 @@ function pointerToImagePoint(event, target, options = {}) {
     const offsetX = (rect.width - drawWidth) / 2;
     const offsetY = (rect.height - drawHeight) / 2;
     return {
-      x: clamp3((event.clientX - rect.left - offsetX) / Math.max(scale, 1e-6), 0, imageWidth),
-      y: clamp3((event.clientY - rect.top - offsetY) / Math.max(scale, 1e-6), 0, imageHeight)
+      x: clamp4((event.clientX - rect.left - offsetX) / Math.max(scale, 1e-6), 0, imageWidth),
+      y: clamp4((event.clientY - rect.top - offsetY) / Math.max(scale, 1e-6), 0, imageHeight)
     };
   }
   if (options.origin === "offset" && event.offsetX != null && event.offsetY != null) {
@@ -4689,19 +5342,19 @@ function pointerToImagePoint(event, target, options = {}) {
     const cssWidth = (element == null ? void 0 : element.clientWidth) || rect.width || 1;
     const cssHeight = (element == null ? void 0 : element.clientHeight) || rect.height || 1;
     return {
-      x: clamp3(event.offsetX / cssWidth * imageWidth, 0, imageWidth),
-      y: clamp3(event.offsetY / cssHeight * imageHeight, 0, imageHeight)
+      x: clamp4(event.offsetX / cssWidth * imageWidth, 0, imageWidth),
+      y: clamp4(event.offsetY / cssHeight * imageHeight, 0, imageHeight)
     };
   }
   return {
-    x: clamp3(rect.width ? (event.clientX - rect.left) / rect.width * imageWidth : 0, 0, imageWidth),
-    y: clamp3(rect.height ? (event.clientY - rect.top) / rect.height * imageHeight : 0, 0, imageHeight)
+    x: clamp4(rect.width ? (event.clientX - rect.left) / rect.width * imageWidth : 0, 0, imageWidth),
+    y: clamp4(rect.height ? (event.clientY - rect.top) / rect.height * imageHeight : 0, 0, imageHeight)
   };
 }
 function mapImagePoint(point, from, to) {
   return {
-    x: clamp3(from.width ? point.x * to.width / from.width : point.x, 0, to.width),
-    y: clamp3(from.height ? point.y * to.height / from.height : point.y, 0, to.height)
+    x: clamp4(from.width ? point.x * to.width / from.width : point.x, 0, to.width),
+    y: clamp4(from.height ? point.y * to.height / from.height : point.y, 0, to.height)
   };
 }
 function mapImageBox(box, from, to) {
@@ -4717,7 +5370,7 @@ function mapImageBox(box, from, to) {
 function isDomRect(value) {
   return typeof DOMRect !== "undefined" && value instanceof DOMRect;
 }
-function clamp3(value, min, max) {
+function clamp4(value, min, max) {
   if (!Number.isFinite(max) || max <= min) {
     return Math.max(min, value);
   }
@@ -4869,283 +5522,13 @@ function pointerImageSize(target, options) {
 }
 
 // src/handler/sam3/sam3-contours.ts
-function packedMaskSize(mask) {
-  if (mask.pixelMaskWidth && mask.pixelMaskHeight) {
-    return {
-      width: Math.max(1, Math.round(mask.pixelMaskWidth)),
-      height: Math.max(1, Math.round(mask.pixelMaskHeight))
-    };
-  }
-  return {
-    width: Math.max(1, Math.round(mask.boundingBox.right - mask.boundingBox.left)),
-    height: Math.max(1, Math.round(mask.boundingBox.bottom - mask.boundingBox.top))
-  };
-}
-var DEFAULT_MAX_POLYGON_POINTS = 96;
-var MAX_MASK_POLYGONS = 16;
-var MIN_MASK_POLYGON_AREA_RATIO = 0.01;
 function maskToPolygons(mask, options) {
-  var _a, _b;
-  const imageWidth = options.imageWidth;
-  const imageHeight = options.imageHeight;
-  if (imageWidth <= 0 || imageHeight <= 0) {
-    return [];
-  }
-  const contours = tracePackedMaskContours(mask);
-  if (contours.length === 0) {
-    return [];
-  }
-  const sourceWidth = options.sourceWidth || imageWidth || 1;
-  const sourceHeight = options.sourceHeight || imageHeight || 1;
-  const size = packedMaskSize(mask);
-  const box = mask.boundingBox;
-  const boxWidth = box.right - box.left;
-  const boxHeight = box.bottom - box.top;
-  const maxPoints = (_a = options.maxPoints) != null ? _a : DEFAULT_MAX_POLYGON_POINTS;
-  const mapped = contours.map((contour) => {
-    const points = contour.map((point) => [
-      clamp4((box.left + point[0] * boxWidth / size.width) * (imageWidth / sourceWidth), 0, imageWidth),
-      clamp4((box.top + point[1] * boxHeight / size.height) * (imageHeight / sourceHeight), 0, imageHeight)
-    ]);
-    return { points, area: Math.abs(signedContourArea(points)) };
-  }).filter((item) => item.points.length >= 3 && item.area > 0).sort((left, right) => right.area - left.area);
-  if (mapped.length === 0) {
-    return [];
-  }
-  if (options.prompt) {
-    const mappedPrompt = {
-      x: options.prompt.x * imageWidth / sourceWidth,
-      y: options.prompt.y * imageHeight / sourceHeight
-    };
-    const selected = (_b = mapped.find((item) => pointInNumberContour(mappedPrompt, item.points))) != null ? _b : mapped[0];
-    return [finalizePolygon(selected.points, imageWidth, imageHeight, maxPoints, options.epsilon)];
-  }
-  const minArea = mapped[0].area * MIN_MASK_POLYGON_AREA_RATIO;
-  const outerContours = [];
-  for (const candidate of mapped) {
-    if (candidate.area < minArea || outerContours.length >= MAX_MASK_POLYGONS) {
-      break;
-    }
-    const probe = { x: candidate.points[0][0], y: candidate.points[0][1] };
-    if (outerContours.some((outer) => pointInNumberContour(probe, outer))) {
-      continue;
-    }
-    outerContours.push(finalizePolygon(candidate.points, imageWidth, imageHeight, maxPoints, options.epsilon));
-  }
-  return outerContours.filter((polygon) => polygon.length >= 3);
+  return extractSegmentationPolygons(mask, options).map(
+    (polygon) => polygon.map((point) => [point.x, point.y])
+  );
 }
 function maskToPolygon(mask, options) {
-  var _a;
-  return (_a = maskToPolygons(mask, options)[0]) != null ? _a : [];
-}
-function tracePackedMaskContours(mask) {
-  const packed = mask.bitPackedPixelMask;
-  const { width, height } = packedMaskSize(mask);
-  if (!(packed == null ? void 0 : packed.byteLength) || width * height > packed.byteLength * 8) {
-    return [];
-  }
-  const vertexWidth = width + 1;
-  const edges = [];
-  const outgoing = /* @__PURE__ */ new Map();
-  const isSet = (x, y) => {
-    if (x < 0 || x >= width || y < 0 || y >= height) {
-      return false;
-    }
-    const index = y * width + x;
-    return (packed[index >> 3] & 1 << (index & 7)) !== 0;
-  };
-  const addEdge = (fromX, fromY, toX, toY, direction) => {
-    const edge = { fromX, fromY, toX, toY, direction, used: false };
-    edges.push(edge);
-    const key = fromY * vertexWidth + fromX;
-    const next = outgoing.get(key);
-    if (next) {
-      next.push(edge);
-    } else {
-      outgoing.set(key, [edge]);
-    }
-  };
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (!isSet(x, y)) {
-        continue;
-      }
-      if (!isSet(x, y - 1)) {
-        addEdge(x, y, x + 1, y, 0);
-      }
-      if (!isSet(x + 1, y)) {
-        addEdge(x + 1, y, x + 1, y + 1, 1);
-      }
-      if (!isSet(x, y + 1)) {
-        addEdge(x + 1, y + 1, x, y + 1, 2);
-      }
-      if (!isSet(x - 1, y)) {
-        addEdge(x, y + 1, x, y, 3);
-      }
-    }
-  }
-  const contours = [];
-  for (const first of edges) {
-    if (first.used) {
-      continue;
-    }
-    const startKey = first.fromY * vertexWidth + first.fromX;
-    const points = [[first.fromX, first.fromY]];
-    let current = first;
-    let closed = false;
-    for (let guard = 0; current && guard <= edges.length; guard += 1) {
-      current.used = true;
-      points.push([current.toX, current.toY]);
-      const endKey = current.toY * vertexWidth + current.toX;
-      if (endKey === startKey) {
-        closed = true;
-        break;
-      }
-      current = chooseNextBoundaryEdge(outgoing.get(endKey), current.direction);
-    }
-    if (!closed || points.length < 4) {
-      continue;
-    }
-    points.pop();
-    if (signedContourArea(points) > 0) {
-      contours.push(points);
-    }
-  }
-  return contours;
-}
-function chooseNextBoundaryEdge(candidates, incomingDirection) {
-  let selected;
-  let selectedRank = Number.POSITIVE_INFINITY;
-  for (const candidate of candidates != null ? candidates : []) {
-    if (candidate.used) {
-      continue;
-    }
-    const turn = (candidate.direction - incomingDirection + 4) % 4;
-    const rank = turn === 1 ? 0 : turn === 0 ? 1 : turn === 3 ? 2 : 3;
-    if (rank < selectedRank) {
-      selected = candidate;
-      selectedRank = rank;
-    }
-  }
-  return selected;
-}
-function finalizePolygon(points, imageWidth, imageHeight, maxPoints, epsilon) {
-  const pointLimit = Math.min(512, Math.max(3, Math.round(maxPoints)));
-  const dense = simplifyClosedPolygon(points, 0);
-  if (dense.length <= pointLimit) {
-    return dense.length >= 3 ? dense : samplePolygon(points, pointLimit);
-  }
-  let lowerEpsilon = 0;
-  let upperEpsilon = epsilon != null ? epsilon : polygonEpsilon(imageWidth, imageHeight);
-  let aboveLimit = dense;
-  let belowLimit = simplifyClosedPolygon(points, upperEpsilon);
-  while (belowLimit.length > pointLimit && upperEpsilon < 128) {
-    lowerEpsilon = upperEpsilon;
-    aboveLimit = belowLimit;
-    upperEpsilon *= 2;
-    belowLimit = simplifyClosedPolygon(points, upperEpsilon);
-  }
-  for (let iteration = 0; iteration < 16; iteration += 1) {
-    const mid = (lowerEpsilon + upperEpsilon) / 2;
-    const candidate = simplifyClosedPolygon(points, mid);
-    if (candidate.length > pointLimit) {
-      lowerEpsilon = mid;
-      aboveLimit = candidate;
-    } else {
-      upperEpsilon = mid;
-      belowLimit = candidate;
-    }
-  }
-  if (aboveLimit.length > pointLimit) {
-    return samplePolygon(aboveLimit, pointLimit);
-  }
-  return belowLimit.length >= 3 ? belowLimit : samplePolygon(dense, pointLimit);
-}
-function polygonEpsilon(width, height) {
-  return Math.max(1.25, Math.max(width, height) / 2048);
-}
-function signedContourArea(points) {
-  let area = 0;
-  for (let index = 0; index < points.length; index += 1) {
-    const current = points[index];
-    const next = points[(index + 1) % points.length];
-    area += current[0] * next[1] - next[0] * current[1];
-  }
-  return area / 2;
-}
-function pointInNumberContour(point, contour) {
-  let inside = false;
-  for (let index = 0, previous = contour.length - 1; index < contour.length; previous = index, index += 1) {
-    const current = contour[index];
-    const last = contour[previous];
-    if (current[1] > point.y !== last[1] > point.y && point.x < (last[0] - current[0]) * (point.y - current[1]) / (last[1] - current[1] || 1e-6) + current[0]) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-function samplePolygon(points, limit) {
-  if (points.length <= limit) {
-    return points;
-  }
-  const sampled = [];
-  const step = points.length / limit;
-  for (let index = 0; index < limit; index += 1) {
-    sampled.push(points[Math.floor(index * step)]);
-  }
-  return sampled;
-}
-function simplifyClosedPolygon(points, epsilon) {
-  if (points.length <= 4) {
-    return points;
-  }
-  const closed = [...points, points[0]];
-  const simplified = simplifyRdp(closed, epsilon);
-  if (simplified.length > 1 && simplified[0][0] === simplified[simplified.length - 1][0] && simplified[0][1] === simplified[simplified.length - 1][1]) {
-    simplified.pop();
-  }
-  return simplified;
-}
-function simplifyRdp(points, epsilon) {
-  if (points.length <= 4) {
-    return points;
-  }
-  const keep = new Uint8Array(points.length);
-  keep[0] = 1;
-  keep[points.length - 1] = 1;
-  const stack = [[0, points.length - 1]];
-  while (stack.length > 0) {
-    const [startIndex, endIndex] = stack.pop();
-    let maxDistance = 0;
-    let maxIndex = -1;
-    for (let index = startIndex + 1; index < endIndex; index += 1) {
-      const distance = perpendicularDistance(points[index], points[startIndex], points[endIndex]);
-      if (distance > maxDistance) {
-        maxDistance = distance;
-        maxIndex = index;
-      }
-    }
-    if (maxIndex >= 0 && maxDistance > epsilon) {
-      keep[maxIndex] = 1;
-      stack.push([startIndex, maxIndex], [maxIndex, endIndex]);
-    }
-  }
-  return points.filter((_, index) => keep[index] === 1);
-}
-function perpendicularDistance(point, start, end) {
-  const dx = end[0] - start[0];
-  const dy = end[1] - start[1];
-  const length = Math.hypot(dx, dy);
-  if (length <= 1e-6) {
-    return Math.hypot(point[0] - start[0], point[1] - start[1]);
-  }
-  return Math.abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / length;
-}
-function clamp4(value, min, max) {
-  if (!Number.isFinite(max) || max <= min) {
-    return Math.max(min, value);
-  }
-  return Math.min(Math.max(value, min), max);
+  return extractSegmentationPolygon(mask, options).map((point) => [point.x, point.y]);
 }
 
 // src/handler/sam3/sam3-mask.ts
@@ -5461,6 +5844,7 @@ var Sam3 = class _Sam3 {
     this.handler = null;
     this.tokenizer = null;
     this.state = null;
+    this.loadedWebGpuGeneration = -1;
     this.webGpu = usesWebGpu(options);
   }
   static async create(options) {
@@ -5481,6 +5865,9 @@ var Sam3 = class _Sam3 {
       ...this.options,
       numThreads: (_a = this.options.numThreads) != null ? _a : defaultNumThreads
     });
+    if (this.webGpu) {
+      await ensureOrtWebGpuReady();
+    }
     if (ort.env.wasm) {
       ort.env.wasm.numThreads = (_b = this.options.numThreads) != null ? _b : defaultNumThreads;
       ort.env.wasm.proxy = (_c = this.options.proxy) != null ? _c : false;
@@ -5552,6 +5939,8 @@ var Sam3 = class _Sam3 {
           webGpu: this.webGpu
         }
       );
+      this.loadedWebGpuGeneration = getOrtWebGpuDeviceGeneration();
+      void watchOrtWebGpuDevice();
       return this;
     } catch (error) {
       await this.dispose();
@@ -5559,23 +5948,23 @@ var Sam3 = class _Sam3 {
     }
   }
   async setImage(image) {
-    this.state = await this.ensureHandler().setImage(image, this.state);
+    this.state = await this.withWebGpuRetry(() => this.ensureHandler().setImage(image, this.state));
     return this.state;
   }
   async setTextPrompt(prompt, description) {
-    return this.ensureHandler().setTextPrompt(prompt, this.ensureState(), description);
+    return this.withWebGpuRetry(() => this.ensureHandler().setTextPrompt(prompt, this.ensureState(), description));
   }
   async addGeometricPrompt(box, label = true) {
-    return this.ensureHandler().addGeometricPrompt(box, label, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addGeometricPrompt(box, label, this.ensureState()));
   }
   async addGeometricPoint(point, label = true) {
-    return this.ensureHandler().addGeometricPoint(point, label, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addGeometricPoint(point, label, this.ensureState()));
   }
   async removeGeometricPrompt(index) {
-    return this.ensureHandler().removeGeometricPrompt(index, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().removeGeometricPrompt(index, this.ensureState()));
   }
   async removeGeometricPoint(index) {
-    return this.ensureHandler().removeGeometricPoint(index, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().removeGeometricPoint(index, this.ensureState()));
   }
   resetPrompts() {
     return this.ensureHandler().resetPrompts(this.ensureState());
@@ -5588,24 +5977,24 @@ var Sam3 = class _Sam3 {
     this.ensureHandler().setConfidenceThreshold(threshold);
     const state = this.ensureState();
     if (((_a = state.lastPcsRaw) == null ? void 0 : _a.length) || state.textEmbeddings) {
-      return this.ensureHandler().applyConfidenceThreshold(state);
+      return this.withWebGpuRetry(() => this.ensureHandler().applyConfidenceThreshold(state));
     }
     return state;
   }
   async predictConcept(prompt) {
-    return this.ensureHandler().predictConcept(prompt, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().predictConcept(prompt, this.ensureState()));
   }
   async predictVisual(prompt = {}) {
-    return this.ensureHandler().predictVisual(prompt, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().predictVisual(prompt, this.ensureState()));
   }
   async addPoint(point, label = 1) {
-    return this.ensureHandler().addPoint(point, label, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addPoint(point, label, this.ensureState()));
   }
   async addBox(box) {
-    return this.ensureHandler().addBox(box, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addBox(box, this.ensureState()));
   }
   async addMask(mask) {
-    return this.ensureHandler().addMask(mask, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addMask(mask, this.ensureState()));
   }
   /**
    * 悬停/点选预览：默认每次独立单点，不写入 PVS 累积状态。
@@ -5795,29 +6184,25 @@ var Sam3 = class _Sam3 {
     return this.ensureHandler().selectPvsCandidate(index, this.ensureState());
   }
   async removePoint(index) {
-    return this.ensureHandler().removePoint(index, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().removePoint(index, this.ensureState()));
   }
   drawSegmentations(source, segmentations, canvas, options = {}) {
-    DrawTool.drawSam3Segmentations(source, segmentations, canvas, {
-      drawBoundingBoxes: true,
-      drawLabel: true,
-      drawSegmentationPixelMask: true,
-      fillSegmentationEdgePoints: true,
-      ...options
-    });
+    DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
   async dispose() {
-    var _a;
-    (_a = this.handler) == null ? void 0 : _a.dispose();
-    const sessions = [this.visionSession, this.textSession, this.groundingSession, this.promptSession];
-    this.visionSession = null;
-    this.textSession = null;
-    this.groundingSession = null;
-    this.promptSession = null;
-    this.handler = null;
-    this.tokenizer = null;
-    this.state = null;
-    await Promise.all(sessions.filter(Boolean).map((session) => session == null ? void 0 : session.release()));
+    await withOrtWebGpuSessionTeardown(async () => {
+      var _a;
+      (_a = this.handler) == null ? void 0 : _a.dispose();
+      const sessions = [this.visionSession, this.textSession, this.groundingSession, this.promptSession];
+      this.visionSession = null;
+      this.textSession = null;
+      this.groundingSession = null;
+      this.promptSession = null;
+      this.handler = null;
+      this.tokenizer = null;
+      this.state = null;
+      await Promise.all(sessions.filter(Boolean).map((session) => session == null ? void 0 : session.release()));
+    });
   }
   createSessionOptions(kind) {
     var _a, _b, _c, _d, _e;
@@ -5921,6 +6306,27 @@ var Sam3 = class _Sam3 {
     }
     return this.handler;
   }
+  async withWebGpuRetry(operation) {
+    if (!this.webGpu) {
+      return operation();
+    }
+    await ensureOrtWebGpuReady();
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isWebGpuDeviceLostError(error)) {
+        throw error;
+      }
+      await recoverOrtWebGpuDevice({
+        reason: "unknown",
+        message: error instanceof Error ? error.message : String(error)
+      });
+      if (this.loadedWebGpuGeneration !== getOrtWebGpuDeviceGeneration()) {
+        await this.load();
+      }
+      return operation();
+    }
+  }
   ensureState() {
     if (!this.state) {
       throw new Error("You must call setImage() before prompting SAM3.");
@@ -5947,21 +6353,31 @@ exports.YoloExecutionProviderOptions = YoloExecutionProviderOptions;
 exports.YoloWebExecutionProviderOptions = YoloWebExecutionProviderOptions;
 exports.canReuseOrtBundle = canReuseOrtBundle;
 exports.ensureOnnxRuntimeWebInitialized = ensureOnnxRuntimeWebInitialized;
+exports.ensureOrtWebGpuReady = ensureOrtWebGpuReady;
+exports.extractSegmentationPolygon = extractSegmentationPolygon;
+exports.extractSegmentationPolygons = extractSegmentationPolygons;
 exports.getLoadedOrtBundle = getLoadedOrtBundle;
 exports.getOrt = getOrt;
+exports.getOrtWebGpuDeviceGeneration = getOrtWebGpuDeviceGeneration;
 exports.initializeOnnxRuntimeWeb = initializeOnnxRuntimeWeb;
+exports.isOrtWebGpuDeviceLost = isOrtWebGpuDeviceLost;
 exports.isWebAssemblyJspiAvailable = isWebAssemblyJspiAvailable;
+exports.isWebGpuDeviceLostError = isWebGpuDeviceLostError;
 exports.isolateMaskComponent = isolateMaskComponent;
 exports.mapImageBox = mapImageBox;
 exports.mapImagePoint = mapImagePoint;
 exports.maskToImagePixels = maskToImagePixels;
 exports.maskToPolygon = maskToPolygon;
 exports.maskToPolygons = maskToPolygons;
+exports.onOrtWebGpuDeviceLost = onOrtWebGpuDeviceLost;
+exports.onOrtWebGpuDeviceRestored = onOrtWebGpuDeviceRestored;
 exports.ort = ort;
 exports.pickBestMask = pickBestMask;
 exports.pointerToImagePoint = pointerToImagePoint;
+exports.recoverOrtWebGpuDevice = recoverOrtWebGpuDevice;
 exports.resolveOrtBundle = resolveOrtBundle;
 exports.selectVisualMask = selectVisualMask;
 exports.splitTextPrompts = splitTextPrompts;
+exports.watchOrtWebGpuDevice = watchOrtWebGpuDevice;
 //# sourceMappingURL=index.cjs.map
 //# sourceMappingURL=index.cjs.map

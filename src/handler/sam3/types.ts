@@ -1,4 +1,11 @@
-import type { Point, Rect, Segmentation, YoloImageSource, YoloModelSource } from '../../types';
+import type {
+  Point,
+  Rect,
+  Segmentation,
+  SegmentationPolygonOptions,
+  YoloImageSource,
+  YoloModelSource,
+} from '../../types';
 import type { OnnxRuntimeWebOptions, YoloExecutionProvider } from '../../types';
 import type * as ort from 'onnxruntime-web';
 
@@ -114,16 +121,7 @@ export interface Sam3MaskOverlayOptions {
   sourceHeight?: number;
 }
 
-export interface Sam3MaskPolygonOptions {
-  imageWidth: number;
-  imageHeight: number;
-  sourceWidth?: number;
-  sourceHeight?: number;
-  prompt?: Point;
-  epsilon?: number;
-  /** 单条轮廓最多保留的点数，默认 96 */
-  maxPoints?: number;
-}
+export type Sam3MaskPolygonOptions = SegmentationPolygonOptions;
 
 export interface Sam3PointerToImageOptions {
   imageWidth?: number;

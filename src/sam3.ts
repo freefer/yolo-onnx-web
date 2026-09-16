@@ -34,6 +34,14 @@ import {
 } from './handler/sam3/sam3-mask';
 import { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
 import { createOrtInferenceSession, ensureOnnxRuntimeWebInitialized, ort } from './runtime';
+import {
+  ensureOrtWebGpuReady,
+  withOrtWebGpuSessionTeardown,
+  getOrtWebGpuDeviceGeneration,
+  isWebGpuDeviceLostError,
+  recoverOrtWebGpuDevice,
+  watchOrtWebGpuDevice,
+} from './webgpu-lifecycle';
 import type { Point, Rect, Segmentation, SegmentationDrawingOptions, YoloModelSource } from './types';
 
 const DEFAULT_EXECUTION_PROVIDERS = ['wasm'] as const;
@@ -59,6 +67,7 @@ export class Sam3 {
   private tokenizer: ClipBpeTokenizer | null = null;
   private state: Sam3InferenceState | null = null;
   private readonly webGpu: boolean;
+  private loadedWebGpuGeneration = -1;
 
   constructor(private readonly options: Sam3Options) {
     this.webGpu = usesWebGpu(options);
@@ -84,6 +93,9 @@ export class Sam3 {
       ...this.options,
       numThreads: this.options.numThreads ?? defaultNumThreads,
     });
+    if (this.webGpu) {
+      await ensureOrtWebGpuReady();
+    }
     if (ort.env.wasm) {
       ort.env.wasm.numThreads = this.options.numThreads ?? defaultNumThreads;
       ort.env.wasm.proxy = this.options.proxy ?? false;
@@ -166,6 +178,8 @@ export class Sam3 {
           webGpu: this.webGpu,
         },
       );
+      this.loadedWebGpuGeneration = getOrtWebGpuDeviceGeneration();
+      void watchOrtWebGpuDevice();
       return this;
     } catch (error) {
       await this.dispose();
@@ -174,28 +188,28 @@ export class Sam3 {
   }
 
   async setImage(image: Sam3ImageInput): Promise<Sam3InferenceState> {
-    this.state = await this.ensureHandler().setImage(image, this.state);
+    this.state = await this.withWebGpuRetry(() => this.ensureHandler().setImage(image, this.state));
     return this.state;
   }
 
   async setTextPrompt(prompt: string, description?: string): Promise<Segmentation[]> {
-    return this.ensureHandler().setTextPrompt(prompt, this.ensureState(), description);
+    return this.withWebGpuRetry(() => this.ensureHandler().setTextPrompt(prompt, this.ensureState(), description));
   }
 
   async addGeometricPrompt(box: Rect, label = true): Promise<Segmentation[]> {
-    return this.ensureHandler().addGeometricPrompt(box, label, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addGeometricPrompt(box, label, this.ensureState()));
   }
 
   async addGeometricPoint(point: Point, label = true): Promise<Segmentation[]> {
-    return this.ensureHandler().addGeometricPoint(point, label, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addGeometricPoint(point, label, this.ensureState()));
   }
 
   async removeGeometricPrompt(index: number): Promise<Segmentation[]> {
-    return this.ensureHandler().removeGeometricPrompt(index, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().removeGeometricPrompt(index, this.ensureState()));
   }
 
   async removeGeometricPoint(index: number): Promise<Segmentation[]> {
-    return this.ensureHandler().removeGeometricPoint(index, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().removeGeometricPoint(index, this.ensureState()));
   }
 
   resetPrompts(): Sam3InferenceState {
@@ -210,29 +224,29 @@ export class Sam3 {
     this.ensureHandler().setConfidenceThreshold(threshold);
     const state = this.ensureState();
     if (state.lastPcsRaw?.length || state.textEmbeddings) {
-      return this.ensureHandler().applyConfidenceThreshold(state);
+      return this.withWebGpuRetry(() => this.ensureHandler().applyConfidenceThreshold(state));
     }
     return state;
   }
 
   async predictConcept(prompt: Sam3PcsPrompt): Promise<Segmentation[]> {
-    return this.ensureHandler().predictConcept(prompt, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().predictConcept(prompt, this.ensureState()));
   }
 
   async predictVisual(prompt: Sam3PvsPrompt = {}): Promise<Sam3PvsResult> {
-    return this.ensureHandler().predictVisual(prompt, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().predictVisual(prompt, this.ensureState()));
   }
 
   async addPoint(point: Point, label: 0 | 1 = 1): Promise<Sam3PvsResult> {
-    return this.ensureHandler().addPoint(point, label, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addPoint(point, label, this.ensureState()));
   }
 
   async addBox(box: Rect): Promise<Sam3PvsResult> {
-    return this.ensureHandler().addBox(box, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addBox(box, this.ensureState()));
   }
 
   async addMask(mask: Sam3MaskPrompt): Promise<Sam3PvsResult> {
-    return this.ensureHandler().addMask(mask, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().addMask(mask, this.ensureState()));
   }
 
   /**
@@ -481,7 +495,7 @@ export class Sam3 {
   }
 
   async removePoint(index: number): Promise<Sam3PvsResult> {
-    return this.ensureHandler().removePoint(index, this.ensureState());
+    return this.withWebGpuRetry(() => this.ensureHandler().removePoint(index, this.ensureState()));
   }
 
   drawSegmentations(
@@ -490,26 +504,22 @@ export class Sam3 {
     canvas: HTMLCanvasElement,
     options: SegmentationDrawingOptions = {},
   ): void {
-    DrawTool.drawSam3Segmentations(source, segmentations, canvas, {
-      drawBoundingBoxes: true,
-      drawLabel: true,
-      drawSegmentationPixelMask: true,
-      fillSegmentationEdgePoints: true,
-      ...options,
-    });
+    DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
 
   async dispose(): Promise<void> {
-    this.handler?.dispose();
-    const sessions = [this.visionSession, this.textSession, this.groundingSession, this.promptSession];
-    this.visionSession = null;
-    this.textSession = null;
-    this.groundingSession = null;
-    this.promptSession = null;
-    this.handler = null;
-    this.tokenizer = null;
-    this.state = null;
-    await Promise.all(sessions.filter(Boolean).map(session => session?.release()));
+    await withOrtWebGpuSessionTeardown(async () => {
+      this.handler?.dispose();
+      const sessions = [this.visionSession, this.textSession, this.groundingSession, this.promptSession];
+      this.visionSession = null;
+      this.textSession = null;
+      this.groundingSession = null;
+      this.promptSession = null;
+      this.handler = null;
+      this.tokenizer = null;
+      this.state = null;
+      await Promise.all(sessions.filter(Boolean).map(session => session?.release()));
+    });
   }
 
   private createSessionOptions(kind: Sam3SessionKind): OrtTypes.InferenceSession.SessionOptions {
@@ -639,6 +649,29 @@ export class Sam3 {
     }
 
     return this.handler;
+  }
+
+  private async withWebGpuRetry<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.webGpu) {
+      return operation();
+    }
+
+    await ensureOrtWebGpuReady();
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isWebGpuDeviceLostError(error)) {
+        throw error;
+      }
+      await recoverOrtWebGpuDevice({
+        reason: 'unknown',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (this.loadedWebGpuGeneration !== getOrtWebGpuDeviceGeneration()) {
+        await this.load();
+      }
+      return operation();
+    }
   }
 
   private ensureState(): Sam3InferenceState {

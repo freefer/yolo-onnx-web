@@ -27,7 +27,7 @@ Chinese documentation: [README.zh-CN.md](https://github.com/freefer/yolo-onnx-we
 - Reuses RF-DETR WebGPU preprocess textures and buffers across frames; `yolo.dispose()` releases them.
 - Adds `Sam3` for SAM 3.1 multiplex: text concept segmentation (PCS) and interactive visual segmentation (PVS).
 - Exports `DrawTool` so drawing helpers can be used independently from a `Yolo` instance.
-- Splits segmentation drawing: YOLO / RF-DETR use `drawSegmentationEdgePoints`; SAM 3 uses `sam3.drawSegmentations()` (`DrawTool.drawSam3Segmentations`).
+- Uses one polygon extractor and one `DrawTool.drawSegmentations()` pipeline for YOLO, RF-DETR, and SAM 3, while preserving both packed-mask and polygon rendering.
 
 ## Installation
 
@@ -155,20 +155,29 @@ yolo.drawObbDetections(image, results, canvas);
 ```ts
 const results = await yolo.RunSegmentation(image, 0.2, 0.65, 0.7);
 yolo.drawSegmentations(image, results, canvas, {
+  segmentationRenderMode: 'mask',
   drawSegmentationPixelMask: true,
   pixelMaskOpacity: 128,
-  drawContour: false,
+  drawContour: true,
 });
 ```
 
-For YOLO / RF-DETR results that you persist and redraw later, extract polygons first, then use edge-point drawing (works even after `bitPackedPixelMask` is dropped):
+`drawSegmentations()` is shared by YOLO, RF-DETR, and SAM 3. Use `segmentationRenderMode: 'mask'` to draw the original packed mask, or `'polygon'` to run all models through the same polygon extractor:
+
+`yolo.extractSegmentationPolygons()`, `DrawTool.extractSegmentationPolygons()`, and the standalone export all return `Point[][]` (`{ x, y }[][]`) from that same extractor.
 
 ```ts
-results.forEach(segmentation => {
-  segmentation.segmentationEdgePoints = yolo.extractSegmentationEdgePoints(segmentation);
-});
+const polygonsByResult = results.map(segmentation =>
+  yolo.extractSegmentationPolygons(segmentation, {
+    imageWidth: image.naturalWidth,
+    imageHeight: image.naturalHeight,
+    sourceWidth: image.naturalWidth,
+    sourceHeight: image.naturalHeight,
+  }),
+);
 
-yolo.drawSegmentationEdgePoints(image, results, canvas, {
+yolo.drawSegmentations(image, results, canvas, {
+  segmentationRenderMode: 'polygon',
   drawBoundingBoxes: true,
   drawLabel: true,
   drawSegmentationPixelMask: true,
@@ -250,6 +259,7 @@ Segmentation and pose drawing expose extra options:
 
 ```ts
 yolo.drawSegmentations(image, segmentations, canvas, {
+  segmentationRenderMode: 'auto',
   drawSegmentationPixelMask: true,
   pixelMaskOpacity: 128,
   drawContour: true,
@@ -263,15 +273,21 @@ yolo.drawPoseEstimations(image, poses, canvas, {
 });
 ```
 
-Segmentation drawing is split by model family:
+Segmentation rendering no longer depends on the model family:
 
-| API | Use for | Fill source |
-| --- | --- | --- |
-| `yolo.drawSegmentations()` / `DrawTool.drawSegmentations()` | Live YOLO packed masks | `bitPackedPixelMask` |
-| `yolo.drawSegmentationEdgePoints()` / `DrawTool.drawSegmentationEdgePoints()` | YOLO / RF-DETR, including cached JSON polygons | packed mask when present, otherwise `segmentationEdgePoints` |
-| `sam3.drawSegmentations()` / `DrawTool.drawSam3Segmentations()` | SAM 3 PCS / PVS | packed mask plus contours |
+| `segmentationRenderMode` | Behavior |
+| --- | --- |
+| `auto` (default) | Draws `bitPackedPixelMask` when present; otherwise fills `segmentationEdgePoints` as polygons |
+| `mask` | Prefers the original packed mask and falls back to polygons when no mask is available |
+| `polygon` | Uses the shared polygon extractor for packed masks, or existing `segmentationEdgePoints` for cached polygon-only results |
 
-Do not use `DrawTool.drawSam3Segmentations` for YOLO / RF-DETR replay. `Sam3.drawSegmentationEdgePoints` was removed; call `sam3.drawSegmentations()` instead.
+### Deprecated segmentation APIs
+
+- `DrawTool.drawSam3Segmentations()` → use `DrawTool.drawSegmentations()`.
+- `DrawTool.drawSegmentationEdgePoints()` and `yolo.drawSegmentationEdgePoints()` → use `drawSegmentations({ segmentationRenderMode: 'polygon' })`.
+- Standalone `maskToPolygon()` / `maskToPolygons()` → use `extractSegmentationPolygon()` / `extractSegmentationPolygons()`.
+
+The old methods remain as compatibility wrappers and are marked `@deprecated`; they do not use a separate rendering or extraction implementation.
 
 `DrawTool` is also exported as a standalone helper. This is useful when inference and drawing live in different modules, or when you want to render cached results:
 
@@ -290,11 +306,15 @@ const image = document.querySelector('img')!;
 const canvas = document.querySelector('canvas')!;
 const segmentations = await yolo.RunSegmentation(image, 0.35, 0.5, 0.7);
 
-segmentations.forEach(segmentation => {
-  segmentation.segmentationEdgePoints = DrawTool.extractSegmentationEdgePoints(segmentation);
-});
+const polygons = segmentations.map(segmentation =>
+  DrawTool.extractSegmentationPolygons(segmentation, {
+    imageWidth: image.naturalWidth,
+    imageHeight: image.naturalHeight,
+  }),
+);
 
-DrawTool.drawSegmentationEdgePoints(image, segmentations, canvas, {
+DrawTool.drawSegmentations(image, segmentations, canvas, {
+  segmentationRenderMode: 'polygon',
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,
@@ -387,10 +407,11 @@ sam3.resetVisualPrompts();
 
 ### Drawing
 
-PCS postprocessing packs masks by bbox and fills `segmentationEdgePoints`. Draw with `sam3.drawSegmentations()`.
+PCS postprocessing packs masks by bbox and fills `segmentationEdgePoints`. `sam3.drawSegmentations()` uses the same drawing pipeline as YOLO and RF-DETR; choose `auto`, `mask`, or `polygon` with `segmentationRenderMode`.
 
 ```ts
 sam3.drawSegmentations(image, masks, canvas, {
+  segmentationRenderMode: 'auto',
   drawSource: true,
   drawBoundingBoxes: true,
   drawLabel: true,

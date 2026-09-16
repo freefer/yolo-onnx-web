@@ -2,6 +2,14 @@ import type * as OrtTypes from 'onnxruntime-web';
 import { DrawTool } from './draw-tool';
 import { parseOnnxModel } from './onnx-model';
 import { createOrtInferenceSession, ensureOnnxRuntimeWebInitialized, ort } from './runtime';
+import {
+  ensureOrtWebGpuReady,
+  getOrtWebGpuDeviceGeneration,
+  isWebGpuDeviceLostError,
+  recoverOrtWebGpuDevice,
+  watchOrtWebGpuDevice,
+  withOrtWebGpuSessionTeardown,
+} from './webgpu-lifecycle';
 import type {
   Classification,
   ClassificationDrawingOptions,
@@ -17,6 +25,7 @@ import type {
   Rect,
   Segmentation,
   SegmentationDrawingOptions,
+  SegmentationPolygonOptions,
   YoloPreprocessResult,
   YoloFeeds,
   YoloFetches,
@@ -44,6 +53,7 @@ export class Yolo {
   private preprocessContext: CanvasRenderingContext2D | null = null;
   private preprocessTensorData: Float32Array | null = null;
   private preprocessTensorSize = 0;
+  private loadedWebGpuGeneration = -1;
 
   constructor(options: YoloOptions = {}) {
     this.options = options;
@@ -97,6 +107,7 @@ export class Yolo {
 
   async load(model: YoloModelSource = this.requireModel()): Promise<this> {
     await ensureOnnxRuntimeWebInitialized(this.options);
+    await ensureOrtWebGpuReady();
     await this.dispose();
 
     this.session = await this.createSession(model);
@@ -138,15 +149,17 @@ export class Yolo {
         throw new Error('Unsupported model version: ' + modelVersion);
     }
 
+    this.loadedWebGpuGeneration = getOrtWebGpuDeviceGeneration();
+    void watchOrtWebGpuDevice();
     return this;
   }
 
   run(feeds: YoloFeeds, options?: YoloRunOptions): Promise<YoloRunResult> {
-    return this.ensureSession().run(feeds, options);
+    return this.withWebGpuRetry(() => this.ensureSession().run(feeds, options));
   }
 
   runWithFetches(feeds: YoloFeeds, fetches: YoloFetches, options?: YoloRunOptions): Promise<YoloRunResult> {
-    return this.ensureSession().run(feeds, fetches, options);
+    return this.withWebGpuRetry(() => this.ensureSession().run(feeds, fetches, options));
   }
 
   predict(feeds: YoloFeeds, options?: YoloRunOptions): Promise<YoloRunResult> {
@@ -159,7 +172,7 @@ export class Yolo {
     iou: number = 0.7,
     roi: Rect | null = null,
   ): Promise<ObjectDetection[]> {
-    return this.ensureHandler().RunObjectDetection(img, confidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunObjectDetection(img, confidence, iou, roi));
   }
 
   RunObbDetection(
@@ -168,7 +181,7 @@ export class Yolo {
     iou: number = 0.7,
     roi: Rect | null = null,
   ): Promise<OBBDetection[]> {
-    return this.ensureHandler().RunObbDetection(img, confidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunObbDetection(img, confidence, iou, roi));
   }
 
   RunSegmentation(
@@ -178,7 +191,7 @@ export class Yolo {
     iou: number = 0.7,
     roi: Rect | null = null,
   ): Promise<Segmentation[]> {
-    return this.ensureHandler().RunSegmentation(img, confidence, pixelConfidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunSegmentation(img, confidence, pixelConfidence, iou, roi));
   }
 
   RunPoseEstimation(
@@ -187,11 +200,11 @@ export class Yolo {
     iou: number = 0.7,
     roi: Rect | null = null,
   ): Promise<PoseEstimation[]> {
-    return this.ensureHandler().RunPoseEstimation(img, confidence, iou, roi);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunPoseEstimation(img, confidence, iou, roi));
   }
 
   RunClassification(img: YoloImageSource, classes: number = 5): Promise<Classification[]> {
-    return this.ensureHandler().RunClassification(img, classes);
+    return this.withWebGpuRetry(() => this.ensureHandler().RunClassification(img, classes));
   }
 
   preprocessImage(img: YoloImageSource, roi: Rect | null = null): YoloPreprocessResult {
@@ -308,6 +321,7 @@ export class Yolo {
     DrawTool.drawSegmentations(source, segmentations, canvas, options);
   }
 
+  /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'polygon'. */
   drawSegmentationEdgePoints(
     source: YoloImageSource,
     segmentations: readonly Segmentation[],
@@ -332,6 +346,20 @@ export class Yolo {
 
   extractSegmentationsEdgePoints(segmentations: readonly Segmentation[]): { x: number; y: number }[][] {
     return DrawTool.extractSegmentationsEdgePoints(segmentations);
+  }
+
+  extractSegmentationPolygons(
+    segmentation: Segmentation,
+    options: SegmentationPolygonOptions,
+  ): { x: number; y: number }[][] {
+    return DrawTool.extractSegmentationPolygons(segmentation, options);
+  }
+
+  extractSegmentationsPolygons(
+    segmentations: readonly Segmentation[],
+    options: SegmentationPolygonOptions,
+  ): { x: number; y: number }[][][] {
+    return DrawTool.extractSegmentationsPolygons(segmentations, options);
   }
 
   tensor<T extends OrtTypes.Tensor.Type>(
@@ -365,22 +393,24 @@ export class Yolo {
   }
 
   async dispose(): Promise<void> {
-    this._handler?.releaseGpuResources?.();
+    await withOrtWebGpuSessionTeardown(async () => {
+      this._handler?.releaseGpuResources?.();
 
-    if (!this.session) {
+      if (!this.session) {
+        this._onnxModel = null;
+        this._handler = null;
+        return;
+      }
+
+      await this.session.release();
+      this.session = null;
       this._onnxModel = null;
       this._handler = null;
-      return;
-    }
-
-    await this.session.release();
-    this.session = null;
-    this._onnxModel = null;
-    this._handler = null;
-    this.preprocessCanvas = null;
-    this.preprocessContext = null;
-    this.preprocessTensorData = null;
-    this.preprocessTensorSize = 0;
+      this.preprocessCanvas = null;
+      this.preprocessContext = null;
+      this.preprocessTensorData = null;
+      this.preprocessTensorSize = 0;
+    });
   }
 
   private createSessionOptions(): OrtTypes.InferenceSession.SessionOptions {
@@ -565,6 +595,29 @@ export class Yolo {
 
       return (executionProvider as any)?.name === 'webgpu';
     });
+  }
+
+  private async withWebGpuRetry<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.hasWebGpuExecutionProvider()) {
+      return operation();
+    }
+
+    await ensureOrtWebGpuReady();
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isWebGpuDeviceLostError(error)) {
+        throw error;
+      }
+      await recoverOrtWebGpuDevice({
+        reason: 'unknown',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (this.loadedWebGpuGeneration !== getOrtWebGpuDeviceGeneration()) {
+        await this.load();
+      }
+      return operation();
+    }
   }
 
   private isSupportedModel(modelVersion: ModelVersion, modelType: ModelType): boolean {

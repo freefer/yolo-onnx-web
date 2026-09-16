@@ -8,6 +8,17 @@ export {
   ort,
   resolveOrtBundle,
 } from './runtime';
+export {
+  ensureOrtWebGpuReady,
+  getOrtWebGpuDeviceGeneration,
+  isOrtWebGpuDeviceLost,
+  isWebGpuDeviceLostError,
+  onOrtWebGpuDeviceLost,
+  onOrtWebGpuDeviceRestored,
+  recoverOrtWebGpuDevice,
+  watchOrtWebGpuDevice,
+} from './webgpu-lifecycle';
+export type { WebGpuDeviceLostInfo, WebGpuLifecycleListener } from './webgpu-lifecycle';
 export type { OrtBundle, OrtModule } from './runtime';
 export {
   Classification,
@@ -31,6 +42,10 @@ export {
   selectVisualMask,
 } from './handler/sam3/sam3-mask';
 export { mapImageBox, mapImagePoint, pointerToImagePoint } from './handler/sam3/sam3-pointer';
+export {
+  extractSegmentationPolygon,
+  extractSegmentationPolygons,
+} from './segmentation-contours';
 export { DrawTool } from './draw-tool';
 export type {
   OnnxRuntimeWebOptions,
@@ -50,6 +65,8 @@ export type {
   Point,
   Rect,
   SegmentationDrawingOptions,
+  SegmentationPolygonOptions,
+  SegmentationRenderMode,
   YoloExecutionProvider,
   YoloFeeds,
   YoloFetches,

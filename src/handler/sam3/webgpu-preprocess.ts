@@ -1,5 +1,6 @@
 import type * as OrtTypes from 'onnxruntime-web';
 import { ort } from '../../runtime';
+import { isWebGpuDeviceLostError } from '../../webgpu-lifecycle';
 import type { YoloImageSource } from '../../types';
 import { getImageSize, SAM3_IMAGE_SIZE, SAM3_MEAN, SAM3_STD, renderSam3ImageToCanvas } from './preprocess';
 import type { Sam3ImageTensor } from './types';
@@ -50,9 +51,15 @@ async function getOrtWebGpuDevice(): Promise<any> {
  * Queue fence only — extra copy/mapAsync on FPN outputs was extra GPU work and did not make encode faster.
  */
 export async function waitForWebGpuOutputs(_result?: OrtTypes.InferenceSession.OnnxValueMapType): Promise<void> {
-  const device = await (ort.env as { webgpu?: { device?: Promise<any> | any } }).webgpu?.device;
-  if (typeof device?.queue?.onSubmittedWorkDone === 'function') {
-    await device.queue.onSubmittedWorkDone();
+  try {
+    const device = await (ort.env as { webgpu?: { device?: Promise<any> | any } }).webgpu?.device;
+    if (typeof device?.queue?.onSubmittedWorkDone === 'function') {
+      await device.queue.onSubmittedWorkDone();
+    }
+  } catch (error) {
+    if (isWebGpuDeviceLostError(error)) {
+      throw error;
+    }
   }
 }
 

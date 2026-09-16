@@ -1,5 +1,13 @@
 import type * as OrtTypes from 'onnxruntime-web';
 import type { OnnxRuntimeWebOptions, YoloExecutionProvider, YoloOptions } from './types';
+import {
+  bindOrtGetter,
+  ensureOrtWebGpuReady,
+  installWebGpuLifecycleHooks,
+  isWebGpuDeviceLostError,
+  recoverOrtWebGpuDevice,
+  watchOrtWebGpuDevice,
+} from './webgpu-lifecycle';
 
 export type OrtBundle = 'auto' | 'webgpu' | 'jspi' | 'wasm' | 'webgl' | 'all';
 export type OrtModule = typeof import('onnxruntime-web/webgpu');
@@ -7,6 +15,8 @@ export type OrtModule = typeof import('onnxruntime-web/webgpu');
 let ortModule: OrtModule | null = null;
 let loadedBundle: Exclude<OrtBundle, 'auto'> | null = null;
 let loadingPromise: Promise<OrtModule> | null = null;
+
+installWebGpuLifecycleHooks();
 
 /**
  * Chrome 137+ / Edge expose JSPI as `WebAssembly.Suspending`.
@@ -171,6 +181,8 @@ export function getOrt(): OrtModule {
   return ortModule;
 }
 
+bindOrtGetter(() => getOrt());
+
 export function getLoadedOrtBundle(): Exclude<OrtBundle, 'auto'> | null {
   return loadedBundle;
 }
@@ -219,30 +231,48 @@ export async function createOrtInferenceSession(
     return createInferenceSession(model, options);
   }
 
-  let release!: () => void;
-  const previous = webGpuSessionLock;
-  webGpuSessionLock = new Promise<void>(resolve => {
-    release = resolve;
-  });
-  await previous;
+  const createLocked = async (): Promise<OrtTypes.InferenceSession> => {
+    let release!: () => void;
+    const previous = webGpuSessionLock;
+    webGpuSessionLock = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    await previous;
+
+    try {
+      await ensureOrtWebGpuReady();
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          const session = await createInferenceSession(model, options);
+          void watchOrtWebGpuDevice();
+          return session;
+        } catch (error) {
+          lastError = error;
+          const message = error instanceof Error ? error.message : String(error);
+          if (!WEBGPU_SESSION_BUSY.test(message) || attempt === 5) {
+            throw error;
+          }
+          await delay(40 * (attempt + 1));
+        }
+      }
+      throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    } finally {
+      release();
+    }
+  };
 
   try {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      try {
-        return await createInferenceSession(model, options);
-      } catch (error) {
-        lastError = error;
-        const message = error instanceof Error ? error.message : String(error);
-        if (!WEBGPU_SESSION_BUSY.test(message) || attempt === 5) {
-          throw error;
-        }
-        await delay(40 * (attempt + 1));
-      }
+    return await createLocked();
+  } catch (error) {
+    if (!isWebGpuDeviceLostError(error)) {
+      throw error;
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
-  } finally {
-    release();
+    await recoverOrtWebGpuDevice({
+      reason: 'unknown',
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return createLocked();
   }
 }
 

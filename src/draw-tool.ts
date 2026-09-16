@@ -11,8 +11,13 @@ import type {
   Rect,
   Segmentation,
   SegmentationDrawingOptions,
+  SegmentationPolygonOptions,
   YoloImageSource,
 } from './types';
+import {
+  extractSegmentationPolygon,
+  extractSegmentationPolygons,
+} from './segmentation-contours';
 
 const DEFAULT_BOX_COLORS = [
   '#22c55e',
@@ -186,36 +191,64 @@ export class DrawTool {
   ): void {
     const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
     const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
-    const drawMask = options.drawSegmentationPixelMask ?? true;
-    const drawContour = options.drawContour ?? false;
+    const drawOverlay = options.drawSegmentationPixelMask ?? true;
+    const drawContour = options.drawContour ?? true;
     const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
+    const fillShapes = options.fillSegmentationEdgePoints ?? true;
+    const requestedRenderMode = options.segmentationRenderMode ?? 'auto';
     const overlayOpacity = this.getResultOverlayOpacity(options);
     if (overlayOpacity <= 0) {
       return;
     }
 
     const alpha = this.getDetectionDrawingAlpha(options);
-    const fillOpacity = this.getPixelMaskDrawingAlpha(options, 128);
+    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
 
-    if (drawMask && fillOpacity > 0) {
+    if (drawOverlay) {
       for (const segmentation of segmentations) {
-        this.drawSegmentationMask(
-          context,
-          segmentation,
-          this.getDetectionColor(segmentation, colors, undefined, fillOpacity),
-        );
-      }
-    }
+        const hasMask = this.hasPackedMask(segmentation);
+        const renderMode = requestedRenderMode === 'auto'
+          ? (hasMask ? 'mask' : 'polygon')
+          : requestedRenderMode;
+        const useMask = renderMode !== 'polygon' && hasMask;
+        const needsContours = drawContour || (!useMask && fillShapes && fillOpacity > 0);
+        const contours = !needsContours
+          ? []
+          : hasMask
+            ? this.extractSegmentationPolygons(segmentation, {
+                imageWidth: width,
+                imageHeight: height,
+                sourceWidth: width,
+                sourceHeight: height,
+              })
+            : this.extractSegmentationContours(segmentation);
+        const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
+        const fillColor = this.getDetectionColor(segmentation, colors, options.fillStyle, fillOpacity);
 
-    if (drawContour && alpha > 0) {
-      for (let index = 0; index < segmentations.length; index += 1) {
-        const segmentation = segmentations[index];
+        if (useMask) {
+          if (fillShapes && fillOpacity > 0) {
+            this.drawSegmentationMask(context, segmentation, fillColor);
+          }
+          if (drawContour) {
+            this.drawOrderedEdgeContours(
+              context,
+              contours,
+              strokeColor,
+              options.contourThickness ?? 2,
+              undefined,
+              true,
+            );
+          }
+          continue;
+        }
 
-        this.drawSegmentationContour(
+        this.drawOrderedEdgeContours(
           context,
-          segmentation,
-          this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha),
+          contours,
+          drawContour ? strokeColor : undefined,
           options.contourThickness ?? 2,
+          fillShapes && fillOpacity > 0 ? fillColor : undefined,
+          true,
         );
       }
     }
@@ -264,6 +297,27 @@ export class DrawTool {
 
   private static hasPackedMask(segmentation: Segmentation): boolean {
     return (segmentation.bitPackedPixelMask?.byteLength ?? 0) > 0;
+  }
+
+  static extractSegmentationPolygon(
+    segmentation: Segmentation,
+    options: SegmentationPolygonOptions,
+  ): Point[] {
+    return extractSegmentationPolygon(segmentation, options);
+  }
+
+  static extractSegmentationPolygons(
+    segmentation: Segmentation,
+    options: SegmentationPolygonOptions,
+  ): Point[][] {
+    return extractSegmentationPolygons(segmentation, options);
+  }
+
+  static extractSegmentationsPolygons(
+    segmentations: readonly Segmentation[],
+    options: SegmentationPolygonOptions,
+  ): Point[][][] {
+    return segmentations.map(segmentation => this.extractSegmentationPolygons(segmentation, options));
   }
 
   static extractSegmentationEdgePoints(segmentation: Segmentation): { x: number; y: number }[] {
@@ -742,149 +796,39 @@ export class DrawTool {
     context.restore();
   }
 
-  private static drawSegmentationContour(
-    context: CanvasRenderingContext2D,
-    segmentation: Segmentation,
-    color: string,
-    thickness: number,
-  ): void {
-
-    const { left, top, right, bottom } = segmentation.boundingBox;
-    const width = right - left;
-    const height = bottom - top;
-
-    if (width <= 0 || height <= 0 || !this.hasPackedMask(segmentation)) {
-      return;
-    }
-
-    context.fillStyle = color;
-
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const pixelIndex = y * width + x;
-
-        if (!this.isPackedMaskSet(segmentation.bitPackedPixelMask, pixelIndex)) {
-          continue;
-        }
-
-        if (this.isSegmentationEdgePixel(segmentation.bitPackedPixelMask, pixelIndex, x, y, width, height)) {
-          context.fillRect(left + x, top + y, thickness, thickness);
-        }
-      }
-    }
-  }
-
-  /**
-   * SAM3 绘制：用 packed mask 填充，轮廓从 mask / 已提取边点拆成多段折线。
-   * YOLO / RF-DETR 请先 extractSegmentationEdgePoints，再走 {@link drawSegmentationEdgePoints}。
-   */
+  /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'auto'. */
   public static drawSam3Segmentations(
     source: YoloImageSource,
     segmentations: readonly Segmentation[],
     canvas: HTMLCanvasElement,
     options: SegmentationDrawingOptions = {},
   ): void {
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
-    const thickness = options.contourThickness ?? 2;
-    const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
-    const overlayOpacity = this.getResultOverlayOpacity(options);
-    if (overlayOpacity <= 0) {
-      return;
-    }
-
-    const alpha = this.getDetectionDrawingAlpha(options);
-    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
-
-    for (const segmentation of segmentations) {
-      const contours = this.extractSegmentationContours(segmentation);
-      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
-      const fillColor = this.getDetectionColor(
-        segmentation,
-        colors,
-        options.fillStyle,
-        fillOpacity,
-      );
-      if (options.drawSegmentationPixelMask === true) {
-        if (options.fillSegmentationEdgePoints === true && this.hasPackedMask(segmentation) && fillOpacity > 0) {
-          this.drawSegmentationMask(context, segmentation, fillColor);
-        }
-
-        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
-      }
-    }
-
-    if (drawBoundingBoxes || options.drawLabel !== false) {
-      this.drawBoundingBoxes(context, segmentations, width, height, options);
-    }
+    this.drawSegmentations(source, segmentations, canvas, {
+      segmentationRenderMode: 'auto',
+      ...options,
+    });
   }
 
-  /**
-   * YOLO / RF-DETR：使用已提取的 `segmentationEdgePoints` 描边和填充。
-   * 没有 packed mask 时按多边形填充，不要求携带 bitPackedPixelMask。
-   */
+  /** @deprecated Use drawSegmentations() with segmentationRenderMode: 'polygon'. */
   public static drawSegmentationEdgePoints(
     source: YoloImageSource,
     segmentations: readonly Segmentation[],
     canvas: HTMLCanvasElement,
     options: SegmentationDrawingOptions = {},
   ): void {
-    const { context, width, height } = this.prepareDrawingCanvas(source, canvas, options.drawSource);
-    const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
-    const thickness = options.contourThickness ?? 2;
-    const drawBoundingBoxes = options.drawBoundingBoxes ?? true;
-    const drawOverlay = options.drawSegmentationPixelMask ?? true;
-    const fillShapes = options.fillSegmentationEdgePoints ?? true;
-    const overlayOpacity = this.getResultOverlayOpacity(options);
-    if (overlayOpacity <= 0) {
-      return;
-    }
-
-    const alpha = this.getDetectionDrawingAlpha(options);
-    const fillOpacity = this.getPixelMaskDrawingAlpha(options, DEFAULT_EDGE_FILL_OPACITY);
-
-    for (const segmentation of segmentations) {
-      const contours = this.extractSegmentationContours(segmentation);
-      const strokeColor = this.getDetectionColor(segmentation, colors, options.strokeStyle, alpha);
-      const fillColor = this.getDetectionColor(
-        segmentation,
-        colors,
-        options.fillStyle,
-        fillOpacity,
-      );
-
-      if (!drawOverlay) {
-        continue;
-      }
-
-      if (fillShapes && this.hasPackedMask(segmentation)) {
-        if (fillOpacity > 0) {
-          this.drawSegmentationMask(context, segmentation, fillColor);
-        }
-        this.drawOrderedEdgeContours(context, contours, strokeColor, thickness);
-        continue;
-      }
-
-      this.drawOrderedEdgeContours(
-        context,
-        contours,
-        strokeColor,
-        thickness,
-        fillShapes ? fillColor : undefined,
-      );
-    }
-
-    if (drawBoundingBoxes || options.drawLabel !== false) {
-      this.drawBoundingBoxes(context, segmentations, width, height, options);
-    }
+    this.drawSegmentations(source, segmentations, canvas, {
+      segmentationRenderMode: 'polygon',
+      ...options,
+    });
   }
 
   private static drawOrderedEdgeContours(
     context: CanvasRenderingContext2D,
     contours: readonly Point[][],
-    strokeColor: string,
+    strokeColor: string | undefined,
     thickness: number,
     fillColor?: string,
+    closeContours = false,
   ): void {
     if (contours.length === 0) {
       return;
@@ -894,7 +838,9 @@ export class DrawTool {
     context.lineWidth = thickness;
     context.lineJoin = 'round';
     context.lineCap = 'round';
-    context.strokeStyle = strokeColor;
+    if (strokeColor) {
+      context.strokeStyle = strokeColor;
+    }
 
     for (const contour of contours) {
       if (contour.length === 0) {
@@ -907,13 +853,18 @@ export class DrawTool {
         context.lineTo(contour[index].x, contour[index].y);
       }
 
-      if (fillColor && this.isMostlyClosedContour(contour)) {
+      const shouldClose = closeContours || (fillColor && this.isMostlyClosedContour(contour));
+      if (shouldClose) {
         context.closePath();
+      }
+      if (fillColor && shouldClose) {
         context.fillStyle = fillColor;
         context.fill();
       }
 
-      context.stroke();
+      if (strokeColor) {
+        context.stroke();
+      }
     }
 
     context.restore();
