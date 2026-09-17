@@ -580,6 +580,7 @@ export class DrawTool {
     const colors = options.boundingBoxHexColors ?? [...DEFAULT_BOX_COLORS];
     const lineWidth = options.lineWidth ?? Math.max(2, Math.round(Math.min(width, height) / 320));
     const font = options.font ?? `${Math.max(14, Math.round(Math.min(width, height) / 70))}px Arial`;
+    const drawBoxes = (options as DetectionDrawingOptions & { drawBoundingBoxes?: boolean }).drawBoundingBoxes ?? true;
     const drawLabel = options.drawLabel ?? true;
     const drawConfidenceScore = options.drawConfidenceScore ?? true;
     const drawLabelBackground = options.drawLabelBackground ?? true;
@@ -600,8 +601,10 @@ export class DrawTool {
         continue;
       }
 
-      context.strokeStyle = color;
-      context.strokeRect(left, top, boxWidth, boxHeight);
+      if (drawBoxes) {
+        context.strokeStyle = color;
+        context.strokeRect(left, top, boxWidth, boxHeight);
+      }
 
       if (drawLabel) {
         this.drawDetectionLabel(context, detection, left, Math.max(0, top - this.getCanvasFontSize(font)), color, {
