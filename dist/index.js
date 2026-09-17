@@ -1338,15 +1338,16 @@ var DrawTool = class {
     return topLeftKey;
   }
   static drawBoundingBoxes(context, detections, width, height, options = {}) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const colors = (_a = options.boundingBoxHexColors) != null ? _a : [...DEFAULT_BOX_COLORS];
     const lineWidth = (_b = options.lineWidth) != null ? _b : Math.max(2, Math.round(Math.min(width, height) / 320));
     const font = (_c = options.font) != null ? _c : `${Math.max(14, Math.round(Math.min(width, height) / 70))}px Arial`;
-    const drawLabel = (_d = options.drawLabel) != null ? _d : true;
-    const drawConfidenceScore = (_e = options.drawConfidenceScore) != null ? _e : true;
-    const drawLabelBackground = (_f = options.drawLabelBackground) != null ? _f : true;
+    const drawBoxes = (_d = options.drawBoundingBoxes) != null ? _d : true;
+    const drawLabel = (_e = options.drawLabel) != null ? _e : true;
+    const drawConfidenceScore = (_f = options.drawConfidenceScore) != null ? _f : true;
+    const drawLabelBackground = (_g = options.drawLabelBackground) != null ? _g : true;
     const alpha = this.getDetectionDrawingAlpha(options);
-    const fontColor = this.withAlpha((_g = options.fontColor) != null ? _g : "#f8fafc", alpha);
+    const fontColor = this.withAlpha((_h = options.fontColor) != null ? _h : "#f8fafc", alpha);
     context.lineWidth = lineWidth;
     context.font = font;
     context.textBaseline = "middle";
@@ -1358,8 +1359,10 @@ var DrawTool = class {
       if (boxWidth <= 0 || boxHeight <= 0) {
         continue;
       }
-      context.strokeStyle = color;
-      context.strokeRect(left, top, boxWidth, boxHeight);
+      if (drawBoxes) {
+        context.strokeStyle = color;
+        context.strokeRect(left, top, boxWidth, boxHeight);
+      }
       if (drawLabel) {
         this.drawDetectionLabel(context, detection, left, Math.max(0, top - this.getCanvasFontSize(font)), color, {
           font,
